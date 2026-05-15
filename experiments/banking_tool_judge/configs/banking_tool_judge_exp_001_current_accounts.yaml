@@ -1,0 +1,227 @@
+# Prototype LLM-as-judge configuration for banking answer-quality evaluations.
+
+experiment:
+  name: "banking_tool_judge_exp_001_current_accounts"
+  persona: >
+    You are a strict evaluator for a banking agent.
+  task: >
+    Evaluate individual banking-agent turns for final-answer grounding and
+    completeness using the supplied actual tool trace and case-specific answer
+    requirements.
+  description: >
+    Minimal prototype for an LLM-as-judge banking answer-quality evaluation.
+    Deterministic tool-call checks run outside this YAML; this rubric judges
+    whether the final answer is grounded in tool output and whether it covers
+    the required user-facing points.
+  version: "0.2.0"
+  author: "Ita Cirovic Donev"
+  created_date: "2026-04-30"
+  tags:
+    - "banking"
+    - "answer-quality"
+    - "llm-judge"
+    - "prototype"
+    - "ai-data-science-evals"
+
+
+model:
+  model_deployment_name: "gpt-5-1"
+  api_provider: "databricks_async"
+  databricks_endpoint_url: "https://adb-3174992876438447.7.azuredatabricks.net/serving-endpoints/gpt-5-1/invocations"
+  temperature: 0.0
+  max_output_tokens: 8000
+  reasoning_effort: "high"
+  max_concurrent_calls: 5
+  tpm_limit: 100000
+
+
+dataset:
+  input_catalog: ""
+  input_schema: ""
+  input_dataset: ""
+  test_num_rows: null
+  id_columns:
+    - case_id
+    - turn_id
+  eval_columns:
+    - case_id
+    - turn_id
+    - user_message
+    - actual_tool_trace
+    - actual_output
+    - required_points
+    - grounding_requirements
+    - disallowed_claims
+    - evaluation_focus
+  passthrough_columns:
+    - scenario
+    - description
+    - tags
+
+
+paths:
+  checkpoint_dir: "checkpoints/banking_tool_judge"
+  system_template_path: "configs/banking_tool_judge/system.md.j2"
+
+
+rubric:
+  base: null
+  pass_threshold: 2.0
+
+  judge_instructions: |
+    Evaluate only final-answer quality. Do not score whether the agent selected
+    the right tool, used the right parameters, or called tools in the right
+    order; those dimensions are evaluated separately by deterministic scorers.
+
+    Prefer grounded interpretation over exact wording. Do not penalize harmless
+    phrasing differences, ordering differences, greetings, or concise wording
+    when the answer remains fully supported and complete.
+
+    Examples:
+
+    Example 1: All PASS
+    User: "What current accounts do I have?"
+    Tool trace returns two current accounts: "Muj bezny ucet" with a CZK
+    balance and "Devizovy ucet" with an EUR balance. The final answer lists
+    both accounts and keeps the CZK and EUR amounts separate.
+    Verdicts: answer_grounding PASS because account names and balances come
+    from tool output; answer_completeness PASS because both current accounts
+    are listed with separate currencies.
+
+    Example 2: All FAIL
+    User: "What do I owe on my mortgage, next installment, fixation end?"
+    Tool trace contains no mortgage detail data, but the final answer says the
+    system cannot show mortgage accounts because of ownership visibility rules.
+    Required points include outstanding amount, next installment, and fixation
+    end. Verdicts: answer_grounding FAIL because the ownership explanation is
+    unsupported by tool output; answer_completeness FAIL because the answer
+    misses all requested mortgage facts.
+
+    Example 3: Answer PASS despite extra lookup
+    User: "Pending card reservations on my main account?"
+    Tool trace includes an initial empty lookup, then a successful account
+    detail call returning two pending reservations. The final answer lists both
+    reservations with amounts and dates. Verdicts: answer_grounding PASS and
+    answer_completeness PASS. Extra tool retries are out of scope for this
+    judge as long as the final answer is grounded and complete.
+
+  critical_evaluation_rules: |
+    OUTPUT CONTRACT:
+      - Return ONLY valid JSON.
+      - Use scores 2 and 0 only: 2 means PASS, 0 means FAIL.
+      - Set `overall_pass=true` only when both answer dimensions pass.
+      - Every critique must cite specific evidence from `actual_tool_trace`,
+        `actual_output`, or the case-specific requirement fields.
+
+    Evidence rules:
+      - Use `actual_tool_trace` as the only source of tool-returned facts.
+      - Use `actual_output` as the final answer to evaluate.
+      - Use `required_points` to decide whether the final answer is complete.
+      - Use `grounding_requirements` to decide which tool-output evidence is
+        authoritative for the case.
+      - Use `disallowed_claims` as hard failure guidance when relevant.
+      - Use `evaluation_focus` as a case-specific note, not as a replacement
+        for evidence from the trace and answer.
+
+  final_reminders: |
+    1. Do not evaluate tool selection, parameter accuracy, or call sequence.
+    2. Fail answer_grounding for fabricated values, unsupported explanations,
+       unsupported system behavior, or claims absent from tool output.
+    3. Fail answer_completeness when any required user-facing point is missing,
+       collapsed, contradicted, or materially weakened.
+    4. If a tool failure leaves no data to answer with, judge whether the final
+       answer honestly reflects the available tool output; do not invent facts.
+
+  dimensions:
+    - id: "answer_grounding"
+      name: "Answer Grounding"
+      weight: 1.0
+      description: >
+        Is every factual claim in the final answer directly supported by the
+        actual tool trace?
+      scale:
+        - score: 2
+          label: "PASS"
+          description: >
+            Every material factual claim in the answer is supported by tool
+            output. The answer does not fabricate data or unsupported system
+            behavior.
+        - score: 0
+          label: "FAIL"
+          description: >
+            The answer includes fabricated data, unsupported explanations,
+            unsupported system behavior, or factual claims absent from tool
+            output.
+
+    - id: "answer_completeness"
+      name: "Answer Completeness"
+      weight: 1.0
+      description: >
+        Does the final answer address all parts of the user's question and all
+        required case-specific answer points?
+      scale:
+        - score: 2
+          label: "PASS"
+          description: >
+            The answer addresses all required points using relevant data from
+            the tool results.
+        - score: 0
+          label: "FAIL"
+          description: >
+            The answer misses, collapses, contradicts, or materially weakens
+            one or more required information points.
+
+  input_fields:
+    - name: "user_message"
+      description: "The user's message for the evaluated turn."
+      required: true
+    - name: "actual_tool_trace"
+      description: >
+        Structured trace of actual tool calls, arguments, outputs, and order.
+        For this judge, tool output is the source of truth for grounding.
+      required: true
+    - name: "actual_output"
+      description: "Final answer produced by the agent."
+      required: true
+    - name: "required_points"
+      description: "Facts or behaviors the final answer must include."
+      required: true
+    - name: "grounding_requirements"
+      description: "Case-specific rules for what evidence should ground the answer."
+      required: true
+    - name: "disallowed_claims"
+      description: "Claims or answer behaviors that should be treated as failures."
+      required: false
+    - name: "evaluation_focus"
+      description: "Short note describing the main answer-quality risk."
+      required: false
+
+  output_schema:
+    fields:
+      - name: "overall_pass"
+        type: "boolean"
+        description: "True only when both answer_grounding and answer_completeness pass."
+      - name: "dimension_critiques"
+        type: "object"
+        description: >
+          Object with exactly two keys, `answer_grounding` and
+          `answer_completeness`. Each value should include a verdict
+          (`PASS` or `FAIL`) and a detailed evidence-based critique.
+      - name: "unsupported_claims"
+        type: "array"
+        description: >
+          Specific claims in `actual_output` that are not supported by
+          `actual_tool_trace`. Use [] when none.
+      - name: "missing_required_points"
+        type: "array"
+        description: >
+          Required points that are absent, collapsed, contradicted, or
+          materially weakened in `actual_output`. Use [] when none.
+      - name: "failure_summary"
+        type: "array"
+        description: >
+          Short list of concrete failures. Use [] when both dimensions pass.
+      - name: "overall_explanation"
+        type: "string"
+        description: >
+          Brief English summary tying the two answer-quality judgments together.

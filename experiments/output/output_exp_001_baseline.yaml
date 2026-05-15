@@ -1,0 +1,422 @@
+# ─────────────────────────────────────────────────────────────
+# output_prompt_exp_001_baseline_2300
+# ─────────────────────────────────────────────────────────────
+# Comparative evaluation: GPT-4o (baseline) vs GPT-4.1 (challenger)
+# for output-prompt responses using the 2300 KBX test set.
+#
+# Goal: Produce a go/no-go recommendation for upgrading the
+#       output-prompt model from GPT-4o to GPT-4.1.
+#
+# Data was pre-filtered in the data-preparation notebook:
+#   - ENUM match across all models
+#   - Output length = 3 (enum + status + response)
+#   - Non-empty responses
+#   - Status match across all models
+# ─────────────────────────────────────────────────────────────
+
+
+# ── Experiment Metadata ───────────────────────────────────────
+experiment:
+  name: "output_prompt_exp_001_baseline_2300"
+  persona: "You are an expert evaluator of chatbot responses from a banking service chatbot."
+  description: >
+    Your task is to evaluate responses from a anking customer-service chatbot ("HeyGeorge").
+    The responses are given bz GPT-4o (baseline) vs GPT-4.1 (challenger). The chatbot answers
+    user queries in, mostly, **Czech** language. The chatbot takes in one or more knowledge 
+    base fragments (ENUMs) with descriptions and generates a response grounded in those ENUMs.
+    
+    You need to compare **two responses** to the **same user query**:
+    - **Baseline (GPT-4o)**: `run_response_gpt4o`
+    - **Challenger (GPT-4.1)**: `run_response_gpt41`
+
+    Both models received the **same ENUM selection** (`run_enum_gpt4o`) and the
+    **same status** (`run_status_gpt4o`).  Any quality difference therefore
+    reflects **only** the output-prompt generation step.
+
+    You MUST return ONLY valid JSON. No text outside the JSON structure. 
+    All responses must be in English.
+  version: "1.0.0"
+  author: "Ita Ćirović Donev"
+  created_date: "2026-02-16"
+  tags:
+    - "baseline"
+    - "gpt-5"
+    - "output-prompt"
+    - "prompt-eval"
+    - "gpt4o-vs-gpt41"
+    - "dts-2300"
+
+
+# ── Model Configuration ──────────────────────────────────────
+# GPT-5 judge with medium reasoning for nuanced cross-model comparison.
+model:
+  model_deployment_name: "gpt-5.2"
+  api_provider: "azure_async"
+  temperature: 0.0                  # Deterministic judge output
+  max_output_tokens: 16000
+  reasoning_effort: "medium"        # Medium — comparison tasks need nuance
+  max_concurrent_calls: 5
+
+
+# ── Dataset Configuration ────────────────────────────────────
+# Source table produced by output_prompt_001_data_preparation_2300.ipynb
+dataset:
+  input_dataset: "dts_eval_output_prompt_2300_exp_001"
+  input_schema: "private_uc055_grag_db"
+  test_num_rows: 50                 # Set to null for production runs
+  id_columns:                       # Row identifier columns for checkpoint tracking
+    - test_case_id
+  eval_columns:
+    - test_case_id
+    - input
+    - run_enum_gpt4o
+    - run_enum_desc_cz
+    - run_enum_desc_en
+    - run_status_gpt4o
+    - run_response_gpt4o
+    - run_response_gpt41
+
+
+# ── Paths ─────────────────────────────────────────────────────
+# Paths need to be defined wrt to the notebook in which the script
+# is run
+paths:
+  checkpoint_dir: "checkpoints"
+  system_template_path: "../../configs/output_prompt/system.md.j2"
+  user_template_path: "../../configs/output_prompt/user.md.j2"
+
+
+# ── Rubric Configuration ─────────────────────────────────────
+#
+# Scoring scale for every dimension:
+#   0 = Poor    — significant problems that would degrade user experience
+#   1 = Acceptable — minor issues that are tolerable
+#   2 = Good    — no issues, meets or exceeds the baseline
+#
+# Dimensions are grouped into two blocks:
+#   Correctness  (factual_completeness, hallucination_control)  — higher weight
+#   Language      (clarity, structure, conciseness, tone)        — standard weight
+#
+rubric:
+  base: "output_prompt"
+  pass_threshold: 1.4               # Weighted-avg threshold (range 0-2)
+
+  # ── Critical Evaluation Rules ──────────────────────────────────────
+  critical_evaluation_rules: |
+    1. Read the user query (`input`) and understand what the customer is asking.
+    2. Read the ENUM descriptions (`run_enum_desc_cz` and `run_enum_desc_en`)
+       to know what factual ground truth is available.
+    3. Read **both** responses carefully.
+    4. Score **each dimension for the Challenger (GPT-4.1) response**, using
+       the Baseline (GPT-4o) response and the ENUM descriptions as your
+       reference for factual content.
+
+  # ── System Context ────────────────────────────────────────────────
+  # Reference material - need to be numbered for better LLM attention.
+  system_context: |
+
+  # ── Root Cause Categories ────────────────────────────────────────────────
+  root_cause_categories: |
+    
+  # ── Domain Specific Guidance ─────────────────────────────────────────────
+  domain_specific_guidance: |
+    - Product-specific queries → need product-specific ENUMs
+    - Generic queries may need generic ENUMs; specific queries need specific ENUMs
+
+  # ── Final Reminders ─────────────────────────────────────────────
+  # Re-state the most important rules right before generation starts.
+  # This is the last section of the system prompt!
+  final_reminders: |
+    1. **Output only JSON** - no markdown, no prose outside JSON
+    2. **Reason in English** - you can reason in English, but all judgments must be based on the Czech content and the Czech user query.
+    3. **English responses** - regardless of input language
+    4. **Concise reasoning** - under 100 characters per dimension
+    5. **Explanation limit** - overall_explanation under 300 characters
+    6. **Be strict** - customer service requires high accuracy
+    7. **Focus on facts** - base scores on what's present in the information provided, not hypotheticals
+    8. **No hallucinations allowed** - only use information provided
+    9. Do NOT penalize the Challenger for stylistic differences that are
+      equally valid (e.g. bullet list vs. prose, if both are clear).
+    10. If the Baseline itself contains errors, note them but still evaluate 
+      the Challenger on its own merits against the ENUM source of truth.
+
+  # ── Dimensions ──────────────────────────────────────────────
+  # Correctness dimensions carry 2× weight; language dimensions carry 1×.
+  dimensions:
+    # --- Correctness ---
+    - id: factual_completeness
+      weight: 2.0
+      description: >
+        Using the information contained in the ENUM descriptions, are all key facts from the GPT-4o baseline response preserved in the GPT-4.1 response?
+      scale:
+        - score: 2
+          label: "good"
+          description: >
+            All key facts from the Baseline are preserved; no meaningful
+            information is lost. Minor rewording is fine.
+        - score: 1
+          label: "partial"
+          description: >
+            One or two secondary facts are missing but the core answer
+            is intact.
+        - score: 0
+          label: "bad"
+          description: >
+            Important facts from the Baseline are missing, or the response
+            is substantially incomplete.
+      
+    - id: hallucination_control
+      weight: 2.0
+      description: >
+        Does the GPT-4.1 response avoid introducing claims not grounded
+        in the ENUM descriptions? Check whether the Challenger introduces 
+        claims **not supported** by the ENUM descriptions (CZ + EN) or 
+        the user query context.
+      scale:
+        - score: 2
+          label: "good"
+          description: >
+            Every claim in the Challenger is grounded in the ENUM descriptions 
+            or is a reasonable inference from them.
+        - score: 1
+          label: "partial"
+          description: >
+            Contains one minor ungrounded claim that does not materially mislead the user.
+        - score: 0
+          label: "bad"
+          description: >
+            Contains one or more clearly fabricated or contradictory claims relative to the ENUM content.
+
+    # --- Language Quality ---
+    - id: clarity
+      weight: 1.0
+      description: >
+        Is the GPT-4.1 response easy for a Czech-speaking bank customer
+        to understand? Evaluate how easy it is for a Czech-speaking bank 
+        customer to understand the Challenger response.
+      scale:
+        - score: 2
+          label: "good"
+          description: >
+            Clear, unambiguous language; no confusing phrasing.
+        - score: 1
+          label: "partial"
+          description: >
+            Mostly clear, but one passage could be misunderstood.
+        - score: 0
+          label: "bad"
+          description: >
+            Confusing or ambiguous wording that would likely mislead the customer.
+
+    - id: structure
+      weight: 1.0
+      description: >
+        Is the GPT-4.1 response logically organized (headings, lists,
+        flow)?
+      scale:
+        - score: 2
+          label: "good"
+          description: >
+            Well organized; information is easy to scan and follow.
+        - score: 1
+          label: "partial"
+          description: >
+            Acceptable organization with minor issues (e.g. one long
+            paragraph where a list would help).
+        - score: 0
+          label: "bad"
+          description: >
+            Disorganized; key information is buried or hard to find.
+
+    - id: conciseness
+      weight: 1.0
+      description: >
+        Is the GPT-4.1 response appropriately concise without losing
+        important detail? Evaluate whether the Challenger is appropriately 
+        concise without sacrificing important detail.
+      scale:
+        - score: 2
+          label: "good"
+          description: >
+            Right level of detail; no filler or unnecessary repetition.Concise and to the point; no unnecessary information.
+        - score: 1
+          label: "partial"
+          description: >
+            Some minor verbosity, but core information is still clear. Slightly too verbose or slightly too sparse, but overall acceptable.
+        - score: 0
+          label: "bad"
+          description: >
+            Overly verbose or redundant, obscuring key information. Excessively verbose (adds significant noise) or overly terse (omits needed context), compared to the Baseline.
+
+    - id: tone_appropriateness
+      weight: 1.0
+      description: >
+        Is the tone professional and appropriate for banking customer
+        service in Czech? Evaluate whether the Challenger's tone is suitable for a professional banking customer-service context in Czech.
+      scale:
+        - score: 2
+          label: "good"
+          description: >
+             Professional, friendly, and helpful; consistent with banking standards.
+        - score: 1
+          label: "partial"
+          description: >
+             Mostly appropriate with one minor tone slip (too casual, too formal, or slightly robotic).
+        - score: 0
+          label: "bad"
+          description: >
+             Clearly inappropriate tone (condescending, overly informal, aggressive, or insensitive).
+
+  # ── Input Fields ────────────────────────────────────────────
+  # Data columns passed to the LLM judge for each test case.
+  input_fields:
+    - name: input
+      description: >
+        The original user message (mostly in Czech) that triggered the bot response.
+      required: true
+    - name: run_enum_gpt4o
+      description: >
+        Comma-separated knowledge base ENUM(s) retireved by the bot for this query.
+        Identical across models (ensured by data-preparation filtering).
+      required: true
+    - name: run_enum_desc_cz
+      description: >
+        Full Czech descriptions of the selected ENUM(s) from the knowledge
+        base.  This is the factual ground truth the bot should draw from.
+      required: true
+    - name: run_enum_desc_en
+      description: >
+        Full English descriptions of the selected ENUM(s) from the knowledge
+        base.  Provided so the judge can understand the content regardless
+        of language.
+      required: true
+    - name: run_status_gpt4o
+      description: >
+        Bot status for this query: "continue" (normal answer),
+        "partialFallback" (partial answer), "outputFallback" (could not
+        answer), or "disambiguation" (clarifying question).
+        Identical across models due to filtering.
+      required: true
+    - name: run_response_gpt4o
+      description: >
+        The GPT-4o (baseline) response.  Treat this as the reference
+        response for factual completeness comparison.
+      required: true
+    - name: run_response_gpt41
+      description: >
+        The GPT-4.1 (challenger) response.  This is the primary target
+        of evaluation.
+      required: true
+
+  # ── Output Schema ───────────────────────────────────────────
+  # JSON structure the judge must return (in addition to rubric_scores).
+  # Designed to support comprehensive downstream analysis.
+  output_schema:
+    fields:
+      # --- Overall Comparison ---
+      - name: comparison_verdict
+        type: string
+        description: >
+          Overall quality verdict for the GPT-4.1 response relative to GPT-4o.
+        enum:
+          - better           # GPT-4.1 is clearly better overall
+          - equivalent       # No meaningful quality difference
+          - worse            # GPT-4.1 is clearly worse overall
+          - mixed            # Better on some dimensions, worse on others
+
+      # --- Correctness Detail ---
+      - name: missing_facts
+        type: array
+        description: >
+          List of specific facts present in the GPT-4o response (and
+          grounded in ENUM descriptions) that are absent from GPT-4.1.
+          Empty array if nothing is missing.
+
+      - name: hallucinated_claims
+        type: array
+        description: >
+          List of specific claims in the GPT-4.1 response that are NOT
+          supported by the ENUM descriptions.  Empty array if none found.
+
+      - name: added_information
+        type: array
+        description: >
+          List of facts in GPT-4.1 that are NOT in GPT-4o but ARE grounded
+          in the ENUM descriptions (i.e., valid additions).  Empty array
+          if none found.
+
+      # --- Language Quality Detail ---
+      - name: language_quality_verdict
+        type: string
+        description: >
+          Summary comparison of language quality (clarity + structure +
+          conciseness) between GPT-4.1 and GPT-4o.
+        enum:
+          - better
+          - equivalent
+          - worse
+          - mixed
+
+      - name: tone_issues
+        type: array
+        description: >
+          Specific tone problems in the GPT-4.1 response (e.g., 'too
+          informal', 'condescending phrasing in paragraph 2').
+          Empty array if tone is appropriate.
+
+      # --- Baseline Quality Flag ---
+      - name: baseline_has_errors
+        type: boolean
+        description: >
+          True if the GPT-4o baseline response itself contains factual
+          errors or hallucinations relative to the ENUM descriptions.
+          Allows downstream analysis to flag unreliable baselines.
+
+      - name: baseline_error_details
+        type: string
+        description: >
+          Brief description of baseline errors (only if
+          baseline_has_errors = true).  Empty string otherwise.
+
+      # --- Status-Specific Analysis ---
+      - name: fallback_quality
+        type: string
+        description: >
+          Only populated when run_status is 'outputFallback' or
+          'partialFallback'.  Rates the Challenger's fallback handling.
+        enum:
+          - better_than_baseline
+          - equivalent_to_baseline
+          - worse_than_baseline
+          - not_applicable      # status is 'continue' or 'disambiguation'
+
+      # --- Summary & Recommendation ---
+      - name: overall_explanation
+        type: string
+        description: >
+          3-5 sentence summary of the comparison.  Must reference the
+          rubric scores, note key differences, and justify the
+          comparison_verdict.  Written in English.
+
+      - name: upgrade_safe
+        type: boolean
+        description: >
+          True if switching from GPT-4o to GPT-4.1 would be safe for
+          this test case (no factual regressions, acceptable language
+          quality).  False if any correctness dimension scored 0 or
+          the weighted average is below pass_threshold.
+
+    additional_instructions: |
+      ## Output Rules
+      - Set upgrade_safe=false if factual_completeness=0 OR hallucination_control=0.
+      - Set upgrade_safe=false if the weighted average of all dimensions < 1.4.
+      - Set fallback_quality="not_applicable" when run_status is "continue" or "disambiguation".
+      - Keep overall_explanation between 150 and 500 characters.
+      - All array fields (missing_facts, hallucinated_claims, added_information, tone_issues)
+        must be arrays of strings.  Use an empty array [] when nothing applies.
+      - If baseline_has_errors=false, set baseline_error_details to "".
+      - The comparison_verdict must be consistent with the dimension scores:
+        - "better"     → weighted avg > baseline-equivalent AND no dim scored 0
+        - "equivalent" → all dimensions scored 2
+        - "worse"      → any correctness dimension scored 0, or weighted avg < 1.4
+        - "mixed"      → some dimensions improved, some degraded

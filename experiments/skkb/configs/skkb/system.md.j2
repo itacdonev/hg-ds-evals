@@ -1,0 +1,100 @@
+# {{ rubric.metadata.name }}
+
+{{ rubric.metadata.persona }}
+
+## ROLE & CORE TASK
+
+{{ rubric.metadata.description }}
+
+{% if rubric.critical_evaluation_rules %}
+## CRITICAL EVALUATION RULES
+{{ rubric.critical_evaluation_rules }}
+{% endif %}
+
+
+{% if rubric.system_context %}
+## SYSTEM CONTEXT
+{{ rubric.system_context }}
+{% endif %}
+
+
+## INPUTS
+{% for field in rubric.input_fields %}
+* **{{ field.name }}**{% if not field.required %} (optional){% endif %}: {{ field.description }}
+{% endfor %}
+
+
+{% if rubric.output_schema and rubric.output_schema.additional_instructions %}
+{{ rubric.output_schema.additional_instructions }}
+{% endif %}
+
+
+## EVALUATION RUBRICS
+Score each dimension with 0 (zero), 1 (one) or 2 (two). Provide score and reasoning for the dimensions:
+
+{% for dim in rubric.dimensions %}
+### {{ loop.index }}. **{{ dim.name }}** ({{ dim.id }})
+
+**Question**: {{ dim.description }}
+
+{% for level in dim.scale %}
+- **Score {{ level.score }} ({{ level.label }})**: {{ level.description }}
+{% endfor %}
+
+{% endfor %}
+
+
+{% if rubric.root_cause_categories %}
+## ROOT CAUSE CATEGORIES
+{{ rubric.root_cause_categories }}
+{% endif %}
+
+
+{% if rubric.domain_specific_guidance %}
+## DOMAIN-SPECIFIC GUIDANCE
+{{ rubric.domain_specific_guidance }}
+{% endif %}
+
+
+## OUTPUT FORMAT
+Return ONLY valid JSON with this exact structure:
+
+```json
+{
+  "rubric_scores": {
+{% for dim in rubric.dimensions %}
+    "{{ dim.id }}": {
+      "score": 0,
+      "reasoning": "..."
+    }{% if not loop.last %},{% endif %}
+
+{% endfor %}
+  }{% if rubric.output_schema and rubric.output_schema.fields %},
+{% for field in rubric.output_schema.fields %}
+{% if field.field_type == "boolean" %}
+    "{{ field.name }}": false{% elif field.field_type == "array" %}
+    "{{ field.name }}": ["..."]{% elif field.field_type == "number" %}
+    "{{ field.name }}": 0{% elif field.enum %}
+    "{{ field.name }}": "{{ field.enum[0] }}"{% else %}
+    "{{ field.name }}": "..."{% endif %}{% if not loop.last %},{% endif %}
+
+{% endfor %}
+{% endif %}
+}
+```
+{% if rubric.output_schema and rubric.output_schema.fields %}
+
+### Output Field Descriptions
+{% for field in rubric.output_schema.fields %}
+- **{{ field.name }}** ({{ field.field_type }}): {{ field.description }}
+{% if field.enum %}
+  Allowed values: {{ field.enum | join(', ') }}
+{% endif %}
+{% endfor %}
+{% endif %}
+
+
+{% if rubric.final_reminders %}
+## FINAL REMINDERS
+{{ rubric.final_reminders }}
+{% endif %}

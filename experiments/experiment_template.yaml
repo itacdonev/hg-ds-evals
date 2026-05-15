@@ -1,0 +1,150 @@
+# ─────────────────────────────────────────────────────────────
+# EXPERIMENT TEMPLATE
+# ─────────────────────────────────────────────────────────────
+# Copy this file into the appropriate eval-type folder and rename:
+#   cp experiment_template.yaml fallback/fallback_exp_003_my_idea.yaml
+#
+# Naming convention:
+#   {eval_type}_exp_{number:03d}_{short_description}.yaml
+#
+# The filename becomes the experiment ID — used for checkpoint
+# files and result table naming.
+#
+# Sections are ordered top-to-bottom: generic → specific.
+# Omit any optional section to keep base rubric defaults.
+# ─────────────────────────────────────────────────────────────
+
+
+# ── Experiment Metadata ───────────────────────────────────────
+# Basic info about this experiment. Used for tracking and logs.
+experiment:
+  name: ""                          # Must match filename stem
+  description: ""                   # What is this experiment testing?
+  version: "1.0.0"                  # Bump when re-running with changes
+  author: ""                        # Who created this experiment
+  created_date: ""                  # YYYY-MM-DD
+  tags: []                          # e.g. ["baseline", "gpt-5", "production"]
+  persona: ""                       # System persona for the LLM judge (e.g. "You are an expert banking QA evaluator.")
+
+
+# ── Model Configuration ──────────────────────────────────────
+# LLM judge settings. These rarely change between experiments
+# within the same eval type.
+model:
+  model_deployment_name: "gpt-5"    # Azure deployment or Databricks serving endpoint name
+  api_provider: "azure_async"       # "azure_async" | "azure_sync" | "databricks_async"
+  # databricks_endpoint_url: "https://adb-3174992876438447.7.azuredatabricks.net/serving-endpoints/gpt-5-1/invocations"
+  temperature: 0.7                  # 0.0 = deterministic, 1.0 = creative
+  max_output_tokens: 15000          # Max tokens in judge response
+  reasoning_effort: "medium"        # "low" | "medium" | "high"
+  max_concurrent_calls: 2           # Parallel API calls
+  # tpm_limit: 300000               # Optional override when the model is absent from ds_common.llm_models_config
+
+
+# ── Dataset Configuration ────────────────────────────────────
+# Input data source and sampling.
+dataset:
+  input_dataset: ""                 # Table name (without catalog/schema prefix)
+  input_schema: ""                  # Schema (database) name inside the DBX catalog
+  test_num_rows: 10                 # Set to null for production runs
+  id_columns:                       # Row identifier columns for checkpoint tracking
+    - session_id
+    - flow_sequence
+    - event_id
+  eval_columns:                     # Columns to extract from input table
+    - session_id
+    - flow_sequence
+    - event_id
+    # Add task-specific columns below:
+    # - user_query
+    # - bot_response
+  passthrough_columns: []           # Columns preserved in checkpoint CSV. Good for metadata (dates, labels).
+                                    # Example:
+                                    #   - event_date
+                                    #   - intent_category
+
+
+# ── Paths ─────────────────────────────────────────────────────
+# Checkpoint and output configuration.
+# Result filenames are auto-derived from the YAML filename.
+paths:
+  checkpoint_dir: "checkpoints"
+
+
+# ── Rubric Configuration ─────────────────────────────────────
+# `base` references a pre-defined Python rubric. Available bases:
+#   - "fallback"      → core dimensions (user_query_clarity, topic_relevance)
+#   - "fallback_full" → all dimensions (+ information_completeness)
+#   - null            → no base, define everything from scratch
+#
+# Any section below (dimensions, input_fields, output_schema)
+# is OPTIONAL. Omit a section → keeps base defaults.
+# Include a section → full override.
+rubric:
+  base: ""                          # Required: name of base rubric
+  pass_threshold: 1.5               # Weighted avg threshold to pass
+  judge_instructions: ""            # Extra instructions for the LLM judge
+
+  # ── Prompt-Section Fields (optional) ───────────────────────
+  # Each of these maps to a conditional section in the system
+  # prompt template (system.md.j2). Leave empty or omit entirely
+  # to skip that section in the rendered prompt.
+  #
+  critical_evaluation_rules: ""     # Hard rules the judge must follow
+  system_context: ""                # Domain / system context for the judge
+  root_cause_categories: ""         # Taxonomy of root-cause labels
+  domain_specific_guidance: ""      # Domain-specific scoring guidance
+  final_reminders: ""               # Final reminders appended at the end
+
+  # ── Dimensions (optional) ──────────────────────────────────
+  # Which dimensions to evaluate. Acts as filter + weight override
+  # when a base rubric is set. Completely new dimensions can also
+  # be defined here (must include id, name, description, and scale).
+  # Omit this section entirely to use all dimensions from the base.
+  #
+  # Note: `scale` must be a list of objects with keys:
+  #   score (int), label (str), description (str)
+  #
+  dimensions:
+    - id: dimension_name
+      name: "Dimension Display Name"
+      weight: 1.0
+      description: >
+        What this dimension evaluates and how to score it.
+      scale:
+        - score: 2
+          label: "good"
+          description: >
+            All key facts from the Baseline are preserved; no meaningful
+            information is lost. Minor rewording is fine.
+        - score: 1
+          label: "partial"
+          description: >
+            One or two secondary facts are missing but the core answer
+            is intact.
+        - score: 0
+          label: "bad"
+          description: >
+            Important facts from the Baseline are missing, or the response
+            is substantially incomplete.
+
+  # ── Input Fields (optional) ────────────────────────────────
+  # What data the LLM judge receives. Omit to use base defaults.
+  #
+  # input_fields:
+  #   - name: field_name
+  #     description: "What this field contains."
+  #     required: true
+
+  # ── Output Schema (optional) ───────────────────────────────
+  # JSON structure the LLM judge must return (in addition to
+  # rubric_scores). Omit to use base defaults.
+  #
+  # output_schema:
+  #   fields:
+  #     - name: field_name
+  #       type: string              # string | boolean | array | number
+  #       description: "What the judge should output here."
+  #       enum: []                  # Optional: constrain values
+  #   additional_instructions: |
+  #     Extra rules for the judge output.

@@ -1,0 +1,369 @@
+[
+  {
+    "type": "function",
+    "function": {
+      "name": "mock_banking_get_accounts",
+      "description": "List the user's bank accounts with balances.\n\nUSE THIS TOOL WHEN: The user asks about their accounts, balances,\ndisposable amount, overdraft, wants to see all accounts, or refers\nto an account by name or alias.\n\nDO NOT USE WHEN: The user asks about a specific account's interest rates\nor detailed terms -- use mock_banking_get_account_detail instead.",
+      "parameters": {
+        "properties": {
+          "account_type": {
+            "type": "string",
+            "description": "Filter accounts by type. 'all' returns every account. Example: 'CURRENT' for checking accounts, 'SAVING' for savings.",
+            "enum": [
+              "all",
+              "CURRENT",
+              "SAVING",
+              "LOAN",
+              "MORTGAGE"
+            ]
+          },
+          "include_details": {
+            "type": "boolean",
+            "description": "If true, return full account details including rates, flags, and sub-objects. If false, return summary with balance only."
+          },
+          "search_text": {
+            "description": "Fuzzy search against account alias or product name. Handles partial matches. Example: 'vacation' matches 'Vacation Fund'. Use when the user refers to an account by name."
+          }
+        },
+        "type": "object",
+        "additionalProperties": false
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "mock_banking_get_account_detail",
+      "description": "Get full details for a specific bank account including reservations.\n\nUSE THIS TOOL WHEN: The user asks about interest rates, overdraft terms,\nloan details, saving goals, saving targets, pending transactions,\nreserved amounts, or specific account features.\n\nDO NOT USE WHEN: The user just wants to see their balance -- use\nmock_banking_get_accounts instead.",
+      "parameters": {
+        "properties": {
+          "account_id": {
+            "type": "string",
+            "description": "Account ID to look up. Get this from a previous mock_banking_get_accounts call. Example: 'ACC001'"
+          },
+          "include_reservations": {
+            "type": "boolean",
+            "description": "If true, include pending card reservations (authorized but not yet booked transactions). Shows merchant name, amount, date, and status."
+          }
+        },
+        "type": "object",
+        "required": [
+          "account_id"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "mock_banking_get_cards",
+      "description": "List the user's payment cards.\n\nUSE THIS TOOL WHEN: The user asks about their cards, card status,\nexpiry dates, card types, card delivery status, or whether a card\nis active/blocked.\n\nDO NOT USE WHEN: The user asks about specific card limits or credit\ncard outstanding -- use mock_banking_get_card_detail instead.",
+      "parameters": {
+        "properties": {
+          "card_type": {
+            "type": "string",
+            "description": "Filter cards by type. 'all' returns every card. Example: 'CREDIT' for credit cards, 'BANK_CARD' for debit cards.",
+            "enum": [
+              "all",
+              "CREDIT",
+              "BANK_CARD",
+              "VIRTUAL_DEBIT",
+              "VIRTUAL_CREDIT"
+            ]
+          },
+          "include_limits": {
+            "type": "boolean",
+            "description": "If true, include ATM/POS/internet daily and monthly limits. If false, return card summary without limit details."
+          }
+        },
+        "type": "object",
+        "additionalProperties": false
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "mock_banking_get_card_detail",
+      "description": "Get full details for a specific payment card.\n\nUSE THIS TOOL WHEN: The user asks about exact card limits (ATM, POS,\ninternet), temporary limits, credit card outstanding, installment due date,\nminimum repayment, 3D Secure status, delivery mode, or specific features.\n\nDO NOT USE WHEN: The user just wants to list their cards -- use\nmock_banking_get_cards instead.",
+      "parameters": {
+        "properties": {
+          "card_id": {
+            "type": "string",
+            "description": "Card ID to look up. Get this from a previous mock_banking_get_cards call. Example: 'CARD001'"
+          }
+        },
+        "type": "object",
+        "required": [
+          "card_id"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "mock_banking_search_transactions",
+      "description": "Search and filter the user's transactions with fuzzy merchant matching.\n\nUSE THIS TOOL WHEN: The user asks about transactions, payments, spending\nat a specific store, salary received, recent activity, \"did I get paid?\",\nATM withdrawals, standing orders, card transactions, or wants to exclude\nown-account transfers from results.\n\nDO NOT USE WHEN: The user asks for aggregated spending summaries or top\nmerchants -- use mock_banking_spending_summary instead.\n\nIMPORTANT: Use EITHER search_text OR category, never both together.\n\"How much on food?\" -> use category=\"FOOD\" (not search_text).\n\"How much at Lidl?\" -> use search_text=\"Lidl\" (not category).",
+      "parameters": {
+        "properties": {
+          "account_id": {
+            "description": "Account ID to search transactions for. Get this from mock_banking_get_accounts. None searches all accounts. Example: 'ACC001'"
+          },
+          "search_text": {
+            "description": "Fuzzy text search against merchant name, title, description, partner name. Handles abbreviations and variants (e.g. 'McD' matches 'McDonald\\'s'). Example: 'McDonalds', 'Starbucks', 'Shell'"
+          },
+          "direction": {
+            "type": "string",
+            "description": "Filter by direction. 'INCOMING' for received, 'OUTGOING' for paid.",
+            "enum": [
+              "all",
+              "INCOMING",
+              "OUTGOING"
+            ]
+          },
+          "category": {
+            "type": "string",
+            "description": "Filter by spending category. Includes both expense AND income categories.",
+            "enum": [
+              "all",
+              "FOOD",
+              "CAR",
+              "LIVING_AND_ENERGY",
+              "LEISURE",
+              "HEALTH",
+              "CLOTHING",
+              "COMMUNICATION",
+              "EDUCATION",
+              "TRANSPORT",
+              "TRAVEL_HOLIDAYS",
+              "ONLINE_SHOPPING",
+              "SAVINGS_INVESTMENT",
+              "WITHDRAWAL",
+              "OTHER_EXPENSES",
+              "ALIMONY_POCKET_MONEY",
+              "TAXES",
+              "FEES",
+              "UNCATEGORIZED_EXPENSE",
+              "REGULAR_INCOME",
+              "NON_REGULAR_INCOME",
+              "UNCATEGORIZED_INCOME"
+            ]
+          },
+          "from_date": {
+            "description": "Start date filter in YYYY-MM-DD format."
+          },
+          "to_date": {
+            "description": "End date filter in YYYY-MM-DD format."
+          },
+          "amount_min": {
+            "description": "Minimum absolute transaction amount."
+          },
+          "amount_max": {
+            "description": "Maximum absolute transaction amount."
+          },
+          "card_number": {
+            "description": "Filter transactions by masked card number (e.g. '451161XXXXXX6044'). Use when the user asks about spending on a specific card."
+          },
+          "transaction_type": {
+            "type": "string",
+            "description": "Filter by transaction type. Use for standing orders, ATM withdrawals, etc.",
+            "enum": [
+              "all",
+              "ATM",
+              "STANDINGORDER",
+              "CREDITCARDCOLLECTION",
+              "POSPAYMENT",
+              "CASHCOLLECTION",
+              "INSTANTPAYMENT",
+              "FOREIGN",
+              "MOBILEPAYMENT",
+              "SIPO"
+            ]
+          },
+          "exclude_own_transfers": {
+            "type": "boolean",
+            "description": "Exclude transfers between user's own accounts. Critical for accurate spending totals. Set to False only when user explicitly asks about own transfers."
+          },
+          "limit": {
+            "type": "integer",
+            "description": "Maximum transactions to return (1-100)."
+          },
+          "offset": {
+            "type": "integer",
+            "description": "Number of results to skip for pagination."
+          },
+          "sort": {
+            "type": "string",
+            "description": "Sort order. Default: newest first.",
+            "enum": [
+              "newest",
+              "oldest",
+              "amount_desc",
+              "amount_asc"
+            ]
+          }
+        },
+        "type": "object",
+        "additionalProperties": false
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "mock_banking_spending_summary",
+      "description": "Get aggregated spending summary by category, merchant, week, or month.\n\nUSE THIS TOOL WHEN: The user asks \"how much did I spend on food?\",\n\"top merchants?\", \"monthly spending trend?\", \"spending by subcategory?\",\nor wants to compare spending across categories or time periods.\n\nDO NOT USE WHEN: The user asks about specific transactions -- use\nmock_banking_search_transactions instead.",
+      "parameters": {
+        "properties": {
+          "account_id": {
+            "description": "Account ID. None includes all accounts. Example: 'ACC001'"
+          },
+          "from_date": {
+            "description": "Start date in YYYY-MM-DD format."
+          },
+          "to_date": {
+            "description": "End date in YYYY-MM-DD format."
+          },
+          "group_by": {
+            "type": "string",
+            "description": "How to group spending. 'category' = by main type (FOOD, CAR, etc.), 'subcategory' = detailed breakdown within categories, 'merchant' = by store/vendor (with fuzzy normalization), 'week' = ISO week, 'month' = YYYY-MM.",
+            "enum": [
+              "category",
+              "subcategory",
+              "merchant",
+              "week",
+              "month"
+            ]
+          },
+          "category": {
+            "type": "string",
+            "description": "Filter to specific category before grouping. When group_by='subcategory', this scopes which main category to break down.",
+            "enum": [
+              "all",
+              "FOOD",
+              "CAR",
+              "LIVING_AND_ENERGY",
+              "LEISURE",
+              "HEALTH",
+              "CLOTHING",
+              "COMMUNICATION",
+              "EDUCATION",
+              "TRANSPORT",
+              "TRAVEL_HOLIDAYS",
+              "ONLINE_SHOPPING",
+              "SAVINGS_INVESTMENT",
+              "WITHDRAWAL",
+              "OTHER_EXPENSES"
+            ]
+          },
+          "card_number": {
+            "description": "Filter spending to a specific card number before aggregation."
+          },
+          "exclude_own_transfers": {
+            "type": "boolean",
+            "description": "Exclude own transfers from spending totals."
+          },
+          "top_n": {
+            "type": "integer",
+            "description": "Number of top groups to return (1-50)."
+          }
+        },
+        "type": "object",
+        "additionalProperties": false
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "mock_banking_get_budget_status",
+      "description": "Check budget usage and remaining amounts by spending category.\n\nUSE THIS TOOL WHEN: The user asks \"how much budget left for food?\",\n\"am I on track?\", \"budget status?\", or mentions spending limits.\n\nDO NOT USE WHEN: The user asks about actual transactions -- use\nmock_banking_search_transactions instead.",
+      "parameters": {
+        "properties": {
+          "category": {
+            "type": "string",
+            "description": "Budget category to check. 'all' returns all budgets.",
+            "enum": [
+              "all",
+              "FOOD",
+              "CAR",
+              "LIVING_AND_ENERGY",
+              "LEISURE",
+              "HEALTH",
+              "CLOTHING",
+              "COMMUNICATION",
+              "EDUCATION",
+              "TRANSPORT",
+              "TRAVEL_HOLIDAYS",
+              "ONLINE_SHOPPING",
+              "SAVINGS_INVESTMENT",
+              "WITHDRAWAL",
+              "OTHER_EXPENSES",
+              "ALIMONY_POCKET_MONEY",
+              "TAXES",
+              "FEES",
+              "UNCATEGORIZED_EXPENSE",
+              "REGULAR_INCOME",
+              "NON_REGULAR_INCOME",
+              "UNCATEGORIZED_INCOME"
+            ]
+          }
+        },
+        "type": "object",
+        "additionalProperties": false
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "mock_banking_find_merchant",
+      "description": "Find merchant names that fuzzy-match a search query.\n\nUSE THIS TOOL WHEN: You need to disambiguate a merchant name before\nsearching transactions, or the user asks \"what merchants match X?\".\n\nDO NOT USE WHEN: You want to search transactions directly --\nuse mock_banking_search_transactions(search_text=...)\nwhich has built-in fuzzy matching.",
+      "parameters": {
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "Merchant name or abbreviation to search for. Example: 'McD', 'starbucks', 'albert'"
+          },
+          "limit": {
+            "type": "integer",
+            "description": "Maximum number of merchant matches to return (1-20)."
+          }
+        },
+        "type": "object",
+        "required": [
+          "query"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "knowledge_search",
+      "description": "Search the knowledge base (groups: KB_GAI_SK_SK_2026-03-17_17h26) for information about bank products, services, policies, fees, eligibility, limits, features, app/portal instructions, and other institution-specific topics. Returns relevant knowledge documents with group name, summary, and description. Use this tool whenever the user asks about bank-specific information. Pass the user's message as-is into the question parameter. Optionally provide query variations in 'queries' and expected facets in 'expected_facets'.",
+      "parameters": {
+        "properties": {
+          "question": {
+            "type": "string",
+            "description": "The user's original question, passed verbatim. Do NOT rephrase, shorten, or extract keywords — pass the full user message exactly as stated."
+          },
+          "queries": {
+            "description": "Optional query variations covering different angles of the question. If empty, the question itself is used as the single query."
+          },
+          "expected_facets": {
+            "description": "Optional aspects the answer should cover (e.g. 'fees', 'eligibility')."
+          }
+        },
+        "type": "object",
+        "required": [
+          "question"
+        ]
+      }
+    }
+  }
+]

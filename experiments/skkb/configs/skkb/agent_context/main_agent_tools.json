@@ -1,0 +1,24 @@
+[
+  {
+    "type": "function",
+    "function": {
+      "name": "Router",
+      "description": "",
+      "parameters": {
+        "properties": {
+          "next": {
+            "type": "string",
+            "enum": [
+              "daily_banking_agent",
+              "FINISH"
+            ]
+          }
+        },
+        "type": "object",
+        "required": [
+          "next"
+        ]
+      }
+    }
+  }
+]

@@ -1,0 +1,23 @@
+# This is a Databricks asset bundle definition for hg-ds-evals.
+# The Databricks extension requires databricks.yml configuration file.
+# See https://docs.databricks.com/dev-tools/bundles/index.html for documentation.
+
+bundle:
+  name: hg-ds-evals
+
+targets:
+  dev:
+    mode: development
+    default: true
+    workspace:
+      host: https://adb-3174992876438447.7.azuredatabricks.net
+      root_path: /Workspace/Users/${workspace.current_user.userName}/hg-ds-evals
+      file_path: /Workspace/Users/${workspace.current_user.userName}/hg-ds-evals
+      artifact_path: /Workspace/Users/${workspace.current_user.userName}/hg-ds-evals/.artifacts
+      state_path: /Workspace/Users/${workspace.current_user.userName}/hg-ds-evals/.state
+
+  ## Optionally, there could be 'staging' or 'prod' targets here.
+  #
+  # prod:
+  #   workspace:
+  #     host: https://adb-3174992876438447.7.azuredatabricks.net
