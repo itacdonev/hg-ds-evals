@@ -995,6 +995,8 @@ def _case_payload(r: pd.Series) -> dict:
         "critical_zero": bool(r["_critical_zero"]) if "_critical_zero" in r.index else False,
         "expert_score": float(r["expert_score"]) if pd.notna(r.get("expert_score")) else None,
         "rel2_score": float(r["enum_relevance_score"]) if pd.notna(r.get("enum_relevance_score")) else None,
+        "enum_recall": float(r["enum_recall"]) if pd.notna(r.get("enum_recall")) else None,
+        "enum_precision": float(r["enum_precision"]) if pd.notna(r.get("enum_precision")) else None,
         "enum_f1": float(r["enum_f1"]) if pd.notna(r.get("enum_f1")) else None,
         "root_cause": g("root_cause_category"),
         "user_query": g("user_query"),
@@ -3463,25 +3465,56 @@ def _judge_eval_rel2_html(df: pd.DataFrame) -> str:
 
 
 def _build_kb_data(df: pd.DataFrame) -> dict:
-    """Aggregate every distinct KB entry that appeared in any case's reranked
-    context, keyed by ``enum_id``. Each entry holds the SK + EN description
-    (parsed from ``reranked_enums_kb_cz`` / ``_en`` JSON columns) and the
-    sorted list of test cases that referenced it. Empty dict if the columns
-    are missing.
+    """Aggregate every distinct KB entry referenced by any case, keyed by
+    ``enum_id``. Each entry holds:
+
+      - ``cz`` / ``en``       — language descriptions parsed from the
+        ``reranked_enums_kb_*`` and ``post_prune_candidates_kb_*`` columns.
+        We ingest from both so an expected ENUM that's only ever present
+        in the post-prune pool (never reranker-selected) still picks up
+        its description.
+      - ``reranked_cases``    — cases that picked this entry into their
+        reranked selection.
+      - ``expected_cases``    — cases that had this entry in their gold
+        ``expected_enums`` list, regardless of whether the reranker
+        actually selected it.
+
+    The KB tab's per-case filter uses these two sets to decide which
+    rows to show when filtered to a single case, and to colour each row
+    by its status for that case:
+      - in BOTH expected and reranked → correctly selected (green)
+      - in expected only              → missed by reranker (blue)
+      - in reranked only              → wrongly selected / distractor (red)
+
+    Empty dict when none of the relevant columns are present.
     """
-    cz_col = "reranked_enums_kb_cz" if "reranked_enums_kb_cz" in df.columns else None
-    en_col = "reranked_enums_kb_en" if "reranked_enums_kb_en" in df.columns else None
-    if not (cz_col or en_col):
+    cz_col_re = "reranked_enums_kb_cz"        if "reranked_enums_kb_cz"        in df.columns else None
+    en_col_re = "reranked_enums_kb_en"        if "reranked_enums_kb_en"        in df.columns else None
+    cz_col_pp = "post_prune_candidates_kb_cz" if "post_prune_candidates_kb_cz" in df.columns else None
+    en_col_pp = "post_prune_candidates_kb_en" if "post_prune_candidates_kb_en" in df.columns else None
+    if not (cz_col_re or en_col_re or cz_col_pp or en_col_pp):
         return {}
-    kb: dict[str, dict] = {}
-    for _, r in df.iterrows():
-        tc = "" if pd.isna(r.get("test_case_id")) else str(r.get("test_case_id"))
-        for col, lang in ((cz_col, "cz"), (en_col, "en")):
-            if not col:
-                continue
-            raw = r.get(col)
-            if raw is None or (isinstance(raw, float) and pd.isna(raw)):
-                continue
+
+    def _unescape(desc: str) -> str:
+        # Upstream JSON often double-escapes whitespace (\\n / \\r / \\t
+        # in the source instead of \n / \r / \t), so json.loads gives
+        # us a literal backslash+letter. Convert to real whitespace so
+        # CSS white-space:pre-wrap renders proper line breaks.
+        return (desc.replace("\\r\\n", "\n")
+                       .replace("\\n", "\n")
+                       .replace("\\r", "\n")
+                       .replace("\\t", "\t"))
+
+    # ── Step 1: build a global enum_id → {cz, en} description index ──────
+    # Walk every column that could carry a description; first non-empty
+    # value per (enum, lang) wins. This lets us back-fill descriptions
+    # for expected ENUMs that were never reranker-selected anywhere.
+    descriptions: dict[str, dict[str, str]] = {}
+    for col, lang in ((cz_col_re, "cz"), (en_col_re, "en"),
+                       (cz_col_pp, "cz"), (en_col_pp, "en")):
+        if not col:
+            continue
+        for raw in df[col].dropna():
             try:
                 items = json.loads(raw) if isinstance(raw, str) else raw
             except (TypeError, json.JSONDecodeError):
@@ -3495,25 +3528,49 @@ def _build_kb_data(df: pd.DataFrame) -> dict:
                 if not eid:
                     continue
                 desc = it.get("description") or ""
-                # Upstream JSON often double-escapes whitespace (\\n / \\r / \\t
-                # in the source instead of \n / \r / \t), so json.loads gives
-                # us a literal backslash+letter. Convert to real whitespace so
-                # CSS white-space:pre-wrap renders proper line breaks.
-                desc = (desc.replace("\\r\\n", "\n")
-                              .replace("\\n", "\n")
-                              .replace("\\r", "\n")
-                              .replace("\\t", "\t"))
-                entry = kb.setdefault(eid, {"cz": "", "en": "", "cases": set()})
-                if not entry[lang] and desc:
-                    entry[lang] = desc
-                if tc:
-                    entry["cases"].add(tc)
-    # Stabilize order — by numeric tail of test_case_id, then string.
+                if not desc:
+                    continue
+                bucket = descriptions.setdefault(eid, {"cz": "", "en": ""})
+                if not bucket[lang]:
+                    bucket[lang] = _unescape(desc)
+
+    # ── Step 2: tag expected / reranked membership per enum per case ─────
+    kb: dict[str, dict] = {}
+
+    def _ensure(eid: str) -> dict:
+        return kb.setdefault(eid, {
+            "cz": descriptions.get(eid, {}).get("cz", ""),
+            "en": descriptions.get(eid, {}).get("en", ""),
+            "reranked_cases": set(),
+            "expected_cases": set(),
+        })
+
+    for _, r in df.iterrows():
+        tc = "" if pd.isna(r.get("test_case_id")) else str(r.get("test_case_id"))
+        if not tc:
+            continue
+
+        reranked_ids = r.get("_reranked_enum_ids") or []
+        if isinstance(reranked_ids, list):
+            for eid in reranked_ids:
+                eid = str(eid).strip()
+                if eid:
+                    _ensure(eid)["reranked_cases"].add(tc)
+
+        expected_ids = r.get("_expected_enums") or []
+        if isinstance(expected_ids, list):
+            for eid in expected_ids:
+                eid = str(eid).strip()
+                if eid:
+                    _ensure(eid)["expected_cases"].add(tc)
+
+    # Stabilize case-list order — by numeric tail of test_case_id, then string.
     def _tc_key(t: str):
         m = re.search(r"\d+", t)
         return (int(m.group()) if m else 10**9, t)
     for v in kb.values():
-        v["cases"] = sorted(v["cases"], key=_tc_key)
+        v["reranked_cases"] = sorted(v["reranked_cases"], key=_tc_key)
+        v["expected_cases"] = sorted(v["expected_cases"], key=_tc_key)
     return kb
 
 
@@ -3526,17 +3583,39 @@ def _render_kb_html(kb_data: dict) -> str:
             "<code>reranked_enums_kb_en</code> columns in the checkpoint.</p>"
             "</div>"
         )
-    items = sorted(kb_data.items(), key=lambda x: (-len(x[1]["cases"]), x[0]))
+    # Sort by total unique cases (union of expected + reranked), then by
+    # enum_id. This keeps the most-referenced entries at the top whether
+    # they were referenced as gold expectations, selections, or both.
+    def _sort_key(item):
+        eid, entry = item
+        all_cases = set(entry["reranked_cases"]) | set(entry["expected_cases"])
+        return (-len(all_cases), eid)
+    items = sorted(kb_data.items(), key=_sort_key)
+    # Same numeric-tail-aware key used by _build_kb_data for stable ordering.
+    def _tc_key(t: str):
+        m = re.search(r"\d+", t)
+        return (int(m.group()) if m else 10**9, t)
     rows_html = ""
     for eid, entry in items:
-        n_cases = len(entry["cases"])
-        ids_attr = _h(json.dumps(entry["cases"]))
+        reranked_cases = entry["reranked_cases"]
+        expected_cases = entry["expected_cases"]
+        all_cases = sorted(set(reranked_cases) | set(expected_cases), key=_tc_key)
+        n_total      = len(all_cases)
+        n_reranked   = len(reranked_cases)
+        n_expected   = len(expected_cases)
+        all_ids_attr      = _h(json.dumps(all_cases))
+        reranked_ids_attr = _h(json.dumps(reranked_cases))
+        expected_ids_attr = _h(json.dumps(expected_cases))
         label = _h(f"KB enum: {eid}")
+        # Case-count link surfaces the union of cases (most useful for
+        # drilling-in); the tooltip explains the breakdown so the reader
+        # knows how many of those cases had it as expected vs selected.
         cases_link = (
             f"<a href='#' class='judge-eval-link' "
-            f"data-ids='{ids_attr}' data-label='{label}' "
-            f"title='Show the {n_cases} cases that referenced this entry'>"
-            f"{n_cases} {'case' if n_cases == 1 else 'cases'}</a>"
+            f"data-ids='{all_ids_attr}' data-label='{label}' "
+            f"title='Show the {n_total} cases that referenced this entry "
+            f"({n_expected} as expected · {n_reranked} as reranker selection)'>"
+            f"{n_total} {'case' if n_total == 1 else 'cases'}</a>"
         )
         cz_html = _h(entry["cz"]) if entry["cz"] else "<em class='lang-fallback'>(no CZ text)</em>"
         en_html = _h(entry["en"]) if entry["en"] else "<em class='lang-fallback'>(no EN text)</em>"
@@ -3544,10 +3623,15 @@ def _render_kb_html(kb_data: dict) -> str:
         search_text = _h((eid + " " + entry["cz"] + " " + entry["en"]).lower())
         rows_html += (
             f"<div class='kb-row collapsed' data-search='{search_text}' "
-            f"data-ids='{ids_attr}'>"
+            f"data-ids='{all_ids_attr}' "
+            f"data-reranked-cases='{reranked_ids_attr}' "
+            f"data-expected-cases='{expected_ids_attr}'>"
             f"<div class='kb-row-head'>"
             f"<span class='kb-chev' aria-hidden='true'>▶</span>"
             f"<code class='kb-id'>{_h(eid)}</code>"
+            # Empty badge — JS fills in (and the row class drives the colour)
+            # only when the KB tab is filtered to a specific case.
+            f"<span class='kb-status-badge' aria-hidden='true'></span>"
             f"<span class='kb-cases-count'>{cases_link}</span>"
             f"</div>"
             f"<div class='kb-desc lang-cz'>{cz_html}</div>"
@@ -3558,8 +3642,7 @@ def _render_kb_html(kb_data: dict) -> str:
         "<div class='card'>"
         f"<div class='card-title'>Knowledge base — {len(items)} unique entries appearing in reranked context</div>"
         "<p style='font-size:12px;color:#537090;margin-bottom:10px'>"
-        "Aggregated from each case's <code>reranked_enums_kb_cz</code> / "
-        "<code>reranked_enums_kb_en</code>. Use the CZ / EN switch on the right to flip language. "
+        "Use the CZ / EN switch on the right to flip language. "
         "Click the case-count link to filter the Test Cases tab to those rows."
         "</p>"
         "<div class='kb-toolbar'>"
@@ -4036,6 +4119,8 @@ a.case-link:hover { text-decoration: underline; }
 .enum-chip.neutral { background: #edf0f4; color: #5c7999; font-weight: 500; }
 .enum-chip.expected-row { background: #e0eafd; color: #0a285c;
                           font-weight: 800; }
+.enum-chip.expected-missed { background: #edf0f4; color: #5c7999;
+                             font-weight: 600; }
 .enum-rows { display: flex; flex-direction: column; gap: 4px;
              background: #f4f6fa; border-radius: 6px;
              padding: 10px 12px; font-size: 12px; font-family: monospace;
@@ -4112,6 +4197,33 @@ a.case-link:hover { text-decoration: underline; }
                   border-radius: 6px; font-size: 11px; color: #0a285c; }
 .kb-case-banner.visible { display: block; }
 .kb-case-banner strong { font-weight: 700; }
+/* Per-case status colouring on the KB tab. Same palette as the per-case
+   ENUMs panel on the Test Cases tab so the two views read consistently:
+     correct    = green  (in expected AND reranked — selected & wanted)
+     missed     = blue   (in expected only — should have been selected)
+     distractor = red    (in reranked only — selected but not expected)
+   Tints applied only when the KB tab is filtered to a single case; the
+   JS in bindKbSearch sets the class + badge text. */
+.kb-row.kb-status-correct     { background: #f1faf3; border-color: #c8e0c9; }
+.kb-row.kb-status-correct    .kb-id { background: #dff5ea; color: #057f19; }
+.kb-row.kb-status-missed      { background: #f4f8fd; border-color: #c6d4ee; }
+.kb-row.kb-status-missed     .kb-id { background: #e0eafd; color: #135ee2; }
+.kb-row.kb-status-distractor  { background: #fdf3f2; border-color: #efc8c4; }
+.kb-row.kb-status-distractor .kb-id { background: #fde5e3; color: #cf2a1e; }
+.kb-status-badge { display: inline-block; font-size: 10px; font-weight: 700;
+                    text-transform: uppercase; letter-spacing: .04em;
+                    padding: 1px 7px; border-radius: 10px; }
+.kb-row:not(.kb-status-correct):not(.kb-status-missed):not(.kb-status-distractor) .kb-status-badge {
+                    display: none; }
+.kb-row.kb-status-correct    .kb-status-badge { background: #dff5ea; color: #057f19; }
+.kb-row.kb-status-missed     .kb-status-badge { background: #e0eafd; color: #135ee2; }
+.kb-row.kb-status-distractor .kb-status-badge { background: #fde5e3; color: #cf2a1e; }
+/* Inline tallies in the kb-case-banner. Plain text + a glyph + colour
+   accent — small enough to coexist with the surrounding banner copy. */
+.kb-banner-tally     { font-weight: 700; font-variant-numeric: tabular-nums; }
+.kb-banner-correct   { color: #057f19; }
+.kb-banner-missed    { color: #135ee2; }
+.kb-banner-distractor{ color: #cf2a1e; }
 a.judge-eval-link { color: #1d69ec; text-decoration: none; font-weight: 600;
                     cursor: pointer; padding: 0 4px; border-radius: 4px; }
 a.judge-eval-link:hover { background: #135ee2; color: #fff; }
@@ -5062,7 +5174,7 @@ function enumChipClass(id, expectedSet, rerankedSet, mode) {
     return inExp ? "enum-chip match" : "enum-chip miss";
   }
   if (mode === "expected") {
-    return "enum-chip expected-row";
+    return inRer ? "enum-chip expected-row" : "enum-chip expected-missed";
   }
   if (inExp && inRer) return "enum-chip match";
   if (inExp || inRer) return "enum-chip miss";
@@ -5195,6 +5307,12 @@ function scoreStripHtml(c, suggHtml) {
   const wa = c.weighted_avg;
   const waStr = wa == null ? "–" : wa.toFixed(2);
   const waCls = summaryClass(wa, [0.5, PASS_THRESHOLD]);
+  const rc = c.enum_recall;
+  const rcStr = rc == null ? "–" : rc.toFixed(2);
+  const rcCls = summaryClass(rc, [0.5, 0.8]);
+  const pr = c.enum_precision;
+  const prStr = pr == null ? "–" : pr.toFixed(2);
+  const prCls = summaryClass(pr, [0.5, 0.8]);
   const exp = c.expert_score;
   const expStr = exp == null ? "–" : exp.toFixed(1);
   const expCls = summaryClass(exp, [4, 7]);
@@ -5208,6 +5326,10 @@ function scoreStripHtml(c, suggHtml) {
     `<div class="score-strip-row">` +
     `<div class="score-box ${waCls}"><span class="sb-accent"></span>
        <div class="sb-label">Judge w.avg (0–1)</div><div class="sb-value">${waStr}</div></div>` +
+    `<div class="score-box ${rcCls}" title="Per-case ENUM recall: |expected ∩ reranker-selected| / |expected|"><span class="sb-accent"></span>
+       <div class="sb-label">Recall (0–1)</div><div class="sb-value">${rcStr}</div></div>` +
+    `<div class="score-box ${prCls}" title="Per-case ENUM precision: |expected ∩ reranker-selected| / |reranker-selected|"><span class="sb-accent"></span>
+       <div class="sb-label">Precision (0–1)</div><div class="sb-value">${prStr}</div></div>` +
     `<div class="score-box ${expCls}"><span class="sb-accent"></span>
        <div class="sb-label">Expert (1–10)</div><div class="sb-value">${expStr}</div></div>` +
     `<div class="score-box ${r2Cls}"><span class="sb-accent"></span>
@@ -5399,29 +5521,67 @@ function bindKbSearch() {
   const banner = document.getElementById("kb-case-banner");
   if (!search || !list) return;
   const rows = Array.from(list.querySelectorAll(".kb-row"));
-  // Pre-parse data-ids per row for the case filter (keeps update() cheap).
-  const rowIds = rows.map(r => {
-    try { return new Set((JSON.parse(r.dataset.ids || "[]")).map(String)); }
+  // Pre-parse per-row case sets so update() stays cheap.
+  //   rowReranked  — cases that picked this entry into reranked
+  //   rowExpected  — cases that had this entry as gold ground truth
+  //   rowAny       — union (data-ids), used by case-count link & fallback
+  const _parseIds = ds => {
+    try { return new Set((JSON.parse(ds || "[]")).map(String)); }
     catch (_) { return new Set(); }
-  });
+  };
+  const rowReranked = rows.map(r => _parseIds(r.dataset.rerankedCases));
+  const rowExpected = rows.map(r => _parseIds(r.dataset.expectedCases));
+  const rowAny      = rows.map(r => _parseIds(r.dataset.ids));
 
   function update() {
     const q = (search.value || "").trim().toLowerCase();
+    const fid = kbCaseFilter ? String(kbCaseFilter) : null;
+    // Tallies for the banner readout when a case filter is active.
+    let nCorrect = 0, nMissed = 0, nDistractor = 0;
     let shown = 0;
     rows.forEach((r, i) => {
       let visible = true;
       if (q && !(r.dataset.search || "").includes(q)) visible = false;
-      if (visible && kbCaseFilter && !rowIds[i].has(String(kbCaseFilter))) visible = false;
+
+      // Reset per-case status before reapplying (so flipping cases or
+      // clearing the filter leaves no stale class behind).
+      r.classList.remove("kb-status-correct", "kb-status-missed", "kb-status-distractor");
+      const badge = r.querySelector(".kb-status-badge");
+      if (badge) badge.textContent = "";
+
+      if (fid) {
+        const inExp = rowExpected[i].has(fid);
+        const inRer = rowReranked[i].has(fid);
+        // Visibility under filter: expected ∪ reranked for that case.
+        if (visible && !inExp && !inRer) visible = false;
+        if (visible) {
+          let cls = "", txt = "";
+          if (inExp && inRer)      { cls = "kb-status-correct";    txt = "Correctly selected"; nCorrect++; }
+          else if (inExp)          { cls = "kb-status-missed";     txt = "Missed";             nMissed++; }
+          else if (inRer)          { cls = "kb-status-distractor"; txt = "Distractor";         nDistractor++; }
+          if (cls) {
+            r.classList.add(cls);
+            if (badge) badge.textContent = txt;
+          }
+        }
+      }
+
       r.style.display = visible ? "" : "none";
       if (visible) shown++;
     });
-    const tail = kbCaseFilter ? ` · case ${kbCaseFilter}` : "";
+    const tail = fid ? ` · case ${fid}` : "";
     if (counter) counter.textContent = `showing ${shown} of ${rows.length}${tail}`;
-    if (reset) reset.classList.toggle("visible", !!kbCaseFilter);
+    if (reset) reset.classList.toggle("visible", !!fid);
     if (banner) {
-      if (kbCaseFilter) {
-        banner.innerHTML = `Filtered to KB entries used by <strong>${esc(kbCaseFilter)}</strong>. ` +
-                            `Click <em>Show all</em> to see every entry.`;
+      if (fid) {
+        const total = nCorrect + nMissed + nDistractor;
+        banner.innerHTML =
+          `Filtered to KB entries linked to <strong>${esc(fid)}</strong> ` +
+          `(expected ∪ reranker selection · ${total} entries). ` +
+          `<span class="kb-banner-tally kb-banner-correct">✓ ${nCorrect} correctly selected</span> · ` +
+          `<span class="kb-banner-tally kb-banner-missed">○ ${nMissed} missed</span> · ` +
+          `<span class="kb-banner-tally kb-banner-distractor">✗ ${nDistractor} distractor</span>. ` +
+          `Click <em>Show all</em> to clear.`;
         banner.classList.add("visible");
       } else {
         banner.classList.remove("visible");
