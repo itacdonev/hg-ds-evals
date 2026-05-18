@@ -19,15 +19,30 @@ The augmentation drops `tool_parameter` from these rows so they no longer report
 
 ## Relaxation rules (analyze_transactions only)
 
-| Rule   | Description                                                                                        | Reasoning                                                         |
-| ------ | -------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------- |
-| **R1** | Ignore `size` on both sides.                                                                       | Upstream pagination; not user-visible.                            |
-| **R2** | Ignore `sort_by` when `group_by` is `group_none` or omitted.                                       | With no groups there is nothing to sort.                          |
-| **R3** | Ignore `sort` when `visualization_type` is `SUMMARY` or omitted.                                   | Aggregation is order-independent.                                 |
-| **R4** | Treat `group_by` omitted ↔ `'group_none'` as equivalent.                                           | `group_none` is the documented default.                           |
-| **R5** | Treat `products_filter_mode` omitted ↔ `'PFM_SETTINGS'` as equivalent.                             | `PFM_SETTINGS` is the documented default per the tool docstring.  |
-| **R6** | Ignore `limit=1000` when `visualization_type=SUMMARY` on either side.                              | A cap larger than any persona's total transactions is never hit.  |
-| **R7** | Treat `visualization_type` omitted ↔ `'SUMMARY'` as equivalent.                                    | `SUMMARY` is the documented default.                              |
-| **R8** | When the persona has no product-filter preference, expected `PFM_SETTINGS` accepts actual `'ALL'`. | Identical data returned for those personas. Off until persona set is populated. |
+Scoped to `tool == "analyze_transactions"` — other tools pass through untouched. R1–R7 are per-call (applied independently to each expected and actual call). R8 is pair-aware (looks at expected and actual together).
 
-**Ordering matters** within the relaxation: R7/R4 normalize defaults before R3/R6/R2 read them, and R8 (pair-aware) runs before per-call normalization so the rewritten value passes through R5.
+| Rule   | Description                                                                                                                                          | Reasoning                                                                                                                 |
+| ------ | ---------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| **R1** | Drop `size` from comparison (both sides). Key listed as excused.                                                                                     | Upstream pagination; not user-visible.                                                                                    |
+| **R2** | Drop `sort_by` when `group_by` is omitted or `'group_none'` (treating omitted as `group_none`).                                                      | With no groups there is nothing to sort.                                                                                  |
+| **R3** | Drop `sort` when `visualization_type` is omitted or `'SUMMARY'` (treating omitted as `SUMMARY`).                                                     | Aggregation is order-independent.                                                                                         |
+| **R4** | Normalize omitted `group_by` → `'group_none'`. Key stays in scope and is still scored against the normalized value.                                  | `group_none` is the documented default.                                                                                   |
+| **R5** | Normalize omitted `products_filter_mode` → `'PFM_SETTINGS'`. Key stays in scope. Implication: an actual call omitting the key now auto-matches an expected `PFM_SETTINGS` without needing R8. | `PFM_SETTINGS` is the documented tool default.                                                                            |
+| **R6** | Drop `limit` when value is `1000` AND (post-R7) `visualization_type` is `SUMMARY`. Applied per side independently.                                   | A cap larger than any persona's total transactions is never hit.                                                          |
+| **R7** | Normalize omitted `visualization_type` → `'SUMMARY'`. Key stays in scope.                                                                            | `SUMMARY` is the documented default.                                                                                      |
+| **R8** | Pair-aware, persona-conditional: when `eval_persona ∈ PERSONAS_WITHOUT_PRODUCT_FILTER` AND the expected call at position `i` has `products_filter_mode='PFM_SETTINGS'`, rewrite the actual call at position `i`'s explicit `'ALL'` → `'PFM_SETTINGS'` (positional pairing). Expected is never modified. | Identical data returned for those personas. `PERSONAS_WITHOUT_PRODUCT_FILTER` defaults to empty → R8 effectively off until the eval team populates it. |
+
+**Excused vs normalized:** R1–R3 and R6 *drop* keys (key listed in `tool_parameter_expected_excused` / `_actual_excused`; report greys them out). R4, R5, R7 *normalize* the value but keep the key in scope for scoring. R8 *rewrites* one actual value pre-comparison (not surfaced as excused).
+
+**Order of application** (matches `_compute_relaxation` → `_relax_one`):
+1. **R8** first on the whole actual list (pair-aware positional rewrite) — runs before R5 so the rewritten `PFM_SETTINGS` is still present when R5 checks for omission.
+2. Per call, capture `vis_for_conditionals` (treat omitted as `SUMMARY`) and `gb_for_conditionals` (treat omitted as `group_none`) BEFORE any mutation — this is what R2/R3/R6 read.
+3. **R4** materializes `group_by` default.
+4. **R5** materializes `products_filter_mode` default.
+5. **R1** drops `size`.
+6. **R2** drops `sort_by` (conditional on `gb_for_conditionals`).
+7. **R3** drops `sort` (conditional on `vis_for_conditionals`).
+8. **R6** drops `limit=1000` (conditional on `vis_for_conditionals`).
+9. **R7** materializes `visualization_type` default (R3/R6 already consulted the post-normalization view via `vis_for_conditionals`, so doing this last is purely cosmetic on the resulting dict).
+
+**A/B toggle:** `RELAXED_PARAMETER_RULES = False` bypasses everything; the scorer sees raw `expected_tool_calls` / `actual_tool_calls`. Per-rule firing counts are emitted in the `RELAX_FIRED` summary printed after scoring.
