@@ -36,6 +36,21 @@ import yaml
 from plotly.subplots import make_subplots
 from czkb_checkpoint import read_checkpoint_csv
 
+# Walk up from this file to find the repo root so the report can be run
+# straight from `experiments/czkb/notebooks/` without `pip install -e .`.
+# Mirrors the bootstrap used in `backfill_latency.py`.
+_REPO_ROOT = Path(__file__).resolve().parent
+while _REPO_ROOT != _REPO_ROOT.parent and not (_REPO_ROOT / "hg_ds_evals").is_dir():
+    _REPO_ROOT = _REPO_ROOT.parent
+if (_REPO_ROOT / "hg_ds_evals").is_dir() and str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from hg_ds_evals.preprocessing.latency import (  # noqa: E402 — needs sys.path tweak above
+    RETRY_BASELINE_TOK_PER_S,
+    RETRY_MAX_TOK_PER_S,
+    RETRY_MIN_DURATION_MS,
+)
+
 # g-evals design tokens (mirrored from g-evals/frontend/src/index.css).
 GE_FONT = "Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif"
 GE_BLUE = "#135ee2"            # --rgb-blue-300 (primary)
@@ -419,6 +434,16 @@ def enrich(df: pd.DataFrame) -> pd.DataFrame:
         if col not in df.columns:
             raise KeyError(f"missing dimension column: {col}")
         df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # Latency columns arrive as strings from read_checkpoint_csv (which forces
+    # dtype=str). Cast to float so the bootstrap CI and summary stats work.
+    for col in ("lat_total_ms",
+                "lat_routing_ms", "lat_planning_llm_ms", "lat_kb_retrieve_ms",
+                "lat_kb_prune_ms", "lat_kb_rerank_ms", "lat_tools_ms",
+                "lat_generation_llm_ms", "lat_overhead_ms",
+                "lat_retry_overhead_ms", "lat_retry_call_count"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
 
     w_sum = sum(DIMENSION_WEIGHTS.values())
     # Per-dim scores are 0/1/2; the extra `/ 2.0` puts the weighted average in
@@ -980,9 +1005,37 @@ def _case_payload(r: pd.Series) -> dict:
         if isinstance(value, bool):
             return value
         return str(value).strip().lower() in {"true", "1", "1.0", "yes"}
+    # Parse the per-trace latency breakdown emitted by backfill_latency.py.
+    lat_steps_raw = g("lat_steps_json", "")
+    try:
+        lat_steps = json.loads(lat_steps_raw) if lat_steps_raw else []
+    except (json.JSONDecodeError, TypeError):
+        lat_steps = []
+    if not isinstance(lat_steps, list):
+        lat_steps = []
+    # Throttling (suspected-retry) detail — emitted by latency.py alongside
+    # the step breakdown. Missing on older CSVs; treated as "no retries".
+    lat_retries_raw = g("lat_retries_json", "")
+    try:
+        lat_retries = json.loads(lat_retries_raw) if lat_retries_raw else []
+    except (json.JSONDecodeError, TypeError):
+        lat_retries = []
+    if not isinstance(lat_retries, list):
+        lat_retries = []
     return {
         "id": g("test_case_id"),
         "trace_id": g("trace_id"),
+        "lat_total_ms": (float(r["lat_total_ms"])
+                         if "lat_total_ms" in r.index and pd.notna(r.get("lat_total_ms"))
+                         else None),
+        "lat_steps": lat_steps,
+        "lat_retry_overhead_ms": (float(r["lat_retry_overhead_ms"])
+                                  if "lat_retry_overhead_ms" in r.index and pd.notna(r.get("lat_retry_overhead_ms"))
+                                  else None),
+        "lat_retry_call_count": (int(r["lat_retry_call_count"])
+                                 if "lat_retry_call_count" in r.index and pd.notna(r.get("lat_retry_call_count"))
+                                 else 0),
+        "lat_retries": lat_retries,
         "scope": g("query_scope"),
         "last_agent": g("last_agent"),
         "rerank_empty": b("reranker_selected_empty"),
@@ -2967,7 +3020,8 @@ case passes  ⇔ weighted_avg ≥ {PASS_THRESHOLD:g} AND
     """
 
 
-def _doc_tab_html(metrics: dict, wavg_hist_fig=None) -> str:
+def _doc_tab_html(metrics: dict, wavg_hist_fig=None, *,
+                  include_latency: bool = False) -> str:
     """Notes page — companion text to the rest of the report. Every count
     or percentage referenced in the body comes from ``metrics`` so the
     text stays in sync with the run on display.
@@ -3019,6 +3073,14 @@ def _doc_tab_html(metrics: dict, wavg_hist_fig=None) -> str:
         wavg_side_card = ""
         pass_row_open  = ""
         pass_row_close = ""
+
+    # The latency-definitions card is only rendered when the latency
+    # surfaces are enabled. Built as a variable so the f-string below
+    # stays readable and the condition lives in one place.
+    if include_latency:
+        latency_definitions_card = _latency_definitions_card_html()
+    else:
+        latency_definitions_card = ""
 
     return f"""
     {pass_row_open}
@@ -3139,6 +3201,156 @@ def _doc_tab_html(metrics: dict, wavg_hist_fig=None) -> str:
       surface it as a separate "no achievable answer" signal — counting
       it as a real claim would inflate hallucination and missing-fact
       metrics.</p>
+    </div>
+
+    {latency_definitions_card}
+    """
+
+
+def _latency_definitions_card_html() -> str:
+    """Notes-tab card explaining what each latency step represents and how
+    the retry-overhead heuristic works. Only rendered when the latency
+    surfaces are enabled (--include-latency on the CLI)."""
+    # Bucket threshold table rendered from the live constants so the doc
+    # stays in sync with the heuristic if someone retunes the dicts.
+    from hg_ds_evals.preprocessing.latency import (
+        RETRY_DUR_THRESHOLDS_MS,
+        RETRY_MAX_TOK_PER_S_BY_BUCKET,
+        RETRY_BASELINE_TOK_PER_S as _BASE,
+    )
+    rows = ""
+    for b in ("routing", "sub_agent_llm", "kb_rerank", "kb_other", "other"):
+        rows += (
+            f"<tr><td><code>{b}</code></td>"
+            f"<td style='text-align:right'>{RETRY_DUR_THRESHOLDS_MS[b]/1000:.0f}s</td>"
+            f"<td style='text-align:right'>{RETRY_MAX_TOK_PER_S_BY_BUCKET[b]:.1f}</td>"
+            f"</tr>"
+        )
+    return f"""
+    <div class="card">
+      <div class="card-title">Latency · step definitions</div>
+      <p style="font-size:12px;color:#5c7999;margin-bottom:10px">
+      Per-step wall-clock latency is parsed from the MLflow trace spans by
+      <code>hg_ds_evals.preprocessing.latency.extract_latency_breakdown</code>.
+      Each step is matched to a specific LangGraph span by name; spans are
+      bucketed so the resulting groups are <strong>mutually non-overlapping</strong>
+      and sum exactly to <code>lat_total_ms</code> (the duration of the
+      root <code>eval_item</code> / <code>eval.predict_item</code> span).
+      <em>Overhead</em> is the residual that captures LangGraph wiring,
+      <code>tools_condition</code> routing decisions, and any
+      eval-framework processing that runs <em>outside</em> the agent's
+      LangGraph (e.g. trace serialization happening after the agent
+      produced its final answer).</p>
+
+      <p style="font-size:12px;color:#b46504;margin-bottom:10px">
+      <strong>Note: these surfaces are approximations.</strong> Retry
+      detection is a tok/s-based heuristic with no ground-truth signal
+      from the spans themselves. Use the numbers as <em>indicators</em>,
+      not facts.</p>
+
+      <dl class="doc-dl">
+        <dt><strong>Routing (<code>main_agent</code>)</strong></dt>
+        <dd>Every span named <code>main_agent</code> at the top level
+            (excluding any that nests inside a sub-agent). In CZKB this
+            normally fires twice per trace: once at the start when the
+            router LLM decides which sub-agent to invoke, and once at
+            the end when control returns. The bulk of the time is one
+            <code>ChatDatabricks</code> call.</dd>
+
+        <dt><strong>Planning LLM</strong></dt>
+        <dd>Every <code>llm</code>-named span inside a sub-agent
+            (<code>daily_banking_agent</code>, <code>hg-invest-phase2</code>)
+            <em>except</em> the last one in temporal order. These are the
+            LLM calls that decide which tool to call next — their output
+            messages carry <code>tool_calls</code> and feed into a
+            <code>tools_condition</code> branch. Multiple iterations are
+            summed.</dd>
+
+        <dt><strong>KB retrieve</strong></dt>
+        <dd>Every span named <code>retrieve</code> inside a
+            <code>knowledge_search</code> tool invocation. Contains the
+            parallel vector-DB queries (<code>HTTP POST
+            /admin/knowledge-base/query</code>) — the dominant cost here
+            is network round-trips, not local computation.</dd>
+
+        <dt><strong>KB prune</strong></dt>
+        <dd>Every <code>prune</code> span inside <code>knowledge_search</code>.
+            Filters and deduplicates the candidate pool from KB retrieve.
+            Pure local computation — typically tens of milliseconds.</dd>
+
+        <dt><strong>KB rerank</strong></dt>
+        <dd>Every <code>rerank</code> span inside <code>knowledge_search</code>.
+            This is an LLM-based reranker (its time includes the inner
+            <code>ChatDatabricks</code> call), <strong>not</strong> the
+            generation step. Often the single largest sub-step of
+            <code>knowledge_search</code>.</dd>
+
+        <dt><strong>Tools (non-KB)</strong></dt>
+        <dd>Every span typed <code>TOOL</code> whose name is not
+            <code>knowledge_search</code>. Empty for KB-only runs.
+            Becomes meaningful in the API report where tools like
+            <code>george-gcg-product_getLoans</code> are invoked.</dd>
+
+        <dt><strong>Generation LLM</strong></dt>
+        <dd>The last <code>llm</code> span (by end time) inside a
+            sub-agent invocation — the LLM call that produces the final
+            user-visible answer and is immediately followed by
+            <code>agent_answer</code>. If the sub-agent makes no tool
+            call at all, this is also the only LLM span for that
+            sub-agent. Typically the largest single contributor and a
+            primary target for optimization (prompt length, model choice,
+            reasoning budget).</dd>
+
+        <dt><strong>Overhead</strong></dt>
+        <dd>The residual: <code>lat_total_ms</code> minus the sum of the
+            above. Includes LangGraph DAG-wiring, <code>tools_condition</code>
+            edge spans, and (importantly) any eval-framework time spent
+            <em>after</em> the agent produced its answer but
+            <em>before</em> the root span closed — e.g. trace
+            serialization. A high overhead share for a run is a signal
+            that the bottleneck is outside the agent itself.</dd>
+
+        <dt><strong>Retry overhead</strong> <em style="color:#b46504">(approximation, overlapping with LLM buckets)</em></dt>
+        <dd>Estimated wall-clock time spent in silent SDK retry / throttle
+            back-off. The Databricks / LangChain client swallows 429s and
+            retries internally, so the back-off sleep is invisibly
+            included in the <code>CHAT_MODEL</code> span duration — there
+            is no explicit retry marker on the span. The detector
+            (<code>_evaluate_chat_model_for_retry</code> in
+            <code>hg_ds_evals.preprocessing.latency</code>) flags a call
+            as a probable retry when its wall time and observed
+            throughput cross <strong>bucket-specific</strong> thresholds
+            — flat thresholds mis-fired on the reranker (whose output is
+            intrinsically tiny, so tok/s is naturally low). The current
+            defaults are:
+            <table class="tbl" style="max-width:520px;margin-top:8px;font-size:11px">
+              <thead><tr>
+                <th>Bucket</th>
+                <th style='text-align:right'>min duration</th>
+                <th style='text-align:right'>max tok/s</th>
+              </tr></thead>
+              <tbody>{rows}</tbody>
+            </table>
+            <p style='margin-top:8px'>Estimated overhead =
+            <code>duration − output_tokens / {_BASE}</code>
+            (baseline expected gen time, clamped at 0).
+            <strong>Retry overhead overlaps with the LLM step buckets above</strong>
+            (each flagged call's wall time is already counted under
+            routing / planning / generation / kb_rerank depending on
+            where the <code>CHAT_MODEL</code> span sits), so it is
+            reported as its own row below the breakdown table and is
+            <em>not</em> summed into the total. Read it as "of the LLM
+            time, how much was probably back-off, not real work?".</p></dd>
+      </dl>
+      <p style="font-size:12px;color:#5c7999;margin-top:10px">
+      <strong>Mean / 95% CI / p50 / p95.</strong> The summary card shows
+      one row per step plus the run total. The 95% CI is a bootstrap
+      percentile CI on the mean (1000 resamples, seed 0) — the
+      right-skewed distribution of latency violates the normality
+      assumption of t-based CIs, so the bootstrap is the correct
+      choice. p50 / p95 are per-case order statistics on the step's
+      duration (not on the bootstrap distribution); p95 is the practical
+      tail metric — it's what users experience as "slow".</p>
     </div>
     """
 
@@ -3940,6 +4152,150 @@ code { font-family: monospace; font-size: 12px; background: #e7effd; padding: 1p
 .tbl { width: 100%; border-collapse: collapse; font-size: 12px; }
 .tbl th, .tbl td { border-bottom: 1px solid #edf0f4; padding: 6px 10px; text-align: left;
                    vertical-align: top; max-width: 480px; }
+/* Latency breakdown (Summary tab + Test Cases tab). */
+.lat-tbl td, .lat-tbl th { vertical-align: middle; }
+.lat-total-row td { font-weight: 600; border-top: 2px solid #d3dce6; background: #fafbfd; }
+.lat-bar { display: inline-block; vertical-align: middle; margin-left: 6px;
+           width: 60px; height: 6px; background: #eef2f7; border-radius: 3px; overflow: hidden; }
+.lat-bar-fill { height: 100%; background: #5c7999; }
+/* Latency score-box value uses a slightly smaller weight so "28.70s" lines
+   up visually with the 0.xx ratios in the neighbouring boxes. */
+.score-box .sb-value-lat { font-variant-numeric: tabular-nums;
+                            letter-spacing: -0.01em; }
+/* 95% CI column. The mini-bar's full width corresponds to the run's mean
+   total latency, so a step at 80% of total sits on the right and a step
+   at 5% sits squashed on the left — readable at a glance. */
+.lat-tbl .lat-ci-cell { width: 180px; min-width: 140px; padding-top: 8px; padding-bottom: 8px;
+                         vertical-align: middle; max-width: none; }
+.lat-ci-vis { position: relative; height: 10px; width: 100%; margin: 2px 0 4px;
+              background: linear-gradient(to right, #eef2f7, #eef2f7); border-radius: 5px; }
+.lat-ci-band { position: absolute; top: 3px; height: 4px; background: #7aa6ef;
+               border-radius: 2px; min-width: 2px; }
+.lat-ci-mark { position: absolute; top: 0; width: 10px; height: 10px;
+               margin-left: -5px; background: #135ee2; border: 2px solid #fff;
+               border-radius: 50%; box-shadow: 0 0 0 1px #135ee2; }
+.lat-ci-text { font-size: 11px; color: #5c7999; font-variant-numeric: tabular-nums;
+               text-align: right; }
+.lat-ci-text-only { font-size: 11px; color: #5c7999; font-variant-numeric: tabular-nums;
+                     display: inline-block; padding: 4px 0; }
+.lat-axis-hint { font-size: 9px; color: #a3b5c9; font-weight: 400;
+                  text-transform: none; letter-spacing: 0; margin-left: 4px; }
+/* "Without throttling" sub-line shown under a step's mean/p95 cell when
+   the retry-adjusted value differs from the observed value by ≥1%.
+   Subtle amber so the eye treats it as commentary on the main number,
+   not a peer of it. */
+.lat-adj-line { font-size: 10px; color: #ad5700; font-weight: 500;
+                 font-variant-numeric: tabular-nums; margin-top: 1px;
+                 line-height: 1.2; }
+.lat-adj-delta { color: #057f19; font-weight: 600; }
+/* Suspected-retry block sits below the breakdown table — separate styling
+   to make the visual separation clear (retries OVERLAP with the LLM step
+   buckets and are not summed into the total). */
+.lat-retry-row { margin-top: 14px; padding-top: 10px;
+                  border-top: 2px dashed #d3dce6; }
+.lat-retry-title { font-size: 11px; color: #b46504; font-weight: 600;
+                    text-transform: uppercase; letter-spacing: 0.4px;
+                    margin-bottom: 6px; }
+.lat-retry-tbl th { background: #fef4e2; color: #b46504; }
+.lat-retry-tbl td { font-variant-numeric: tabular-nums; }
+/* Headline latency card on Summary row 2. Centred big mean + CI bracket. */
+.lat-headline-card { align-items: center; text-align: center; }
+.lat-headline-card .hc-label { justify-content: center; }
+.lat-headline-card .hc-value { color: #135ee2; }
+.lat-hc-ci { width: 100%; max-width: 240px; margin: 8px auto 0; }
+.lat-hc-ci-bracket { display: flex; align-items: center; justify-content: center;
+                      width: 100%; height: 16px; }
+.lat-hc-ci-tick { width: 2px; height: 12px; background: #135ee2; border-radius: 1px; }
+.lat-hc-ci-line { flex: 1 1 auto; height: 2px; background: #7aa6ef; }
+.lat-hc-ci-dot { width: 10px; height: 10px; background: #135ee2; border: 2px solid #fff;
+                 border-radius: 50%; box-shadow: 0 0 0 1px #135ee2; flex: 0 0 auto;
+                 margin: 0 -2px; }
+.lat-hc-ci-labels { display: flex; justify-content: space-between; margin-top: 4px;
+                    font-size: 11px; color: #5c7999; font-variant-numeric: tabular-nums; }
+.lat-hc-ci-mid { color: #a3b5c9; font-size: 10px; text-transform: uppercase;
+                  letter-spacing: 0.5px; font-weight: 600; }
+.lat-hc-detail { display: flex; justify-content: center; align-items: center;
+                  gap: 8px; flex-wrap: wrap; }
+.lat-hc-detail strong { color: #0a285c; font-variant-numeric: tabular-nums; }
+.lat-hc-detail-sep { color: #c4cfdc; }
+.lat-hc-throttle { font-size: 11px; color: #ad5700; margin-top: 6px;
+                   padding-top: 6px; border-top: 1px dashed #f2dca3;
+                   justify-content: center; }
+.lat-hc-throttle strong { color: #ad5700; }
+.lat-hc-label-aux { font-size: 10px; color: #a3b5c9; font-weight: 500;
+                     text-transform: uppercase; letter-spacing: 0.04em; }
+/* "Without throttling" row directly below the throttling line. Same
+   amber palette so the reader sees them as a paired before/after, but
+   slightly muted so it doesn't compete with the main observed value. */
+.lat-hc-adjusted { font-size: 11px; color: #5c7999; margin-top: 4px;
+                    justify-content: center; flex-direction: column;
+                    gap: 2px; text-align: center; }
+.lat-hc-adjusted-title { color: #ad5700; font-weight: 600;
+                          text-transform: uppercase; letter-spacing: 0.04em;
+                          font-size: 10px; }
+.lat-hc-adjusted strong { color: #0a285c; font-variant-numeric: tabular-nums;
+                           font-weight: 700; }
+.lat-hc-adjusted-delta { color: #057f19; font-variant-numeric: tabular-nums;
+                          font-weight: 600; margin-left: 2px; }
+.lat-hc-detail-n { color: #a3b5c9; font-variant-numeric: tabular-nums;
+                    margin-left: 8px; }
+/* Latency breakdown sub-block, rendered INSIDE the score-strip grey box,
+   styled to match `.score-strip-sugg` (same tiny uppercase title rule).
+   Implemented as <details> so it collapses by default — the table is bulky. */
+.score-strip-lat { border-top: 1px solid #edf0f4; padding-top: 10px; }
+.score-strip-lat > summary { list-style: none; cursor: pointer;
+                              user-select: none; outline: none; }
+.score-strip-lat > summary::-webkit-details-marker { display: none; }
+.score-strip-lat-title { font-size: 9px; color: #537090; font-weight: 600;
+                         text-transform: uppercase; letter-spacing: 0.12em;
+                         margin-bottom: 6px; display: flex; align-items: baseline;
+                         gap: 8px; }
+.score-strip-lat-title::before { content: "▸"; display: inline-block;
+                                  width: 10px; font-size: 9px; color: #5c7999;
+                                  transition: transform 0.15s ease; }
+.score-strip-lat[open] > .score-strip-lat-title::before { transform: rotate(90deg); }
+.score-strip-lat[open] > .score-strip-lat-title { margin-bottom: 8px; }
+.lat-inline-total { font-size: 11px; color: #0a285c; font-weight: 600;
+                     text-transform: none; letter-spacing: 0;
+                     font-variant-numeric: tabular-nums; }
+.lat-tbl-inline { width: 100%; border-collapse: collapse; font-size: 11px;
+                  font-variant-numeric: tabular-nums; }
+.lat-tbl-inline td { padding: 2px 0; border: none; vertical-align: middle; }
+.lat-tbl-inline tr + tr td { border-top: 1px solid #edf0f4; }
+.lat-inline-name { color: #0a285c; width: 50%; }
+.lat-inline-ms { color: #0a285c; text-align: right; width: 70px;
+                  padding-right: 12px !important; }
+.lat-inline-share { text-align: right; white-space: nowrap; }
+.lat-inline-pct { color: #5c7999; min-width: 42px; display: inline-block;
+                   text-align: right; }
+.lat-n { font-size: 9px; color: #a3b5c9; font-variant-numeric: tabular-nums;
+          margin-left: 4px; }
+
+/* Throttling chip on the latency-breakdown summary + nested retry table. */
+.lat-inline-retry { margin-left: 8px; padding: 1px 7px; border-radius: 8px;
+                    font-size: 10.5px; font-weight: 600;
+                    background: #fff3da; border: 1px solid #f2a91e;
+                    color: #ad5700; font-variant-numeric: tabular-nums; }
+.score-strip-lat-retry { margin-top: 8px; padding-top: 8px;
+                         border-top: 1px dashed #edf0f4; }
+.score-strip-lat-retry > summary { list-style: none; cursor: pointer;
+                                   font-size: 9px; color: #ad5700; font-weight: 600;
+                                   text-transform: uppercase; letter-spacing: .12em; }
+.score-strip-lat-retry > summary::-webkit-details-marker { display: none; }
+.score-strip-lat-retry > summary::before { content: "▸"; display: inline-block;
+                                            margin-right: 4px;
+                                            transition: transform 120ms; }
+.score-strip-lat-retry[open] > summary::before { transform: rotate(90deg); }
+.score-strip-lat-retry[open] > summary { margin-bottom: 6px; }
+.lat-retry-note { color: #a3b5c9; font-weight: 500; margin-left: 6px;
+                  text-transform: none; letter-spacing: 0; }
+.lat-tbl-retry thead th { font-size: 9px; color: #5c7999; font-weight: 600;
+                          text-transform: uppercase; letter-spacing: .08em;
+                          text-align: left; padding: 2px 0; border-bottom: 1px solid #edf0f4; }
+.lat-tbl-retry thead th:nth-child(2),
+.lat-tbl-retry thead th:nth-child(4) { text-align: right; padding-right: 12px; }
+.lat-retry-toks { color: #5c7999; font-size: 10.5px; }
+.lat-retry-overhead { color: #ad5700; font-weight: 600; }
 .tbl th { background: #f4f6fa; color: #5c7999; font-weight: 600; text-transform: uppercase;
           font-size: 11px; letter-spacing: .5px; }
 .tbl tbody tr:hover { background: #f9fbff; }
@@ -4356,6 +4712,9 @@ hr.enum-divider { border: none; border-top: 1px solid #c8d3e1;
    Stage funnel. */
 .headline-row.headline-row-1-3 { grid-template-columns: 1fr 3fr; }
 @media (max-width: 980px) { .headline-row.headline-row-1-3 { grid-template-columns: 1fr; } }
+/* Row 2 with three cards: Test cases | Latency headline | Stage funnel. */
+.headline-row.headline-row-1-1-3 { grid-template-columns: 1fr 1.4fr 3fr; }
+@media (max-width: 980px) { .headline-row.headline-row-1-1-3 { grid-template-columns: 1fr; } }
 /* weighted_avg histogram card on the Notes tab — slider + readout below the chart.
    Lives in a summary-grid-2 next to the "Pass rate" card. */
 .doc-passrate-row { align-items: stretch; }
@@ -4702,6 +5061,141 @@ JS = r"""
 const CASES = __CASES__;
 const DIM_NAMES = __DIM_NAMES__;
 const PASS_THRESHOLD = __PASS_THRESHOLD__;
+// Run mean latency in ms (null when no latency columns OR latency surface
+// is suppressed). Drives the per-case latency-chip colour.
+const MEAN_LAT_MS = __MEAN_LAT_MS__;
+const LAT_GREEN_CEILING_MS = 10000;
+// Master switch — when false, the case-detail score strip skips the
+// Latency score-box and the in-strip Latency breakdown sub-block.
+// Driven by --include-latency on the report CLI.
+const INCLUDE_LATENCY = __INCLUDE_LATENCY__;
+// Throughput threshold used by latency.py's retry heuristic — kept in sync
+// with hg_ds_evals.preprocessing.latency.RETRY_MAX_TOK_PER_S so the report's
+// "tok/s < X" caption can't drift from the actual rule.
+const RETRY_MAX_TOK_PER_S = __RETRY_MAX_TOK_PER_S__;
+
+// Display labels for the per-step latency breakdown. Mirrors LAT_STEP_DISPLAY
+// in the Python side so the case-detail table reads identically to the
+// Summary-tab card.
+const LAT_STEP_DISPLAY = {
+  routing:        "Routing (main_agent)",
+  planning_llm:   "Planning LLM",
+  kb_retrieve:    "KB retrieve",
+  kb_prune:       "KB prune",
+  kb_rerank:      "KB rerank",
+  tools:          "Tools (non-KB)",
+  generation_llm: "Generation LLM",
+  overhead:       "Overhead",
+};
+
+function formatMs(ms) {
+  if (ms == null || !isFinite(ms)) return "—";
+  if (ms >= 60000) return (ms / 60000).toFixed(1) + "m";
+  if (ms >= 1000) return (ms / 1000).toFixed(2) + "s";
+  return Math.round(ms) + "ms";
+}
+
+// Three-band colour for per-case latency, matching the score-box palette so
+// the Latency card sits visually alongside Judge w.avg / Recall / Precision
+// without introducing a new colour vocabulary.
+//   green (s-good): < 10s
+//   yellow (s-mid): >= 10s and <= run mean
+//   red   (s-bad):  > run mean
+// When MEAN_LAT_MS is null (no latency data) the red band falls back to
+// "more than 2 × the 10s floor" so the card still reads as a heat map.
+function latencyClass(ms) {
+  if (ms == null || !isFinite(ms)) return "s-na";
+  if (MEAN_LAT_MS != null) {
+    if (ms > MEAN_LAT_MS) return "s-bad";
+    if (ms > LAT_GREEN_CEILING_MS) return "s-mid";
+    return "s-good";
+  }
+  if (ms > 2 * LAT_GREEN_CEILING_MS) return "s-bad";
+  if (ms > LAT_GREEN_CEILING_MS) return "s-mid";
+  return "s-good";
+}
+
+function latencyBoxTitle(ms) {
+  if (ms == null || !isFinite(ms)) return "trace wall-clock latency · not available";
+  const meanTxt = (MEAN_LAT_MS != null) ? formatMs(MEAN_LAT_MS) : "—";
+  const cls = latencyClass(ms);
+  if (cls === "s-bad")  return `trace wall-clock latency · above run mean (${meanTxt})`;
+  if (cls === "s-mid")  return `trace wall-clock latency · above 10s, at-or-below run mean (${meanTxt})`;
+  if (cls === "s-good") return "trace wall-clock latency · below 10s";
+  return "trace wall-clock latency · not available";
+}
+
+function latencyDetailHtml(c) {
+  if (!INCLUDE_LATENCY) return "";
+  const total = c.lat_total_ms;
+  const steps = Array.isArray(c.lat_steps) ? c.lat_steps : [];
+  if (total == null || !steps.length) return "";
+  // Sort steps by ms descending so the bottleneck for this case lands on top.
+  // Drop zero-ms rows — they're noise inside the compact in-box layout.
+  const sorted = steps.slice()
+    .filter(s => (s.ms != null) && Number(s.ms) > 0)
+    .sort((a, b) => (b.ms || 0) - (a.ms || 0));
+  const rows = sorted.map(s => {
+    const ms = Number(s.ms);
+    const share = (total > 0) ? (ms / total) : 0;
+    const pct = Math.max(0, Math.min(100, share * 100));
+    const display = LAT_STEP_DISPLAY[s.label] || s.label;
+    // ×N = number of times this step's span fired in the trace (e.g. routing
+    // typically ×2: one main_agent span at the start, one at the end; KB
+    // retrieve ×2 if knowledge_search ran twice). Shown for every non-zero
+    // step so the count is consistent — a "×1" tells the reader the step
+    // was actually present, which is meaningful when reading the breakdown.
+    const nStr = (s.n == null || s.n <= 0) ? "" : ` <span class="lat-n">×${s.n}</span>`;
+    return `<tr>
+      <td class="lat-inline-name">${esc(display)}${nStr}</td>
+      <td class="lat-inline-ms">${formatMs(ms)}</td>
+      <td class="lat-inline-share"><span class="lat-inline-pct">${pct.toFixed(1)}%</span>` +
+        `<div class="lat-bar"><div class="lat-bar-fill" style="width:${pct.toFixed(1)}%"></div></div></td>
+    </tr>`;
+  }).join("");
+
+  // Throttling chip + per-call detail — emitted by latency.py when the
+  // tok/s heuristic flags one or more CHAT_MODEL spans as a hidden SDK
+  // retry. The chip is visible on the collapsed summary so the reader
+  // sees the cost without expanding; per-call detail is a nested
+  // <details> so it doesn't crowd the step table.
+  const retryCount = c.lat_retry_call_count || 0;
+  const retryMs = c.lat_retry_overhead_ms || 0;
+  const retries = Array.isArray(c.lat_retries) ? c.lat_retries : [];
+  let retryChip = "";
+  let retryDetail = "";
+  if (retryCount > 0 && retryMs > 0) {
+    const share = (total > 0) ? (100 * retryMs / total) : 0;
+    retryChip = ` <span class="lat-inline-retry" title="suspected SDK retry overhead — see breakdown">` +
+                `↻ ${retryCount} · ${formatMs(retryMs)} (${share.toFixed(0)}%)</span>`;
+    const retryRows = retries.map(r => `
+      <tr>
+        <td class="lat-inline-name">${esc(r.bucket || "other")}</td>
+        <td class="lat-inline-ms">${formatMs(Number(r.dur_ms) || 0)}</td>
+        <td class="lat-retry-toks">${r.output_tokens || 0} out / ${(r.tok_per_s || 0).toFixed(1)} tok/s</td>
+        <td class="lat-inline-ms lat-retry-overhead">~${formatMs(Number(r.overhead_ms) || 0)}</td>
+      </tr>`).join("");
+    retryDetail = `<details class="score-strip-lat-retry">
+      <summary class="score-strip-lat-retry-title">Throttling detail (heuristic) <span class="lat-retry-note">tok/s &lt; ${RETRY_MAX_TOK_PER_S}</span></summary>
+      <table class="lat-tbl-inline lat-tbl-retry">
+        <thead><tr><th>bucket</th><th>duration</th><th>output / rate</th><th>overhead</th></tr></thead>
+        <tbody>${retryRows}</tbody>
+      </table>
+    </details>`;
+  }
+
+  // Rendered INSIDE the score-strip grey box, styled to match the
+  // Improvement-suggestions sub-block (same tiny uppercase title rule).
+  // Collapsed by default — the breakdown table is bulky and most readers
+  // only want it when something looks off.
+  return `<details class="score-strip-lat">
+    <summary class="score-strip-lat-title">Latency breakdown <span class="lat-inline-total">${formatMs(total)} total</span>${retryChip}</summary>
+    <table class="lat-tbl-inline">
+      <tbody>${rows}</tbody>
+    </table>
+    ${retryDetail}
+  </details>`;
+}
 
 const SCOPE_CLS = {kb:"scope-kb", mock_tool:"scope-mock_tool",
                     dba_no_tools:"scope-dba_no_tools", main_agent:"scope-main_agent",
@@ -5303,7 +5797,7 @@ function summaryClass(v, thresholds) {
   return "s-good";
 }
 
-function scoreStripHtml(c, suggHtml) {
+function scoreStripHtml(c, suggHtml, latHtml) {
   const wa = c.weighted_avg;
   const waStr = wa == null ? "–" : wa.toFixed(2);
   const waCls = summaryClass(wa, [0.5, PASS_THRESHOLD]);
@@ -5313,12 +5807,20 @@ function scoreStripHtml(c, suggHtml) {
   const pr = c.enum_precision;
   const prStr = pr == null ? "–" : pr.toFixed(2);
   const prCls = summaryClass(pr, [0.5, 0.8]);
-  const exp = c.expert_score;
-  const expStr = exp == null ? "–" : exp.toFixed(1);
-  const expCls = summaryClass(exp, [4, 7]);
   const r2 = c.rel2_score;
   const r2Str = r2 == null ? "–" : r2.toFixed(2);
   const r2Cls = summaryClass(r2, [0.5, 0.8]);
+  const latMs = c.lat_total_ms;
+  const latStr = (latMs == null || !isFinite(latMs)) ? "–" : formatMs(latMs);
+  const latCls = latencyClass(latMs);
+  const latTip = latencyBoxTitle(latMs);
+  // When the latency surface is disabled by --include-latency=false the
+  // box itself is dropped from the score strip so the report doesn't
+  // show approximated data to readers who shouldn't see it.
+  const latBoxHtml = INCLUDE_LATENCY
+    ? `<div class="score-box ${latCls}" title="${latTip}"><span class="sb-accent"></span>
+       <div class="sb-label">Latency</div><div class="sb-value sb-value-lat">${latStr}</div></div>`
+    : "";
   const suggBlock = suggHtml
     ? `<div class="score-strip-sugg"><div class="score-strip-sugg-title">Improvement suggestions</div>${suggHtml}</div>`
     : "";
@@ -5330,12 +5832,12 @@ function scoreStripHtml(c, suggHtml) {
        <div class="sb-label">Recall (0–1)</div><div class="sb-value">${rcStr}</div></div>` +
     `<div class="score-box ${prCls}" title="Per-case ENUM precision: |expected ∩ reranker-selected| / |reranker-selected|"><span class="sb-accent"></span>
        <div class="sb-label">Precision (0–1)</div><div class="sb-value">${prStr}</div></div>` +
-    `<div class="score-box ${expCls}"><span class="sb-accent"></span>
-       <div class="sb-label">Expert (1–10)</div><div class="sb-value">${expStr}</div></div>` +
     `<div class="score-box ${r2Cls}"><span class="sb-accent"></span>
        <div class="sb-label">Rel2 (0–1)</div><div class="sb-value">${r2Str}</div></div>` +
+    latBoxHtml +
     `</div>` +
     suggBlock +
+    (latHtml || "") +
     `</div>`;
 }
 
@@ -5385,7 +5887,7 @@ function selectCase(id) {
       ${langSwitch}
     </h2>
     <div style="margin-bottom:10px">${routeChips(c)}</div>
-    ${scoreStripHtml(c, sugg)}
+    ${scoreStripHtml(c, sugg, latencyDetailHtml(c))}
     <div class="detail-section">
       <h3>User query</h3>
       ${bodyLangPair(c.user_query, c.user_query_en)}
@@ -5922,6 +6424,63 @@ document.addEventListener("click", e => {
   attach();
 })();
 
+// Point click on the Latency-vs-#ENUMs scatter → filter Test Cases to
+// the single clicked case. The point's customdata is [case_id]. Clicks
+// on the binned-mean diamond line don't carry customdata (no case-id
+// attached at the trace level) so we simply ignore them.
+(function bindLatencyEnumScatterClick() {
+  const el = document.getElementById("latency-vs-enums");
+  if (!el || typeof Plotly === "undefined") return;
+  function attach() {
+    if (!el.on) { setTimeout(attach, 60); return; }
+    el.on("plotly_click", evt => {
+      if (!evt || !evt.points || !evt.points.length) return;
+      const p = evt.points[0];
+      const cd = p.customdata;
+      if (!Array.isArray(cd) || !cd.length) return;
+      const cid = String(cd[0] || "");
+      if (!cid) return;
+      activeFilters.case_id_set = new Set([cid]);
+      activeFilters.case_id_label = "case " + cid;
+      activeFilters.dim_pairs = [];
+      activeFilters.missed_enum = null;
+      document.querySelector('[data-target="tab-cases"]').click();
+      renderList();
+    });
+  }
+  attach();
+})();
+
+// Bar click on the Latency-distribution histogram → filter Test Cases to
+// the rows whose total wall-clock latency falls in that bin. Per-bar
+// customdata is [bin_lo_s, bin_hi_s, [case_ids]]; the last bin holds the
+// p99+ tail (we clip the visual at p99 but assign all overflow cases to
+// the rightmost bar so the click still reveals them).
+(function bindLatencyDistributionClick() {
+  const el = document.getElementById("latency-distribution");
+  if (!el || typeof Plotly === "undefined") return;
+  function attach() {
+    if (!el.on) { setTimeout(attach, 60); return; }
+    el.on("plotly_click", evt => {
+      if (!evt || !evt.points || !evt.points.length) return;
+      const p = evt.points[0];
+      const cd = p.customdata;
+      if (!Array.isArray(cd) || cd.length < 3) return;
+      const lo = Number(cd[0]);
+      const hi = Number(cd[1]);
+      const ids = cd[2];
+      if (!Array.isArray(ids) || !ids.length) return;
+      activeFilters.case_id_set = new Set(ids.map(String));
+      activeFilters.case_id_label = "latency " + lo.toFixed(2) + "–" + hi.toFixed(2) + "s";
+      activeFilters.dim_pairs = [];
+      activeFilters.missed_enum = null;
+      document.querySelector('[data-target="tab-cases"]').click();
+      renderList();
+    });
+  }
+  attach();
+})();
+
 // Cell click on Dimension × score heatmap → filter Test Cases.
 // Each axis label is "<dim>=<score>". Diagonal click = one pair, off-diagonal = two.
 (function bindDimHeatmapClick() {
@@ -5952,13 +6511,782 @@ document.addEventListener("click", e => {
 """
 
 
+# ─── Latency (per-step wall-clock breakdown parsed from MLflow spans) ──────
+# Columns are added to the checkpoint CSV by backfill_latency.py before
+# the report runs; the report degrades gracefully when they are absent.
+LAT_STEP_LABELS = (
+    "routing", "planning_llm", "kb_retrieve", "kb_prune",
+    "kb_rerank", "tools", "generation_llm", "overhead",
+)
+LAT_STEP_DISPLAY = {
+    "routing":        "Routing (main_agent)",
+    "planning_llm":   "Planning LLM",
+    "kb_retrieve":    "KB retrieve",
+    "kb_prune":       "KB prune",
+    "kb_rerank":      "KB rerank",
+    "tools":          "Tools (non-KB)",
+    "generation_llm": "Generation LLM",
+    "overhead":       "Overhead",
+}
+
+
+def _fmt_ms(ms) -> str:
+    if ms is None or (isinstance(ms, float) and (np.isnan(ms) or not np.isfinite(ms))):
+        return "—"
+    try:
+        ms = float(ms)
+    except (TypeError, ValueError):
+        return "—"
+    if ms >= 60_000:
+        return f"{ms / 60_000:.1f}m"
+    if ms >= 1_000:
+        return f"{ms / 1_000:.2f}s"
+    return f"{ms:.0f}ms"
+
+
+def _bootstrap_mean_ci(arr: np.ndarray, *, n_resamples: int = 1000,
+                       seed: int = 0) -> tuple[float, float]:
+    """Bootstrap percentile 95% CI on the mean. Skewed distributions like
+    latency violate the t-CI normality assumption; the percentile bootstrap
+    handles them correctly."""
+    if arr.size == 0:
+        return float("nan"), float("nan")
+    rng = np.random.default_rng(seed)
+    means = rng.choice(arr, size=(n_resamples, arr.size), replace=True).mean(axis=1)
+    lo, hi = np.percentile(means, [2.5, 97.5])
+    return float(lo), float(hi)
+
+
+def _latency_stats(series: pd.Series) -> dict:
+    s = pd.to_numeric(series, errors="coerce").dropna()
+    if s.empty:
+        return {"n": 0, "mean": None, "ci_low": None, "ci_high": None,
+                "p50": None, "p95": None}
+    arr = s.to_numpy(dtype=float)
+    ci_low, ci_high = _bootstrap_mean_ci(arr)
+    return {
+        "n": int(arr.size),
+        "mean": float(arr.mean()),
+        "ci_low": ci_low,
+        "ci_high": ci_high,
+        "p50": float(np.percentile(arr, 50)),
+        "p95": float(np.percentile(arr, 95)),
+    }
+
+
+def _per_step_retry_overhead(df: pd.DataFrame) -> dict[str, "pd.Series"]:
+    """Attribute each flagged retry's estimated back-off back to a step bucket.
+
+    Returns a dict ``{step_label: pd.Series}`` where each Series is per-case
+    overhead in ms attributed to that step. Buckets that don't carry LLM
+    time (``kb_retrieve``, ``kb_prune``, ``tools``, ``overhead``) get the
+    zero Series so callers can treat the dict uniformly.
+
+    Attribution rules — driven by the ``bucket`` field that
+    ``_classify_llm_call`` writes into ``lat_retries_json``:
+
+    * ``routing``       — counted under ``routing``.
+    * ``kb_rerank`` / ``kb_other`` — counted under ``kb_rerank`` (the only
+                          knowledge-search bucket that contains LLM time).
+    * ``sub_agent_llm`` — split proportionally between ``planning_llm``
+                          and ``generation_llm`` based on the per-case
+                          ratio of those two step times. When only
+                          ``generation_llm`` is non-zero (no tool call),
+                          all of it lands there. Defensible heuristic
+                          because the retry detector cannot tell
+                          planning- from generation-CHAT_MODEL spans
+                          from ancestor chain alone (both nest under
+                          ``llm`` → ``LangGraph`` → sub-agent).
+    * ``other``         — unattributable; not subtracted from any step.
+
+    NB: Per-step overhead does not have to sum to ``lat_retry_overhead_ms``
+    on a case (the ``other`` bucket gets dropped). That's by design — we
+    only adjust step buckets we can defend.
+    """
+    overhead = {label: pd.Series(0.0, index=df.index) for label in LAT_STEP_LABELS}
+    if "lat_retries_json" not in df.columns:
+        return overhead
+    plan = pd.to_numeric(df.get("lat_planning_llm_ms"), errors="coerce").fillna(0.0)
+    gen = pd.to_numeric(df.get("lat_generation_llm_ms"), errors="coerce").fillna(0.0)
+    for idx, retries_json in df["lat_retries_json"].items():
+        if not isinstance(retries_json, str) or not retries_json:
+            continue
+        try:
+            retries = json.loads(retries_json)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(retries, list):
+            continue
+        plan_ms = float(plan.at[idx]) if idx in plan.index else 0.0
+        gen_ms = float(gen.at[idx]) if idx in gen.index else 0.0
+        denom = plan_ms + gen_ms
+        plan_share = (plan_ms / denom) if denom > 0 else 0.0
+        gen_share = 1.0 - plan_share if denom > 0 else 1.0
+        for r in retries:
+            try:
+                o = float(r.get("overhead_ms", 0))
+            except (TypeError, ValueError):
+                continue
+            if o <= 0:
+                continue
+            bucket = r.get("bucket", "")
+            if bucket == "routing":
+                overhead["routing"].at[idx] += o
+            elif bucket in ("kb_rerank", "kb_other"):
+                overhead["kb_rerank"].at[idx] += o
+            elif bucket == "sub_agent_llm":
+                overhead["planning_llm"].at[idx] += o * plan_share
+                overhead["generation_llm"].at[idx] += o * gen_share
+            # "other": skip — can't attribute.
+    return overhead
+
+
+def _latency_summary_rows(df: pd.DataFrame) -> list[dict]:
+    if "lat_total_ms" not in df.columns:
+        return []
+    total = _latency_stats(df["lat_total_ms"])
+    if total["n"] == 0:
+        return []
+    # Adjusted total: observed - per-case retry overhead, clamped at 0.
+    clean_total_series = _adjusted_latency_series(df)
+    total_adj = (
+        _latency_stats(clean_total_series) if clean_total_series is not None
+        else {"n": 0, "mean": None, "ci_low": None, "ci_high": None,
+              "p50": None, "p95": None}
+    )
+    # Per-step retry overhead (attributed per the rules in
+    # `_per_step_retry_overhead`). When no retry data is present every
+    # series is zero, so `adj_*` ends up equal to `*` and the report
+    # silently skips the "without throttling" line per row.
+    overhead_by_step = _per_step_retry_overhead(df)
+    rows: list[dict] = []
+    for label in LAT_STEP_LABELS:
+        col = f"lat_{label}_ms"
+        if col not in df.columns:
+            continue
+        obs_series = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+        st = _latency_stats(obs_series)
+        adj_series = (obs_series - overhead_by_step.get(label, 0.0)).clip(lower=0.0)
+        adj = _latency_stats(adj_series)
+        share = ((st["mean"] / total["mean"])
+                 if (total["mean"] and st["mean"] is not None) else None)
+        rows.append({
+            "label": label, **st, "share": share,
+            "adj_mean": adj["mean"], "adj_ci_low": adj["ci_low"],
+            "adj_ci_high": adj["ci_high"], "adj_p50": adj["p50"],
+            "adj_p95": adj["p95"],
+        })
+    # Bottleneck on top: descending share, with missing shares last.
+    rows.sort(key=lambda r: (r["share"] is None, -(r["share"] or 0)))
+    rows.append({
+        "label": "total", **total, "share": 1.0,
+        "adj_mean": total_adj["mean"], "adj_ci_low": total_adj["ci_low"],
+        "adj_ci_high": total_adj["ci_high"], "adj_p50": total_adj["p50"],
+        "adj_p95": total_adj["p95"],
+    })
+    return rows
+
+
+def _lat_ci_bar_html(mean, ci_low, ci_high, *, total_mean: float | None) -> str:
+    """Horizontal mini-bar visualising a step's 95% CI relative to the run's
+    mean total latency. The full bar width corresponds to ``total_mean``; the
+    coloured band marks ``[ci_low, ci_high]`` and the diamond marks ``mean``.
+
+    Falls back to a text-only range when any value or the reference total is
+    missing — the column still renders, just without the visual.
+    """
+    if (mean is None or ci_low is None or ci_high is None
+            or not total_mean or total_mean <= 0):
+        if ci_low is not None and ci_high is not None:
+            return (
+                "<span class='lat-ci-text-only'>"
+                f"[{_fmt_ms(ci_low)} … {_fmt_ms(ci_high)}]</span>"
+            )
+        return "—"
+    lo_pct = max(0.0, min(100.0, (ci_low / total_mean) * 100))
+    hi_pct = max(0.0, min(100.0, (ci_high / total_mean) * 100))
+    mean_pct = max(0.0, min(100.0, (mean / total_mean) * 100))
+    band_w = max(hi_pct - lo_pct, 0.4)  # 0.4% min so a tight CI is still visible
+    label = f"[{_fmt_ms(ci_low)} … {_fmt_ms(ci_high)}]"
+    return (
+        f"<div class='lat-ci-vis' title='{label} · scale: full bar = mean total'>"
+        f"<div class='lat-ci-band' style='left:{lo_pct:.2f}%;width:{band_w:.2f}%'></div>"
+        f"<div class='lat-ci-mark' style='left:{mean_pct:.2f}%'></div>"
+        f"</div>"
+        f"<div class='lat-ci-text'>{label}</div>"
+    )
+
+
+def _latency_retry_summary(df: pd.DataFrame) -> dict | None:
+    """Run-level retry metrics. Returns ``None`` when the columns are
+    absent or no traces carry retry data.
+
+    Computed separately from the step rows because retries OVERLAP with the
+    LLM buckets (each retried call's wall time is already counted in
+    routing / planning_llm / generation_llm / kb_rerank). Summing them
+    into the total would double-count, so the report keeps them as their
+    own row below the step table.
+    """
+    if "lat_retry_call_count" not in df.columns or "lat_retry_overhead_ms" not in df.columns:
+        return None
+    counts = pd.to_numeric(df["lat_retry_call_count"], errors="coerce").fillna(0).astype(int)
+    overhead = pd.to_numeric(df["lat_retry_overhead_ms"], errors="coerce").fillna(0.0)
+    n_total = int(counts.notna().sum())
+    if n_total == 0:
+        return None
+    n_with = int((counts > 0).sum())
+    # Stats on the subset of cases that actually had a retry — the
+    # zero-retry cases dominate the population and would drown out the
+    # mean otherwise.
+    with_mask = counts > 0
+    if with_mask.any():
+        stats = _latency_stats(overhead[with_mask])
+    else:
+        stats = {"n": 0, "mean": None, "ci_low": None, "ci_high": None,
+                 "p50": None, "p95": None}
+    return {
+        "n_total": n_total,
+        "n_with_retries": n_with,
+        "share_with_retries": (n_with / n_total) if n_total else 0.0,
+        "calls_total": int(counts.sum()),
+        **stats,
+    }
+
+
+def _latency_summary_card_html(df: pd.DataFrame) -> str:
+    rows = _latency_summary_rows(df)
+    if not rows:
+        return ""
+    # The Total row sets the scale for every per-step CI bar. Pull it once.
+    total_row = next((r for r in rows if r["label"] == "total"), None)
+    total_mean = total_row["mean"] if total_row else None
+    body_rows: list[str] = []
+    for r in rows:
+        is_total = r["label"] == "total"
+        cls = " class='lat-total-row'" if is_total else ""
+        display = "Total" if is_total else LAT_STEP_DISPLAY.get(r["label"], r["label"])
+        share_str = f"{r['share'] * 100:.1f}%" if r.get("share") is not None else "—"
+        bar_html = ""
+        if not is_total and r.get("share") is not None:
+            pct = max(0.0, min(100.0, r["share"] * 100))
+            bar_html = (f"<div class='lat-bar' title='{pct:.1f}% of mean total'>"
+                        f"<div class='lat-bar-fill' style='width:{pct:.1f}%'></div></div>")
+        # The Total row's CI is shown text-only — visualising it against
+        # itself is uninformative (band would always span the whole bar).
+        if is_total:
+            if r.get("ci_low") is not None and r.get("ci_high") is not None:
+                ci_html = (
+                    f"<span class='lat-ci-text-only'>"
+                    f"[{_fmt_ms(r['ci_low'])} … {_fmt_ms(r['ci_high'])}]</span>"
+                )
+            else:
+                ci_html = "—"
+        else:
+            ci_html = _lat_ci_bar_html(
+                r.get("mean"), r.get("ci_low"), r.get("ci_high"),
+                total_mean=total_mean,
+            )
+        # When a step's retry-adjusted mean differs meaningfully from the
+        # observed mean (≥1%) we tuck a small "without throttling" line
+        # under the observed number — same column, smaller font, amber
+        # delta, so a reader scanning the Mean column sees both the as-
+        # observed value and what it would be if back-off was stripped.
+        # Steps with no LLM time (kb_retrieve, kb_prune, tools, overhead)
+        # never carry retry overhead, so this line just doesn't render
+        # for them.
+        adj_mean_html = ""
+        if r.get("adj_mean") is not None and r.get("mean"):
+            adj_mean = r["adj_mean"]
+            mean_val = r["mean"]
+            if mean_val > 0 and abs(adj_mean - mean_val) / mean_val >= 0.01:
+                delta_pct = 100.0 * (adj_mean - mean_val) / mean_val
+                adj_mean_html = (
+                    f"<div class='lat-adj-line' title='Same mean with the "
+                    f"estimated per-step retry back-off subtracted "
+                    f"(clamped at 0)'>"
+                    f"{_fmt_ms(adj_mean)} "
+                    f"<span class='lat-adj-delta'>({delta_pct:+.1f}%)</span>"
+                    f"</div>"
+                )
+        adj_p95_html = ""
+        if r.get("adj_p95") is not None and r.get("p95"):
+            ap = r["adj_p95"]
+            pv = r["p95"]
+            if pv > 0 and abs(ap - pv) / pv >= 0.01:
+                adj_p95_html = (
+                    f"<div class='lat-adj-line'>{_fmt_ms(ap)}</div>"
+                )
+        body_rows.append(
+            f"<tr{cls}>"
+            f"<td>{display}</td>"
+            f"<td style='text-align:right'>{r['n']}</td>"
+            f"<td style='text-align:right'>{_fmt_ms(r['mean'])}{adj_mean_html}</td>"
+            f"<td class='lat-ci-cell'>{ci_html}</td>"
+            f"<td style='text-align:right'>{_fmt_ms(r['p50'])}</td>"
+            f"<td style='text-align:right'>{_fmt_ms(r['p95'])}{adj_p95_html}</td>"
+            f"<td style='text-align:right;white-space:nowrap'>{share_str}{bar_html}</td>"
+            f"</tr>"
+        )
+    # Retry overhead — rendered as its own row below the table because it
+    # OVERLAPS with the LLM step buckets (it's a slice of routing /
+    # planning_llm / generation_llm / kb_rerank wall time, not an
+    # independent step). Adding it to the table would visually invite
+    # double-counting.
+    retry = _latency_retry_summary(df)
+    retry_block = ""
+    if retry is not None and retry["n_with_retries"] > 0:
+        share_pct = retry["share_with_retries"] * 100
+        ci_html = (
+            f"[{_fmt_ms(retry['ci_low'])} … {_fmt_ms(retry['ci_high'])}]"
+            if retry["ci_low"] is not None and retry["ci_high"] is not None
+            else "—"
+        )
+        retry_block = (
+            '<div class="lat-retry-row">'
+            '<div class="lat-retry-title">Retry overhead <span class="lat-axis-hint">— overlaps with LLM buckets, not summed into total</span></div>'
+            '<table class="tbl lat-tbl lat-retry-tbl">'
+            '<thead><tr>'
+            '<th>—</th>'
+            '<th style="text-align:right">cases w/ retries</th>'
+            '<th style="text-align:right">Mean overhead</th>'
+            '<th style="text-align:right">95% CI (mean)</th>'
+            '<th style="text-align:right">p50</th>'
+            '<th style="text-align:right">p95</th>'
+            '<th style="text-align:right">Retry rate</th>'
+            '</tr></thead>'
+            '<tbody>'
+            '<tr>'
+            '<td>Suspected throttle / retry</td>'
+            f'<td style="text-align:right">{retry["n_with_retries"]:,} / {retry["n_total"]:,}'
+            f' <span class="lat-axis-hint">({retry["calls_total"]:,} call(s))</span></td>'
+            f'<td style="text-align:right">{_fmt_ms(retry["mean"])}</td>'
+            f'<td style="text-align:right;color:#5c7999;font-size:11px">{ci_html}</td>'
+            f'<td style="text-align:right">{_fmt_ms(retry["p50"])}</td>'
+            f'<td style="text-align:right">{_fmt_ms(retry["p95"])}</td>'
+            f'<td style="text-align:right">{share_pct:.1f}%</td>'
+            '</tr>'
+            '</tbody></table></div>'
+        )
+    return (
+        '<div class="card">'
+        '<div class="card-title">Latency breakdown ' + _info_icon(
+            "Per-step wall-clock latency parsed from MLflow trace spans. "
+            "Mean: arithmetic mean across cases. 95% CI: bootstrap percentile "
+            "(1000 resamples) on the mean — robust to the right-skew typical "
+            "of latency data. The CI column is drawn to scale: the full bar "
+            "width equals the mean total latency, so you can read each step's "
+            "absolute position and CI tightness at a glance. "
+            "p50 / p95: per-case order statistics. "
+            "Share: mean step time / mean total time. Steps are mutually "
+            "non-overlapping; overhead absorbs LangGraph wiring time. "
+            "Sorted by share desc — the bottleneck is on top. "
+            "A small amber line under Mean / p95 shows the same number "
+            "without the estimated retry back-off (when it differs by "
+            "≥1%) — answers 'what would this step look like with no "
+            "throttling?'. Retry-overhead row below the table aggregates "
+            "the same overhead across the run."
+        ) + "</div>"
+        '<table class="tbl lat-tbl">'
+        '<thead><tr>'
+        '<th>Step</th>'
+        '<th style="text-align:right">n</th>'
+        '<th style="text-align:right">Mean</th>'
+        '<th>95% CI (mean) <span class="lat-axis-hint">— full bar = mean total</span></th>'
+        '<th style="text-align:right">p50</th>'
+        '<th style="text-align:right">p95</th>'
+        '<th style="text-align:right">Share</th>'
+        '</tr></thead>'
+        '<tbody>' + "".join(body_rows) + '</tbody>'
+        '</table>'
+        + retry_block +
+        '</div>'
+    )
+
+
+def _build_latency_distribution_fig(df: pd.DataFrame):
+    """Histogram of per-trace total latency with vertical lines marking the
+    bootstrap 95% CI on the mean, plus p50 / p95 reference lines.
+
+    X-axis is in seconds (latencies usually run multi-second so milliseconds
+    would be hard to read). The histogram is clipped at the p99 mark to keep
+    a few extreme outliers from squashing the rest of the distribution; a
+    note in the card title makes the clipping explicit.
+    """
+    if "lat_total_ms" not in df.columns:
+        return None
+    s = pd.to_numeric(df["lat_total_ms"], errors="coerce").dropna()
+    if s.empty:
+        return None
+    arr_s = (s.to_numpy(dtype=float) / 1000.0)
+    stats = _latency_stats(s)
+    if stats["mean"] is None:
+        return None
+    mean_s = stats["mean"] / 1000.0
+    ci_lo_s = stats["ci_low"] / 1000.0
+    ci_hi_s = stats["ci_high"] / 1000.0
+    p50_s = stats["p50"] / 1000.0
+    p95_s = stats["p95"] / 1000.0
+
+    n = len(arr_s)
+    upper = float(np.percentile(arr_s, 99))
+    if upper <= 0:
+        upper = float(arr_s.max() or 1.0)
+    n_bins = max(20, min(60, int(np.sqrt(n) * 2)))
+    bin_edges = np.linspace(0.0, upper, n_bins + 1)
+    clipped = np.clip(arr_s, 0.0, upper)
+    counts, _ = np.histogram(clipped, bins=bin_edges)
+    centers = (bin_edges[:-1] + bin_edges[1:]) / 2.0
+
+    # Build per-bin lists of test_case_ids so clicking a bar can filter the
+    # Test Cases tab. Outliers above the p99 clip land in the last bin —
+    # matches the visual: the bar at the right edge holds the long tail.
+    case_ids = (df["test_case_id"].astype(str).tolist()
+                if "test_case_id" in df.columns
+                else [""] * len(arr_s))
+    bin_idx = np.digitize(clipped, bin_edges) - 1
+    bin_idx = np.clip(bin_idx, 0, len(bin_edges) - 2)
+    per_bin_ids: list[list[str]] = [[] for _ in range(len(bin_edges) - 1)]
+    for cid, bi in zip(case_ids, bin_idx, strict=False):
+        per_bin_ids[int(bi)].append(cid)
+    # customdata schema per bar: [bin_lo_s, bin_hi_s, [case_ids…]]. The JS
+    # click handler reads cd[2] as the filter set and cd[0]/cd[1] for the
+    # range label shown on the active-filter banner.
+    customdata = [
+        [float(bin_edges[i]), float(bin_edges[i + 1]), per_bin_ids[i]]
+        for i in range(len(bin_edges) - 1)
+    ]
+
+    fig = go.Figure(go.Bar(
+        x=centers, y=counts,
+        marker=dict(color=GE_BLUE, line=dict(width=0)),
+        width=(bin_edges[1] - bin_edges[0]) * 0.96,
+        customdata=customdata,
+        hovertemplate=(
+            "<b>%{customdata[0]:.2f}s – %{customdata[1]:.2f}s</b><br>"
+            "cases: %{y}<br>"
+            "<i>click to filter Test Cases</i><extra></extra>"
+        ),
+        showlegend=False,
+    ))
+    # Mean + 95% CI annotations all live above the plot area on the same
+    # horizontal line as the rest. Annotation y is anchored to "paper"
+    # coordinates with a small yshift so labels sit just above the top axis
+    # and never collide with bars (which is what the bottom-anchored p50/p95
+    # used to do).
+    def _vline_at_top(x, *, color, dash="solid", width=1, label, size=10, yshift=0,
+                       xanchor="center"):
+        fig.add_shape(type="line", xref="x", yref="paper",
+                      x0=x, x1=x, y0=0, y1=1,
+                      line=dict(color=color, width=width, dash=dash))
+        fig.add_annotation(x=x, xref="x", y=1.0, yref="paper",
+                            yshift=10 + yshift,
+                            text=label, showarrow=False,
+                            font=dict(color=color, size=size),
+                            xanchor=xanchor, yanchor="bottom",
+                            bgcolor="rgba(255,255,255,0.85)")
+
+    # Lines drawn in x-axis order so closer labels can stagger via yshift if
+    # they're too close together (p50/CI-lo cluster, mean/CI-hi cluster).
+    _vline_at_top(p50_s, color=GE_MUTED, dash="dot", width=1,
+                   label=f"p50 {p50_s:.2f}s", size=10, xanchor="right")
+    _vline_at_top(ci_lo_s, color=GE_BLUE, dash="dash", width=1,
+                   label=f"CI lo {ci_lo_s:.2f}s", size=10, xanchor="right",
+                   yshift=14)
+    _vline_at_top(mean_s, color=GE_BLUE, dash="solid", width=2,
+                   label=f"mean {mean_s:.2f}s", size=11)
+    _vline_at_top(ci_hi_s, color=GE_BLUE, dash="dash", width=1,
+                   label=f"CI hi {ci_hi_s:.2f}s", size=10, xanchor="left",
+                   yshift=14)
+    _vline_at_top(p95_s, color=GE_RED, dash="dot", width=1,
+                   label=f"p95 {p95_s:.2f}s", size=10, xanchor="left")
+
+    _style_fig(fig, height=380)
+    fig.update_layout(
+        # Extra top margin so the staggered annotations have room.
+        margin=dict(t=70, b=40, l=50, r=20),
+        bargap=0.04,
+        xaxis_title="trace latency (s) · clipped at p99",
+        yaxis_title="count",
+    )
+    return fig
+
+
+def _adjusted_latency_series(df: pd.DataFrame) -> "pd.Series | None":
+    """Per-case latency with the estimated retry back-off subtracted.
+
+    Returns ``None`` when the retry columns are missing on the dataframe.
+    Clamped at 0 so an over-estimate of overhead cannot push a case below
+    zero. Used to compute the "without estimated throttling" mean / CI /
+    p50 / p95 shown on the headline Latency card.
+    """
+    if "lat_total_ms" not in df.columns or "lat_retry_overhead_ms" not in df.columns:
+        return None
+    total = pd.to_numeric(df["lat_total_ms"], errors="coerce")
+    overhead = pd.to_numeric(df["lat_retry_overhead_ms"], errors="coerce").fillna(0.0)
+    clean = (total - overhead).clip(lower=0.0)
+    return clean
+
+
+def _build_latency_vs_enum_count_fig(df: pd.DataFrame):
+    """Scatter of reranked-ENUM count vs *generation-LLM* latency.
+
+    Directly tests the hypothesis: "more selected ENUMs → bigger
+    generation-LLM context → longer generation time". Plotting against
+    ``lat_total_ms`` was misleading because cases that never invoked the
+    KB pipeline are pinned at enum_count=0 with their latency dominated
+    by main-agent routing time. We filter to cases where the KB
+    pipeline ran (``post_prune_enum_count > 0``) so the relationship
+    being plotted is the one the user is actually asking about.
+
+    Retry-flagged cases are coloured red so any clustering of retries
+    at high enum counts (which would support the "more context → more
+    TPM pressure → more throttling" side of the hypothesis) is
+    immediately visible. A binned mean line (per integer enum count,
+    dropping bins with fewer than 3 cases) shows the trend, and the
+    Pearson r between count and generation latency is printed in the
+    x-axis label.
+
+    Customdata on each point is ``[case_id]`` so clicking a point opens
+    that case in the Test Cases tab (see
+    ``bindLatencyEnumScatterClick``).
+    """
+    needed = ("lat_generation_llm_ms", "_reranked_enum_ids", "post_prune_enum_count")
+    if any(c not in df.columns for c in needed):
+        return None
+    gen_lat = pd.to_numeric(df["lat_generation_llm_ms"], errors="coerce")
+    counts = df["_reranked_enum_ids"].apply(
+        lambda x: len(x) if isinstance(x, list) else 0
+    )
+    post_prune = pd.to_numeric(df["post_prune_enum_count"], errors="coerce").fillna(0)
+    rc = pd.to_numeric(
+        df.get("lat_retry_call_count", pd.Series(0, index=df.index)),
+        errors="coerce",
+    ).fillna(0).astype(int)
+    case_ids = (df["test_case_id"].astype(str)
+                if "test_case_id" in df.columns
+                else pd.Series(["?"] * len(df), index=df.index))
+    # Filter: only cases where the KB pipeline actually ran. For cases
+    # that took the chit-chat / no-tool path, reranked_enum_count is
+    # structurally 0 and the generation latency reflects routing-LLM
+    # rather than context-driven generation — including them would
+    # bias the correlation toward 0.
+    valid = gen_lat.notna() & (post_prune > 0)
+    if not valid.any():
+        return None
+    lat_s = gen_lat[valid].to_numpy(dtype=float) / 1000.0
+    counts_v = counts[valid].to_numpy(dtype=int)
+    rc_v = rc[valid].to_numpy(dtype=int)
+    case_ids_v = case_ids[valid].to_numpy()
+    has_retry = rc_v > 0
+    no_retry = ~has_retry
+
+    fig = go.Figure()
+    # Background layer: cases with no flagged retry. Semi-transparent so
+    # the red retry points and the binned-mean line still read clearly.
+    if no_retry.any():
+        fig.add_trace(go.Scatter(
+            x=counts_v[no_retry], y=lat_s[no_retry],
+            mode="markers",
+            name=f"no retry (n={int(no_retry.sum())})",
+            marker=dict(color=GE_BLUE, size=6, opacity=0.35,
+                        line=dict(width=0)),
+            customdata=case_ids_v[no_retry].reshape(-1, 1),
+            hovertemplate=("<b>%{customdata[0]}</b><br>"
+                            "ENUMs: %{x}<br>latency: %{y:.2f}s"
+                            "<extra></extra>"),
+        ))
+    # Foreground layer: retry-flagged cases. Red, larger, bordered.
+    if has_retry.any():
+        fig.add_trace(go.Scatter(
+            x=counts_v[has_retry], y=lat_s[has_retry],
+            mode="markers",
+            name=f"retry flagged (n={int(has_retry.sum())})",
+            marker=dict(color=GE_RED, size=8, opacity=0.75,
+                        line=dict(color="#ffffff", width=0.5)),
+            customdata=case_ids_v[has_retry].reshape(-1, 1),
+            hovertemplate=("<b>%{customdata[0]}</b><br>"
+                            "ENUMs: %{x}<br>latency: %{y:.2f}s"
+                            "<br><i>retry flagged</i><extra></extra>"),
+        ))
+    # Binned mean trend line — only buckets with n>=3 so a single outlier
+    # doesn't yank a bucket's mean.
+    bin_df = pd.DataFrame({"c": counts_v, "l": lat_s})
+    grouped = (bin_df.groupby("c")
+                       .agg(mean=("l", "mean"), n=("l", "count"))
+                       .reset_index())
+    grouped = grouped[grouped["n"] >= 3].sort_values("c")
+    if not grouped.empty:
+        fig.add_trace(go.Scatter(
+            x=grouped["c"], y=grouped["mean"],
+            mode="lines+markers", name="mean per bin (n≥3)",
+            line=dict(color=GE_TEXT, width=2),
+            marker=dict(color=GE_TEXT, size=9, symbol="diamond"),
+            hovertemplate=("ENUMs: %{x}<br>"
+                            "mean latency: %{y:.2f}s<extra></extra>"),
+        ))
+    # Correlation summary printed in the x-axis label so the reader gets
+    # a numeric "is there a trend?" answer alongside the visual.
+    if len(lat_s) >= 3:
+        r = float(np.corrcoef(counts_v.astype(float), lat_s)[0, 1])
+        r_text = f"Pearson r = {r:+.2f}"
+    else:
+        r_text = "Pearson r = n/a"
+    _style_fig(fig, height=420)
+    fig.update_layout(
+        margin=dict(t=20, b=70, l=60, r=20),
+        xaxis_title=f"# reranked ENUMs · {r_text} · KB-running cases only (n={len(lat_s)})",
+        yaxis_title="generation LLM latency (s)",
+        legend=dict(orientation="h", y=-0.22, x=0.5, xanchor="center"),
+    )
+    return fig
+
+
+def _throttling_detail_row(df: pd.DataFrame) -> str:
+    """Throttling info appended inside the headline Latency card.
+
+    Two pieces, only rendered when at least one retry was flagged:
+
+    1. How many traces / calls were affected and how much wall time the
+       estimator attributes to back-off — the same line that was there
+       before, kept for the run-level scope.
+    2. A *retry-adjusted* mean / CI / p50 / p95, shown right under the
+       throttling line. This answers the question "if we could remove
+       the throttle back-off entirely, what would the run look like?".
+       Computed per-case (``lat_total_ms - lat_retry_overhead_ms``,
+       clamped at 0) so the bootstrap CI matches the same arithmetic as
+       the unadjusted headline mean.
+    """
+    if "lat_retry_overhead_ms" not in df.columns or "lat_retry_call_count" not in df.columns:
+        return ""
+    rc = pd.to_numeric(df["lat_retry_call_count"], errors="coerce").fillna(0)
+    ro = pd.to_numeric(df["lat_retry_overhead_ms"], errors="coerce").fillna(0)
+    total_overhead_ms = float(ro.sum())
+    n_calls = int(rc.sum())
+    n_traces = int((rc > 0).sum())
+    if n_calls == 0 or total_overhead_ms <= 0:
+        return ""
+    lat_sum = float(pd.to_numeric(df["lat_total_ms"], errors="coerce").fillna(0).sum())
+    pct = (100.0 * total_overhead_ms / lat_sum) if lat_sum > 0 else 0.0
+    tip = (
+        "Heuristic — APPROXIMATION, not ground truth. CHAT_MODEL spans "
+        "are flagged when their duration crosses a bucket-specific "
+        "minimum AND their output_tokens/sec sits below a bucket-specific "
+        "cap. Per-bucket thresholds (default): routing dur≥6s, tok/s&lt;5; "
+        "sub_agent_llm dur≥35s, tok/s&lt;8; kb_rerank dur≥18s, "
+        "tok/s&lt;4. The OTEL spans carry no explicit retry marker "
+        "(the Databricks/LangChain SDK swallows 429s), so an estimated "
+        f"overhead = duration − output_tokens / {RETRY_BASELINE_TOK_PER_S} "
+        "is reported per flagged call. See Notes for full definitions."
+    )
+    # Run-level: how much overhead was observed.
+    throttle_line = (
+        '<div class="hc-detail lat-hc-throttle">'
+        f'<span>Throttling {_info_icon(tip)} <strong>{n_traces}</strong> traces · '
+        f'<strong>{n_calls}</strong> calls · '
+        f'<strong>{_fmt_ms(total_overhead_ms)}</strong> overhead '
+        f'(<strong>{pct:.1f}%</strong> of total wall)</span>'
+        '</div>'
+    )
+    # What the same stats look like with the estimated overhead subtracted
+    # per-case. p50 usually shifts very little (most cases have no retry,
+    # so the median is set by an unretried case); the mean and p95 are
+    # where the difference shows up.
+    clean = _adjusted_latency_series(df)
+    if clean is None:
+        return throttle_line
+    clean_st = _latency_stats(clean)
+    obs_st = _latency_stats(pd.to_numeric(df["lat_total_ms"], errors="coerce"))
+    if clean_st["n"] == 0 or obs_st["mean"] is None:
+        return throttle_line
+    delta = clean_st["mean"] - obs_st["mean"]
+    delta_pct = (100.0 * delta / obs_st["mean"]) if obs_st["mean"] else 0.0
+    # _fmt_ms is sign-blind (treats -1439 as a sub-second value), so format
+    # the absolute drop and prepend the sign explicitly.
+    delta_sign = "−" if delta < 0 else "+"
+    delta_str = f"{delta_sign}{_fmt_ms(abs(delta))}"
+    adjusted_tip = (
+        "Same population, re-computed with the estimated retry back-off "
+        "subtracted per case (clamped at 0). Read it as: "
+        "'if the SDK never had to back off, this is what the run would "
+        "look like'. The CI here uses the same 1000-resample percentile "
+        "bootstrap as the observed mean. p50 usually moves very little "
+        "(most cases have no retry, so the median is unaffected); the "
+        "biggest change is in the mean and p95."
+    )
+    adjusted_line = (
+        '<div class="hc-detail lat-hc-adjusted">'
+        f'<span class="lat-hc-adjusted-title">Without throttling {_info_icon(adjusted_tip)}</span>'
+        '<span class="lat-hc-adjusted-stats">'
+        f'mean <strong>{_fmt_ms(clean_st["mean"])}</strong> '
+        f'<span class="lat-hc-adjusted-delta">({delta_pct:+.1f}%, '
+        f'{delta_str})</span> · '
+        f'CI <strong>[{_fmt_ms(clean_st["ci_low"])} – {_fmt_ms(clean_st["ci_high"])}]</strong> · '
+        f'p50 <strong>{_fmt_ms(clean_st["p50"])}</strong> · '
+        f'p95 <strong>{_fmt_ms(clean_st["p95"])}</strong>'
+        '</span>'
+        '</div>'
+    )
+    return throttle_line + adjusted_line
+
+
+def _latency_headline_card_html(df: pd.DataFrame) -> str:
+    """Compact headline-style card with the run's overall mean latency,
+    a centred CI bracket visualisation, and p50/p95 below. Designed to sit
+    on Summary row 2 alongside the Test-cases card.
+    """
+    if "lat_total_ms" not in df.columns:
+        return ""
+    st = _latency_stats(df["lat_total_ms"])
+    if st["n"] == 0 or st["mean"] is None:
+        return ""
+    return (
+        '<div class="headline-card lat-headline-card">'
+        '<div class="hc-label">Latency · mean <span class="lat-hc-label-aux">(observed)</span> ' + _info_icon(
+            "Mean end-to-end latency across all parsed traces — exactly "
+            "what the user/system experienced, back-off sleep included. "
+            "The bracket below shows the 95% bootstrap CI (1000 resamples) on "
+            "the mean — wide bracket means the run-level mean is noisy. "
+            "p50 / p95 are per-case order statistics; p95 is the right-tail "
+            "experience that dominates user complaints. "
+            "If a throttling line is shown below, the 'Without throttling' "
+            "row is the same arithmetic with the estimated retry back-off "
+            "subtracted per case — a what-if for the same population. "
+            "See the Notes tab for the full per-step definitions."
+        ) + '</div>'
+        f'<div class="hc-value lat-hc-value">{_fmt_ms(st["mean"])}</div>'
+        '<div class="lat-hc-ci">'
+        '<div class="lat-hc-ci-bracket">'
+        '<span class="lat-hc-ci-tick lat-hc-ci-tick-left"></span>'
+        '<span class="lat-hc-ci-line"></span>'
+        '<span class="lat-hc-ci-dot" title="mean"></span>'
+        '<span class="lat-hc-ci-line"></span>'
+        '<span class="lat-hc-ci-tick lat-hc-ci-tick-right"></span>'
+        '</div>'
+        '<div class="lat-hc-ci-labels">'
+        f'<span>{_fmt_ms(st["ci_low"])}</span>'
+        '<span class="lat-hc-ci-mid">95% CI (mean)</span>'
+        f'<span>{_fmt_ms(st["ci_high"])}</span>'
+        '</div>'
+        '</div>'
+        '<div class="hc-detail lat-hc-detail">'
+        f'<span>p50 <strong>{_fmt_ms(st["p50"])}</strong></span>'
+        '<span class="lat-hc-detail-sep">·</span>'
+        f'<span>p95 <strong>{_fmt_ms(st["p95"])}</strong></span>'
+        f'<span class="lat-hc-detail-n">n = {st["n"]:,}</span>'
+        '</div>'
+        + _throttling_detail_row(df) +
+        '</div>'
+    )
+
+
 def render_html(df: pd.DataFrame, *, df_all: pd.DataFrame | None = None,
                 yaml_name: str, reasoning_effort: str,
                 checkpoint_label: str, judge_model: str = "unknown",
                 experiment_name: str | None = None,
                 mlflow_run_id: str = "",
                 mlflow_experiment_id: str = "",
-                mlflow_run_timestamp: str = "") -> str:
+                mlflow_run_timestamp: str = "",
+                include_latency: bool = False) -> str:
     if df_all is None:
         df_all = df
     if not experiment_name:
@@ -5978,6 +7306,11 @@ def render_html(df: pd.DataFrame, *, df_all: pd.DataFrame | None = None,
     # the run's weighted_avg distribution at a glance; fig_missed feeds the
     # Retrieval Findings tab. fig_dim and fig_rc are unused but kept here.
     _, fig_wavg_hist, _, fig_missed = _build_figs(df, reranker_miss, retriever_miss)
+    # The latency figures are only built when the surface is included so
+    # we don't pay the plotly cost for a shareable report that suppresses
+    # everything latency-related anyway.
+    fig_lat_dist = _build_latency_distribution_fig(df) if include_latency else None
+    fig_lat_vs_enums = _build_latency_vs_enum_count_fig(df) if include_latency else None
     fig_dim_heatmap = _build_dim_heatmap(df)
     enum_count_dist_html = _enum_count_distribution_table_html(df)
     fig_fm_cooccurrence = _build_failure_mode_cooccurrence_fig(df)
@@ -6034,9 +7367,21 @@ def render_html(df: pd.DataFrame, *, df_all: pd.DataFrame | None = None,
         (_case_payload(r) for _, r in df_all.iterrows()),
         key=lambda c: _tid_key(c.get("id", "")),
     )
+    # Run-level mean latency feeds the per-case latency-chip threshold:
+    # green < 10s · yellow [10s, mean] · red > mean. Falls back to null
+    # when latency columns are absent so the JS goes to the trivial fast path.
+    if "lat_total_ms" in df.columns:
+        mean_lat_ms = pd.to_numeric(df["lat_total_ms"], errors="coerce").dropna().mean()
+        mean_lat_payload = float(mean_lat_ms) if pd.notna(mean_lat_ms) else None
+    else:
+        mean_lat_payload = None
+
     js = (JS.replace("__CASES__", json.dumps(cases_payload))
             .replace("__DIM_NAMES__", json.dumps(list(DIMENSION_WEIGHTS.keys())))
-            .replace("__PASS_THRESHOLD__", json.dumps(PASS_THRESHOLD)))
+            .replace("__PASS_THRESHOLD__", json.dumps(PASS_THRESHOLD))
+            .replace("__MEAN_LAT_MS__", json.dumps(mean_lat_payload if include_latency else None))
+            .replace("__RETRY_MAX_TOK_PER_S__", json.dumps(RETRY_MAX_TOK_PER_S))
+            .replace("__INCLUDE_LATENCY__", json.dumps(bool(include_latency))))
 
 
     # ── Filter chips (Test-Cases tab) ────────────────────────────────────────
@@ -6287,6 +7632,50 @@ def render_html(df: pd.DataFrame, *, df_all: pd.DataFrame | None = None,
         f'<div class="corr-grid">{corr_cards}</div></div>'
     ) if corr_cards else ""
 
+    # Build the Latency tab panel only when the surface is enabled. Kept
+    # as a variable rather than an inline expression because the panel
+    # is multi-card and easier to read out-of-band.
+    if include_latency:
+        latency_tab_panel = f"""
+  <div id="tab-latency" class="tab-panel">
+    <div class="card">
+      <div class="card-title">Latency distribution {_info_icon(
+          "Histogram of per-trace total wall-clock latency across all "
+          "parsed traces. Vertical lines: solid blue = mean, dashed blue = "
+          "95% bootstrap CI on the mean, dotted grey = p50 (median), dotted "
+          "red = p95 (the tail experience that dominates user complaints). "
+          "X-axis is clipped at p99 so extreme outliers do not squash the "
+          "rest of the distribution.")}
+      </div>
+      {_plot(fig_lat_dist, div_id="latency-distribution") if fig_lat_dist is not None else "<p class='placeholder'>no latency data on this checkpoint</p>"}
+    </div>
+
+    <div class="card">
+      <div class="card-title">Generation latency vs # selected ENUMs {_info_icon(
+          "Scatter of the reranker's final ENUM count (x) against the "
+          "generation-LLM step latency (y). Filtered to cases where the "
+          "KB pipeline actually ran (post_prune_enum_count &gt; 0) — "
+          "chit-chat cases would otherwise pile up at x=0 with their "
+          "latency driven by routing rather than context size, biasing "
+          "the correlation toward 0. "
+          "Directly tests the hypothesis 'more selected ENUMs → bigger "
+          "generation context → longer generation time'. "
+          "Retry-flagged cases are drawn in red so any clustering at "
+          "high enum counts (which would support the TPM-throttling "
+          "side of the hypothesis) is visible. "
+          "The diamond line is the mean per enum-count bucket (bins "
+          "with fewer than 3 cases omitted). Pearson r in the x-axis "
+          "label is the linear correlation. "
+          "Click any point to open that case in the Test Cases tab.")}
+      </div>
+      {_plot(fig_lat_vs_enums, div_id="latency-vs-enums") if fig_lat_vs_enums is not None else "<p class='placeholder'>need lat_generation_llm_ms, reranked_enum_ids, and post_prune_enum_count columns</p>"}
+    </div>
+
+    {_latency_summary_card_html(df)}
+  </div>"""
+    else:
+        latency_tab_panel = ""
+
     return f"""<!doctype html>
 <html><head><meta charset="utf-8">
 <title>CZKB – {_h(yaml_name)}</title>
@@ -6321,6 +7710,7 @@ def render_html(df: pd.DataFrame, *, df_all: pd.DataFrame | None = None,
     <button class="tab-btn tab-home active" data-target="tab-summary">Summary</button>
     <button class="tab-btn" data-target="tab-cases">Test Cases</button>
     <button class="tab-btn" data-target="tab-issues">Issues</button>
+    {'<button class="tab-btn" data-target="tab-latency">Latency</button>' if include_latency else ''}
     <button class="tab-btn" data-target="tab-dims">Scorers</button>
     <button class="tab-btn" data-target="tab-missed">Retrieval Findings</button>
     <button class="tab-btn" data-target="tab-kb-findings">KB Findings</button>
@@ -6386,12 +7776,13 @@ def render_html(df: pd.DataFrame, *, df_all: pd.DataFrame | None = None,
       </div>
     </div>
 
-    <div class="headline-row headline-row-1-3">
+    <div class="headline-row {('headline-row-1-1-3' if include_latency else 'headline-row-1-3')}">
       <div class="headline-card">
         <div class="hc-label">Test cases {_info_icon(test_cases_tooltip)}
         </div>
         <div class="hc-value">{summary_metrics['n_total']}</div>
       </div>
+      {_latency_headline_card_html(df) if include_latency else ""}
       <div class="headline-card kb-recall-card">
         <div class="hc-label">Stage funnel — recall &amp; precision {_info_icon(
             "Micro-averaged recall (Σ TP / Σ expected) and precision (Σ TP / "
@@ -6572,6 +7963,8 @@ def render_html(df: pd.DataFrame, *, df_all: pd.DataFrame | None = None,
     </div>
   </div>
 
+  {latency_tab_panel}
+
   <div id="tab-dims" class="tab-panel">
     <div class="card">
       <div class="card-title">Judge scorers {_info_icon(
@@ -6679,7 +8072,7 @@ def render_html(df: pd.DataFrame, *, df_all: pd.DataFrame | None = None,
   </div>
 
   <div id="tab-doc" class="tab-panel">
-    {_doc_tab_html(summary_metrics, wavg_hist_fig=fig_wavg_hist)}
+    {_doc_tab_html(summary_metrics, wavg_hist_fig=fig_wavg_hist, include_latency=include_latency)}
   </div>
 
 </main>
@@ -6923,6 +8316,15 @@ def main():
                          "the header reads reasoning_effort directly from the YAML.")
     ap.add_argument("--suffix", default="",
                     help="optional filename suffix (e.g. '_test' for a test run)")
+    ap.add_argument("--include-latency", action="store_true",
+                    help="Include the experimental Latency surfaces "
+                         "(headline card on Summary row 2, Latency tab, "
+                         "case-detail Latency score-box, in-case Latency "
+                         "breakdown, Notes-tab definitions). These are "
+                         "approximations — retry detection is a tok/s-based "
+                         "heuristic and can mis-fire. Off by default so the "
+                         "shareable report stays clean; turn on for "
+                         "internal perf reviews.")
     args = ap.parse_args()
 
     # If --yaml-name is omitted, try to auto-detect it from the checkpoint
@@ -6966,6 +8368,7 @@ def main():
         mlflow_run_id=meta["mlflow_run_id"],
         mlflow_experiment_id=meta["mlflow_experiment_id"],
         mlflow_run_timestamp=meta["mlflow_run_timestamp"],
+        include_latency=args.include_latency,
     )
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(html_str)
