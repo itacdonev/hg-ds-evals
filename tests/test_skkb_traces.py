@@ -559,3 +559,125 @@ def test_multiple_knowledge_search_runs_keep_final_run_as_flat_columns() -> None
     assert runs[0]["post_prune_enum_ids"] == ["OLD_POST"]
     assert runs[1]["raw_vector_db_retrieved_enum_ids"] == ["NEW_RAW"]
     assert runs[1]["post_prune_enum_ids"] == ["NEW_POST"]
+
+
+def test_agent_response_extracted_from_agent_answer_span() -> None:
+    spans = [
+        _span(
+            "agent_answer",
+            span_id="answer",
+            span_type="AGENT",
+            outputs={
+                "question": "How do I write to my advisor?",
+                "answer": "Use the WRITE_MESSAGE option in George.",
+            },
+        ),
+    ]
+    traces_df = pd.DataFrame(
+        [
+            {
+                "trace_id": "tr-answer",
+                "trace_metadata": {},
+                "tags": {},
+                "assessments": [],
+                "spans": spans,
+            }
+        ]
+    )
+
+    result = build_skkb_dataframe_from_mlflow_search_traces(traces_df)
+
+    assert result.parse_errors == []
+    assert result.dataframe.loc[0, "agent_response"] == "Use the WRITE_MESSAGE option in George."
+
+
+def test_agent_response_is_empty_when_agent_answer_span_absent() -> None:
+    """Strict extraction: no heuristic fallback when the canonical span is missing."""
+    spans = [
+        _span(
+            "ChatDatabricks",
+            span_id="chat",
+            outputs={
+                "generations": [
+                    [
+                        {
+                            "type": "ai",
+                            "content": "Some long heuristic-bait reasoning blob.",
+                            "response_metadata": {"finish_reason": "stop"},
+                        }
+                    ]
+                ]
+            },
+        ),
+    ]
+    traces_df = pd.DataFrame(
+        [
+            {
+                "trace_id": "tr-no-answer",
+                "trace_metadata": {},
+                "tags": {},
+                "assessments": [],
+                "spans": spans,
+            }
+        ]
+    )
+
+    result = build_skkb_dataframe_from_mlflow_search_traces(traces_df)
+
+    assert result.parse_errors == []
+    assert result.dataframe.loc[0, "agent_response"] == ""
+
+
+def test_agent_response_is_empty_when_answer_field_blank() -> None:
+    spans = [
+        _span(
+            "agent_answer",
+            span_id="answer",
+            span_type="AGENT",
+            outputs={"question": "Hi?", "answer": "   "},
+        ),
+    ]
+    traces_df = pd.DataFrame(
+        [
+            {
+                "trace_id": "tr-blank-answer",
+                "trace_metadata": {},
+                "tags": {},
+                "assessments": [],
+                "spans": spans,
+            }
+        ]
+    )
+
+    result = build_skkb_dataframe_from_mlflow_search_traces(traces_df)
+
+    assert result.parse_errors == []
+    assert result.dataframe.loc[0, "agent_response"] == ""
+
+
+def test_agent_response_ignores_agent_answer_span_with_wrong_type() -> None:
+    """``agent_answer`` name without ``AGENT`` span type must not match."""
+    spans = [
+        _span(
+            "agent_answer",
+            span_id="answer",
+            span_type="CHAIN",  # wrong type — strict extractor must skip
+            outputs={"answer": "Should not be picked up."},
+        ),
+    ]
+    traces_df = pd.DataFrame(
+        [
+            {
+                "trace_id": "tr-wrong-type",
+                "trace_metadata": {},
+                "tags": {},
+                "assessments": [],
+                "spans": spans,
+            }
+        ]
+    )
+
+    result = build_skkb_dataframe_from_mlflow_search_traces(traces_df)
+
+    assert result.parse_errors == []
+    assert result.dataframe.loc[0, "agent_response"] == ""
