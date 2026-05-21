@@ -546,16 +546,6 @@ def enrich(df: pd.DataFrame) -> pd.DataFrame:
         if f"_{src}" in df.columns:
             df[dst] = df[f"_{src}"].apply(len)
 
-    # `expected_answer_summary_with_optimal_context = sentinel` is the judge's
-    # "the post-prune pool cannot answer this query" signal — independent of
-    # the dimension scores.
-    if "expected_answer_summary_with_optimal_context" in df.columns:
-        df["_no_achievable_answer"] = df["expected_answer_summary_with_optimal_context"].apply(
-            lambda v: _is_void_string(v) if isinstance(v, str) else False
-        )
-    else:
-        df["_no_achievable_answer"] = pd.Series([False] * len(df), index=df.index)
-
     # ── Empty user_query flag ────────────────────────────────────────────────
     if "user_query" in df.columns:
         df["_user_query_empty"] = (
@@ -564,31 +554,7 @@ def enrich(df: pd.DataFrame) -> pd.DataFrame:
     else:
         df["_user_query_empty"] = pd.Series([True] * len(df), index=df.index)
 
-    # ── Stage-by-stage expected-ENUM recall (unweighted) ─────────────────────
-    def _recall_from_to(expected, candidate) -> float:
-        e = set(expected or [])
-        if not e:
-            return np.nan
-        return len(e & set(candidate or [])) / len(e)
-
-    if "_pre_prune_enum_ids" not in df.columns:
-        df["_pre_prune_enum_ids"] = df.get(
-            "pre_prune_enum_ids", pd.Series([""] * len(df), index=df.index)
-        ).apply(_parse_list)
-
-    df["_expected_recall_pre_prune"] = df.apply(
-        lambda r: _recall_from_to(r.get("_expected_enums", []), r.get("_pre_prune_enum_ids", [])),
-        axis=1,
-    )
-    df["_expected_recall_post_prune"] = df.apply(
-        lambda r: _recall_from_to(r.get("_expected_enums", []), r.get("_post_prune_enum_ids", [])),
-        axis=1,
-    )
-    df["_expected_recall_reranked"] = df.apply(
-        lambda r: _recall_from_to(r.get("_expected_enums", []), r.get("_reranked_enum_ids", [])),
-        axis=1,
-    )
-
+    # _recall_optimal_vs_final is read by the per-case stage-recall table.
     def _opt_vs_final(r) -> float:
         opt = set(r.get("_optimal_enum_selection", []) or [])
         final = set(r.get("_reranked_enum_ids", []) or [])
@@ -597,15 +563,6 @@ def enrich(df: pd.DataFrame) -> pd.DataFrame:
         return len(opt & final) / len(opt)
 
     df["_recall_optimal_vs_final"] = df.apply(_opt_vs_final, axis=1)
-
-    def _distractor_rate(r) -> float:
-        final = r.get("_reranked_enum_ids", []) or []
-        extra = r.get("_extra_or_distracting_enums", []) or []
-        if not final:
-            return np.nan
-        return len(extra) / len(final)
-
-    df["_distractor_rate"] = df.apply(_distractor_rate, axis=1)
 
     # ── Boolean flags used by the failure-mode classifier + summary tiles ───
     cs = df.get("case_scope", pd.Series([""] * len(df), index=df.index)).fillna("").astype(str)
@@ -623,9 +580,6 @@ def enrich(df: pd.DataFrame) -> pd.DataFrame:
     ).fillna("").astype(str).str.strip().ne("")
 
     df["_agent_skipped_kb"] = df["_case_scope_kb_like"] & (qs != "kb")
-    df["_reranked_empty_kb"] = df["_case_scope_kb_like"] & df["_reranked_enum_ids"].apply(
-        lambda v: isinstance(v, list) and len(v) == 0
-    )
 
     g = lambda c: pd.to_numeric(df.get(c, pd.Series([np.nan]*len(df), index=df.index)),
                                   errors="coerce")
@@ -855,147 +809,6 @@ def _h(s) -> str:
     return _html.escape(str(s))
 
 
-def _scope_badge(scope: str) -> str:
-    cls = {
-        "kb": "scope-kb", "mock_tool": "scope-mock_tool",
-        "dba_no_tools": "scope-dba_no_tools", "main_agent": "scope-main_agent",
-        "other_tools": "scope-other",
-        "hg_invest_kb": "scope-hg_invest",
-        "hg_invest_mock_tool": "scope-hg_invest",
-        "hg_invest_no_tools": "scope-hg_invest",
-        "hg_invest_other_tools": "scope-hg_invest",
-    }.get(str(scope), "scope-other")
-    return f'<span class="scope-badge {cls}">{_h(scope)}</span>'
-
-
-def _agent_badge(agent: str) -> str:
-    cls = {
-        "main_agent": "agent-main",
-        "daily_banking_agent": "agent-dba",
-        "hg-invest-phase2": "agent-hg_invest",
-    }.get(str(agent), "agent-other")
-    label = _h(agent) if agent else "—"
-    return f'<span class="agent-badge {cls}">{label}</span>'
-
-
-_TABLE_COLS = ("test_case_id", "query_scope", "last_agent", "weighted_avg", "expert_score",
-                "enum_relevance_score", "root_cause_category", "user_query")
-_COL_LABELS = {"enum_relevance_score": "rel2", "weighted_avg": "judge_w.avg",
-                "root_cause_category": "root_cause"}
-
-# Filter widget type per column when ``filterable=True``. Anything not listed
-# falls back to a plain substring text filter.
-_FILTER_TYPES = {
-    "test_case_id":           "text",
-    "user_query":             "text",
-    "weighted_avg":           "range",
-    "expert_score":           "range",
-    "enum_relevance_score":   "range",
-    "query_scope":            "multi",
-    "last_agent":             "multi",
-    "root_cause_category":    "multi",
-}
-
-# Numeric step/min/max defaults for range inputs.
-_RANGE_CFG = {
-    "weighted_avg":         (0, 1, 0.05),
-    "expert_score":         (0, 10, 1),
-    "enum_relevance_score": (0, 1, 0.05),
-}
-
-
-# Color-coding thresholds for numeric cells.
-_NUM_THRESHOLDS = {
-    "weighted_avg": (0.5, PASS_THRESHOLD),          # bad < 0.5, mid < 0.7, good ≥ 0.7
-    "expert_score": (4.0, 7.0),                      # bad < 4, mid < 7, good ≥ 7
-    "enum_relevance_score": (0.5, 0.8),              # bad < 0.5, mid < 0.8, good ≥ 0.8
-}
-
-
-def _num_class(col: str, v) -> str:
-    t = _NUM_THRESHOLDS.get(col)
-    if t is None or pd.isna(v):
-        return "num-na"
-    lo, hi = t
-    if v < lo: return "num-bad"
-    if v < hi: return "num-mid"
-    return "num-good"
-
-
-def _filter_widget(col: str, series: pd.Series) -> str:
-    """Render the per-column filter widget."""
-    ftype = _FILTER_TYPES.get(col, "text")
-    if ftype == "range":
-        lo, hi, step = _RANGE_CFG.get(col, (0, 10, 0.1))
-        return (f'<div class="range-filter" data-col="{col}">'
-                f'<input class="col-range-min" data-col="{col}" type="number" '
-                f'min="{lo}" max="{hi}" step="{step}" placeholder="min">'
-                f'<span class="range-sep">–</span>'
-                f'<input class="col-range-max" data-col="{col}" type="number" '
-                f'min="{lo}" max="{hi}" step="{step}" placeholder="max">'
-                f'</div>')
-    if ftype == "multi":
-        values = sorted(str(v) for v in series.dropna().unique())
-        opts = "".join(
-            f'<label><input type="checkbox" value="{_h(v)}"> {_h(v)}</label>'
-            for v in values
-        )
-        return (f'<div class="multi-filter" data-col="{col}">'
-                f'<button type="button" class="multi-toggle">all</button>'
-                f'<div class="multi-menu">{opts}</div>'
-                f'</div>')
-    return (f'<input class="col-filter" data-col="{col}" type="text" '
-            f'placeholder="filter…">')
-
-
-def _table_rows(sub: pd.DataFrame, cols: tuple = _TABLE_COLS,
-                *, table_id: str | None = None, filterable: bool = False) -> str:
-    cols = [c for c in cols if c in sub.columns]
-    if not cols or sub.empty:
-        return "<p class='placeholder'>no rows</p>"
-    thead_rows = ["<tr>" + "".join(
-        f'<th data-col="{c}">{_COL_LABELS.get(c, c)}</th>' for c in cols
-    ) + "</tr>"]
-    if filterable:
-        thead_rows.append(
-            "<tr class='filter-row'>" + "".join(
-                f'<th>{_filter_widget(c, sub[c])}</th>' for c in cols
-            ) + "</tr>"
-        )
-    body = ""
-    for _, r in sub.iterrows():
-        tid = _h(r.get("test_case_id"))
-        cells = []
-        for c in cols:
-            v = r[c]
-            if c == "test_case_id":
-                cells.append(
-                    f'<td data-col="{c}" data-val="{tid}">'
-                    f'<a class="case-link" href="#" data-case="{tid}">{tid}</a></td>'
-                )
-            elif c == "query_scope":
-                cells.append(f'<td data-col="{c}" data-val="{_h(v)}">{_scope_badge(v)}</td>')
-            elif c == "last_agent":
-                cells.append(f'<td data-col="{c}" data-val="{_h(v)}">{_agent_badge(v)}</td>')
-            elif c in ("weighted_avg", "expert_score", "enum_relevance_score"):
-                if pd.isna(v):
-                    cells.append(f'<td data-col="{c}" data-val="" data-numeric="">–</td>')
-                else:
-                    cls = _num_class(c, v)
-                    cells.append(
-                        f'<td data-col="{c}" data-val="{v:.4f}" data-numeric="{v:.6f}" '
-                        f'class="num-cell {cls}">'
-                        f'<span class="num-pill">{v:.2f}</span></td>'
-                    )
-            else:
-                text = _h(v)[:240]
-                cells.append(f'<td data-col="{c}" data-val="{_h(v)}">{text}</td>')
-        body += "<tr>" + "".join(cells) + "</tr>"
-    id_attr = f' id="{table_id}"' if table_id else ""
-    cls = "tbl" + (" tbl-filterable" if filterable else "")
-    return (f'<table class="{cls}"{id_attr}>'
-            f'<thead>{"".join(thead_rows)}</thead><tbody>{body}</tbody></table>')
-
 
 def _case_payload(r: pd.Series) -> dict:
     def g(c, default=""):
@@ -1022,6 +835,23 @@ def _case_payload(r: pd.Series) -> dict:
         lat_retries = []
     if not isinstance(lat_retries, list):
         lat_retries = []
+    # Span-level errors emitted by backfill_span_errors.py. The trace-level
+    # state is "OK" whenever the agent returned something, so without this
+    # the report would silently hide ConnectTimeout / CancelledError / etc.
+    span_errors_raw = g("span_errors_json", "")
+    try:
+        span_errors = json.loads(span_errors_raw) if span_errors_raw else []
+    except (json.JSONDecodeError, TypeError):
+        span_errors = []
+    if not isinstance(span_errors, list):
+        span_errors = []
+    span_error_types_raw = g("span_error_types_json", "")
+    try:
+        span_error_types = json.loads(span_error_types_raw) if span_error_types_raw else []
+    except (json.JSONDecodeError, TypeError):
+        span_error_types = []
+    if not isinstance(span_error_types, list):
+        span_error_types = []
     return {
         "id": g("test_case_id"),
         "trace_id": g("trace_id"),
@@ -1036,6 +866,12 @@ def _case_payload(r: pd.Series) -> dict:
                                  if "lat_retry_call_count" in r.index and pd.notna(r.get("lat_retry_call_count"))
                                  else 0),
         "lat_retries": lat_retries,
+        "has_span_error": b("trace_has_span_error"),
+        "span_error_count": (int(r["span_error_count"])
+                             if "span_error_count" in r.index and pd.notna(r.get("span_error_count"))
+                             else 0),
+        "span_error_types": span_error_types,
+        "span_errors": span_errors,
         "scope": g("query_scope"),
         "last_agent": g("last_agent"),
         "rerank_empty": b("reranker_selected_empty"),
@@ -1451,73 +1287,6 @@ def _build_failure_mode_cooccurrence_fig(df: pd.DataFrame):
                        automargin=True,
                        tickfont=dict(family=GE_FONT, size=11, color=GE_TEXT))
     return fig
-
-
-def _build_judge_failure_field_fig(df: pd.DataFrame):
-    """Bar chart of how often the judge populated each failure-detection
-    field. Each judge output array (hallucinated_claims, missing_facts,
-    unavailable_facts_in_selected_context, extra_or_distracting_enums) has
-    a *_cnt numeric column built in enrich(). For every in-scope KB
-    case (df is already filtered to non-empty user_query AND case_scope
-    in {kb, kb_and_api}) we sum the per-row counts. The result is the
-    total number of detected items across the run for each failure type.
-    Sentinel-normalized arrays were already collapsed to [] in enrich,
-    so the void-marker rows don't inflate the totals."""
-    fields = (
-        ("hallucinated_claims_cnt",     "Hallucinated claims"),
-        ("missing_facts_cnt",           "Missing facts (vs expected response)"),
-        ("unavailable_facts_cnt",       "Unavailable facts in selected context"),
-        ("extra_distracting_enums_cnt", "Extra / distracting ENUMs"),
-    )
-    rows = []
-    for col, label in fields:
-        if col not in df.columns:
-            continue
-        counts = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
-        affected = counts > 0
-        ids = df.loc[affected, "test_case_id"].astype(str).tolist() \
-              if "test_case_id" in df.columns else []
-        rows.append({
-            "label":  label,
-            "total":  int(counts.sum()),
-            "cases":  int(affected.sum()),
-            "ids":    ids,
-        })
-    if not rows or all(r["total"] == 0 for r in rows):
-        return None
-    rows.sort(key=lambda r: -r["total"])
-    fig = go.Figure(go.Bar(
-        x=[r["total"] for r in rows],
-        y=[r["label"] for r in rows],
-        orientation="h",
-        marker=dict(color=GE_BLUE, line=dict(width=0), cornerradius=6),
-        text=[r["total"] for r in rows],
-        textposition="outside",
-        cliponaxis=False,
-        textfont=dict(family=GE_FONT, size=11, color=GE_TEXT),
-        # customdata[0] = case count for hover; customdata[1] = ID list
-        # surfaced to the click handler so the bar can drill into Test Cases.
-        customdata=[[r["cases"], r["ids"]] for r in rows],
-        hovertemplate=("<b>%{y}</b><br>%{x} items detected"
-                        "<br>across %{customdata[0]} cases — click to filter<extra></extra>"),
-    ))
-    _style_fig(fig, height=max(220, 44 * len(rows) + 80))
-    fig.update_layout(margin=dict(t=20, b=40, l=260, r=80), bargap=0.4,
-                      xaxis_title="total items detected",
-                      yaxis_title="")
-    if rows:
-        fig.update_xaxes(range=[0, max(r["total"] for r in rows) * 1.18 + 1])
-    fig.update_yaxes(tickfont=dict(family="monospace", size=11, color=GE_TEXT),
-                      automargin=True)
-    return fig
-
-
-def _build_enum_count_distribution_fig(df: pd.DataFrame):
-    """DEPRECATED — replaced by `_enum_count_distribution_table_html` for a
-    clearer numeric presentation. Kept as a stub returning None so any
-    leftover call sites render a placeholder rather than blowing up.
-    """
-    return None
 
 
 def _enum_count_distribution_table_html(df: pd.DataFrame) -> str:
@@ -2332,32 +2101,6 @@ def _funnel_html(funnel: dict) -> str:
     )
 
 
-def _opt_vs_final_html(opt: dict) -> str:
-    n = opt["n"]
-    if n == 0:
-        return "<p class='placeholder'>no rows have a non-empty <code>optimal_enum_selection</code>.</p>"
-    bucket_rows = ""
-    for label, count in opt["buckets"]:
-        pct = (count / n) if n else float("nan")
-        bucket_rows += (
-            "<tr>"
-            f"<td>{_h(label)}</td>"
-            f"<td style='text-align:right'>{count}</td>"
-            f"<td style='text-align:right'>{_fmt_pct(pct)}</td>"
-            "</tr>"
-        )
-    return (
-        f"<p style='font-size:12px;color:#5c7999;margin-bottom:8px'>"
-        f"Per-case recall of the judge's <code>optimal_enum_selection</code> against "
-        f"the actual <code>reranked_enum_ids</code>. n = {n}. Mean = "
-        f"<strong>{_fmt_pct(opt['mean'])}</strong>.</p>"
-        f"<table class='tbl funnel-tbl'>"
-        f"<thead><tr><th>Recall bucket</th><th style='text-align:right'>N</th>"
-        f"<th style='text-align:right'>%</th></tr></thead>"
-        f"<tbody>{bucket_rows}</tbody></table>"
-    )
-
-
 def _empty_user_queries_card_html(df_all: pd.DataFrame) -> str:
     """Compact card showing how many cases have an empty user_query.
     The number is a click-through that filters the Test Cases tab to
@@ -2516,48 +2259,6 @@ def _kb_findings_table_html(df: pd.DataFrame) -> str:
     return (
         "<table class='tbl tbl-filterable kb-findings-table' id='kb-findings-table'>"
         f"{head}<tbody>{body}</tbody></table>"
-    )
-
-
-def _enum_count_comparison_html(metrics: dict) -> str:
-    """Compare how many ENUMs the reranker selected against how many the
-    test set expected. Surfaces systemic over/under-selection bias and
-    empty-selection rates."""
-    n = metrics.get("count_cmp_n", 0)
-    if n == 0:
-        return ("<p class='placeholder'>no rows have both case_scope ∈ "
-                "{kb, kb_and_api} AND a non-empty <code>expected_enums</code>.</p>")
-    mean_e = metrics.get("count_cmp_mean_expected", float("nan"))
-    mean_s = metrics.get("count_cmp_mean_selected", float("nan"))
-    rows = ""
-    for entry in metrics.get("count_cmp_buckets", []):
-        n_b = entry["n"]
-        pct = (n_b / n) if n else float("nan")
-        if n_b and entry["ids"]:
-            cell = _ids_filter_link(
-                entry["ids"], f"count comparison: {entry['label']}",
-                classes="judge-eval-link", inner=str(n_b),
-            )
-        else:
-            cell = str(n_b)
-        rows += (
-            "<tr>"
-            f"<td>{_h(entry['label'])}</td>"
-            f"<td style='text-align:right'>{cell}</td>"
-            f"<td style='text-align:right'>{_fmt_pct(pct)}</td>"
-            "</tr>"
-        )
-    return (
-        f"<p style='font-size:12px;color:#5c7999;margin-bottom:8px'>"
-        f"<strong>{n}</strong> in-scope cases have a non-empty <code>expected_enums</code>. "
-        f"Mean expected = <strong>{mean_e:.2f}</strong> · "
-        f"mean selected = <strong>{mean_s:.2f}</strong>. "
-        f"A persistent gap (mean selected ≪ mean expected, or many empty "
-        f"selections) is reranker-prompt evidence.</p>"
-        f"<table class='tbl funnel-tbl'>"
-        f"<thead><tr><th>Pattern</th><th style='text-align:right'>N</th>"
-        f"<th style='text-align:right'>%</th></tr></thead>"
-        f"<tbody>{rows}</tbody></table>"
     )
 
 
@@ -3874,39 +3575,6 @@ def _render_kb_html(kb_data: dict) -> str:
     )
 
 
-def _build_agents_called_fig(df: pd.DataFrame):
-    """Horizontal bar of agents_called values (each row's agent-trajectory)."""
-    if "agents_called" not in df.columns:
-        return None, 0
-    seqs = []
-    for v in df["agents_called"]:
-        items = _parse_list(v)
-        if items:
-            seqs.append(" → ".join(str(x) for x in items))
-        else:
-            seqs.append("(none)")
-    vc = Counter(seqs)
-    if not vc:
-        return None, 0
-    items = vc.most_common(15)
-    y_labels = [k for k, _ in items][::-1]
-    x_counts = [n for _, n in items][::-1]
-    fig = go.Figure(go.Bar(
-        x=x_counts, y=y_labels, orientation="h",
-        marker=dict(color=GE_BLUE, line=dict(width=0), cornerradius=6),
-        text=x_counts, textposition="outside", cliponaxis=False,
-        textfont=dict(family=GE_FONT, size=11, color=GE_TEXT),
-        hovertemplate="<b>%{y}</b><br>%{x} rows<extra></extra>",
-    ))
-    _style_fig(fig, height=max(260, 30 * len(items) + 80))
-    fig.update_layout(margin=dict(t=20, b=40, l=220, r=40), bargap=0.35,
-                      xaxis_title="count", yaxis_title="")
-    if x_counts:
-        fig.update_xaxes(range=[0, max(x_counts) * 1.12])
-    fig.update_yaxes(tickfont=dict(family="monospace", size=11, color=GE_TEXT))
-    return fig, len(vc)
-
-
 def _build_rel2_expert_scatter(df: pd.DataFrame):
     """Scatter of Rel2 × expert_score, colored by judge weighted_avg.
 
@@ -4296,6 +3964,58 @@ code { font-family: monospace; font-size: 12px; background: #e7effd; padding: 1p
 .lat-tbl-retry thead th:nth-child(4) { text-align: right; padding-right: 12px; }
 .lat-retry-toks { color: #5c7999; font-size: 10.5px; }
 .lat-retry-overhead { color: #ad5700; font-weight: 600; }
+
+/* Span-level error surfaces. Trace info.state stays "OK" whenever the
+   agent returned an answer, so a child span crashing (ConnectTimeout,
+   CancelledError, etc.) is silent unless we surface it here. Chip on
+   the case-detail header is always rendered when has_span_error;
+   standalone <details> block lives next to the latency breakdown so
+   the reader can drill into exception type + trimmed stacktrace. */
+.span-err-chip { display: inline-flex; align-items: center; gap: 4px;
+                  padding: 2px 8px; border-radius: 10px;
+                  background: #cf2a1e; color: #fff;
+                  font-size: 10px; font-weight: 700; letter-spacing: 0.02em;
+                  white-space: nowrap; cursor: help; }
+.span-err-chip .span-err-icon { font-size: 11px; line-height: 1; }
+.score-strip-err { border-top: 1px solid #f3d6d2; padding-top: 10px; }
+.score-strip-err > summary { list-style: none; cursor: pointer;
+                              user-select: none; outline: none; }
+.score-strip-err > summary::-webkit-details-marker { display: none; }
+.score-strip-err-title { font-size: 9px; color: #8b1a10; font-weight: 700;
+                          text-transform: uppercase; letter-spacing: 0.12em;
+                          display: inline-flex; align-items: baseline; gap: 8px; }
+.score-strip-err-title::before { content: "▸"; display: inline-block;
+                                  width: 10px; font-size: 9px; color: #cf2a1e;
+                                  transition: transform 0.15s ease; }
+.score-strip-err[open] > summary > .score-strip-err-title::before { transform: rotate(90deg); }
+.score-strip-err-summary { font-size: 11px; color: #8b1a10; font-weight: 600;
+                            text-transform: none; letter-spacing: 0; margin-left: 4px; }
+.score-strip-err-list { margin: 8px 0 0; padding: 0; list-style: none;
+                         border: 1px solid #f3d6d2; border-radius: 6px;
+                         background: #fff8f7; }
+.score-strip-err-list li { padding: 8px 10px; border-bottom: 1px solid #f3d6d2;
+                            font-size: 11px; color: #0a285c; }
+.score-strip-err-list li:last-child { border-bottom: none; }
+.span-err-type { display: inline-block; padding: 1px 6px; border-radius: 4px;
+                  background: #cf2a1e; color: #fff; font-weight: 700;
+                  font-size: 10px; letter-spacing: 0.02em;
+                  font-variant-numeric: tabular-nums; }
+.span-err-where { color: #5c7999; font-size: 10px; margin-left: 6px; }
+.span-err-msg { display: block; margin-top: 4px; color: #8b1a10;
+                 font-style: italic; }
+.span-err-stack { display: block; margin-top: 4px; padding: 6px 8px;
+                   background: #fff; border: 1px solid #f3d6d2; border-radius: 4px;
+                   font-family: ui-monospace, Menlo, Consolas, monospace;
+                   font-size: 10px; color: #5c7999; white-space: pre-wrap;
+                   max-height: 160px; overflow: auto; }
+
+/* Mark a latency-breakdown row that we attributed an error to. Name
+   goes red and an exception-type chip lands inline so the operator
+   sees both *which step crashed* and *what crashed* in one glance. */
+.lat-inline-name.lat-row-err { color: #8b1a10; font-weight: 600; }
+.lat-row-err-types { margin-left: 6px; display: inline-flex; gap: 4px;
+                      vertical-align: middle; }
+.lat-row-err-types .span-err-type { font-size: 9px; padding: 0 5px; }
 .tbl th { background: #f4f6fa; color: #5c7999; font-weight: 600; text-transform: uppercase;
           font-size: 11px; letter-spacing: .5px; }
 .tbl tbody tr:hover { background: #f9fbff; }
@@ -4433,6 +4153,13 @@ a.case-link:hover { text-decoration: underline; }
 .chip-clear { background: transparent; border: 1px solid #e4eaf0; color: #cf2a1e;
               font-weight: 600; margin-left: auto; }
 .chip-clear:hover { background: #fde5e3; }
+/* Flag chip dedicated to span-level errors. Visible-red even inactive so
+   the reader knows it filters to crashes specifically. Active state is
+   solid red (vs the blue used by every other chip) to underscore that
+   the result set is the broken cases. */
+.chip-err { background: #fde5e3; color: #8b1a10; border: 1px solid #f3d6d2; }
+.chip-err:hover { background: #fbd0cc; }
+.chip-err.active { background: #cf2a1e; color: #fff; border-color: #cf2a1e; }
 .list-count { font-size: 10px; color: #a3b5c9; padding: 0 4px 6px;
               text-transform: uppercase; letter-spacing: .5px; flex-shrink: 0; }
 .cases-list-wrap { flex: 1 1 auto; overflow-y: auto; min-height: 0; }
@@ -5125,6 +4852,100 @@ function latencyBoxTitle(ms) {
   return "trace wall-clock latency · not available";
 }
 
+// Map a span_errors[] entry to a lat_step label so the breakdown row for
+// the crashing step can be highlighted. langgraph_node wins when present
+// (more specific); falls back to span_name for HTTP / Runnable spans
+// that don't carry one. null = unmappable → only surfaced in the
+// standalone errors block.
+const SPAN_NODE_TO_STEP = {
+  retrieve:        "kb_retrieve",
+  rerank:          "kb_rerank",
+  knowledge_prune: "kb_prune",
+  kb_prune:        "kb_prune",
+};
+const SPAN_NAME_TO_STEP = {
+  "retrieve":                              "kb_retrieve",
+  "rerank":                                "kb_rerank",
+  "RunnableSequence":                      "kb_rerank",
+  "HTTP POST /admin/knowledge-base/query": "kb_retrieve",
+  "knowledge_search":                      "kb_retrieve",
+  "prune":                                 "kb_prune",
+  "knowledge_prune":                       "kb_prune",
+  "kb_prune":                              "kb_prune",
+};
+function mapSpanErrorToStep(err) {
+  if (!err) return null;
+  const node = (err.langgraph_node != null) ? String(err.langgraph_node).trim() : "";
+  if (node && SPAN_NODE_TO_STEP[node]) return SPAN_NODE_TO_STEP[node];
+  const name = (err.span_name != null) ? String(err.span_name).trim() : "";
+  if (name && SPAN_NAME_TO_STEP[name]) return SPAN_NAME_TO_STEP[name];
+  return null;
+}
+function buildStepErrorIndex(spanErrors) {
+  const idx = {};
+  const errs = Array.isArray(spanErrors) ? spanErrors : [];
+  for (const err of errs) {
+    const step = mapSpanErrorToStep(err);
+    if (!step) continue;
+    if (!idx[step]) idx[step] = [];
+    const t = String(err.exception_type || err.status_code || "error").trim() || "error";
+    if (!idx[step].includes(t)) idx[step].push(t);
+  }
+  return idx;
+}
+
+// Red chip rendered on the case-detail header. Always on when the
+// trace has a span-level error — the trace state column says OK so
+// without this the reader has no signal.
+function spanErrorChipHtml(c) {
+  if (!c || !c.has_span_error) return "";
+  const errs = Array.isArray(c.span_errors) ? c.span_errors : [];
+  const n = errs.length || (c.span_error_count || 0);
+  const types = Array.isArray(c.span_error_types) ? c.span_error_types : [];
+  const label = types.length ? types.join(", ") : (n + " span error" + (n === 1 ? "" : "s"));
+  const where = errs.map(e =>
+    `${e.exception_type || e.status_code || "error"} @ ${e.span_name || "?"}`
+  ).join("\n");
+  const tip = "Span-level errors hidden by trace state=OK:\n" + where;
+  return `<span class="span-err-chip" title="${esc(tip)}">` +
+         `<span class="span-err-icon">⚠</span>${esc(label)}</span>`;
+}
+
+// Standalone errors <details> block inside the score-strip. Rendered
+// whenever c.has_span_error so the reader has a clear "what crashed
+// where" surface regardless of whether --include-latency is set.
+function spanErrorsBlockHtml(c) {
+  if (!c || !c.has_span_error) return "";
+  const errs = Array.isArray(c.span_errors) ? c.span_errors : [];
+  if (!errs.length) return "";
+  const items = errs.map(e => {
+    const type = String(e.exception_type || e.status_code || "error");
+    const whereParts = [e.span_name, e.langgraph_node]
+      .map(v => (v == null ? "" : String(v).trim()))
+      .filter((v, i, a) => v && a.indexOf(v) === i);
+    const where = whereParts.join(" · ") || "(unknown span)";
+    const msg = String(e.exception_message || e.status_message || "").trim();
+    const stack = String(e.stacktrace_tail || "").trim();
+    return `<li>
+      <span class="span-err-type">${esc(type)}</span>` +
+        `<span class="span-err-where">at ${esc(where)}</span>` +
+        (msg ? `<span class="span-err-msg">${esc(msg)}</span>` : "") +
+        (stack ? `<pre class="span-err-stack">${esc(stack)}</pre>` : "") +
+    `</li>`;
+  }).join("");
+  const n = errs.length;
+  const summary = n === 1
+    ? "1 span crashed — trace state was OK so this would otherwise be hidden"
+    : `${n} spans crashed — trace state was OK so these would otherwise be hidden`;
+  return `<details class="score-strip-err">
+    <summary>
+      <span class="score-strip-err-title">Span errors</span>` +
+      `<span class="score-strip-err-summary">${esc(summary)}</span>
+    </summary>
+    <ul class="score-strip-err-list">${items}</ul>
+  </details>`;
+}
+
 function latencyDetailHtml(c) {
   if (!INCLUDE_LATENCY) return "";
   const total = c.lat_total_ms;
@@ -5135,6 +4956,7 @@ function latencyDetailHtml(c) {
   const sorted = steps.slice()
     .filter(s => (s.ms != null) && Number(s.ms) > 0)
     .sort((a, b) => (b.ms || 0) - (a.ms || 0));
+  const stepErrIdx = buildStepErrorIndex(c.span_errors);
   const rows = sorted.map(s => {
     const ms = Number(s.ms);
     const share = (total > 0) ? (ms / total) : 0;
@@ -5146,8 +4968,15 @@ function latencyDetailHtml(c) {
     // step so the count is consistent — a "×1" tells the reader the step
     // was actually present, which is meaningful when reading the breakdown.
     const nStr = (s.n == null || s.n <= 0) ? "" : ` <span class="lat-n">×${s.n}</span>`;
+    const errTypes = stepErrIdx[s.label] || [];
+    const errChips = errTypes.length
+      ? `<span class="lat-row-err-types">` +
+          errTypes.map(t => `<span class="span-err-type">${esc(t)}</span>`).join("") +
+        `</span>`
+      : "";
+    const nameCls = errTypes.length ? "lat-inline-name lat-row-err" : "lat-inline-name";
     return `<tr>
-      <td class="lat-inline-name">${esc(display)}${nStr}</td>
+      <td class="${nameCls}">${esc(display)}${nStr}${errChips}</td>
       <td class="lat-inline-ms">${formatMs(ms)}</td>
       <td class="lat-inline-share"><span class="lat-inline-pct">${pct.toFixed(1)}%</span>` +
         `<div class="lat-bar"><div class="lat-bar-fill" style="width:${pct.toFixed(1)}%"></div></div></td>
@@ -5370,6 +5199,7 @@ detailEl.addEventListener("click", (ev) => {
 // case must have at least one of the selected modes in failure_modes_all.
 const activeFilters = { rc: null, flag: null, rel2_min: null, rel2_max: null,
                           wavg_min: null, wavg_max: null,
+                          lat_min: null, lat_max: null,
                           dim_pairs: [], missed_enum: null,
                           case_id_set: null, case_id_label: null,
                           failure_modes: new Set() };
@@ -5416,6 +5246,11 @@ function matchesFilters(c) {
     // red rows + "> 6" footer in the Retrieval Findings tab's ENUMs-per-case
     // distribution table. Threshold kept in sync with OVERSEL_K on the Python side.
     if (f === "oversel" && !(c.reranked_enum_count != null && c.reranked_enum_count > 6)) return false;
+    // Span errors: surfaces ConnectTimeout / CancelledError / etc. that
+    // are otherwise hidden by trace info.state=OK. has_span_error is set
+    // by parse_trace_skkb whenever any span carries STATUS_CODE_ERROR or
+    // an "exception" event.
+    if (f === "span_errors" && !c.has_span_error) return false;
   }
   if (activeFilters.rel2_min != null || activeFilters.rel2_max != null) {
     if (c.rel2_score == null) return false;
@@ -5426,6 +5261,13 @@ function matchesFilters(c) {
     if (c.weighted_avg == null) return false;
     if (activeFilters.wavg_min != null && c.weighted_avg < activeFilters.wavg_min) return false;
     if (activeFilters.wavg_max != null && c.weighted_avg > activeFilters.wavg_max) return false;
+  }
+  // Latency range (ms) — sidebar inputs are in seconds; bindLatencyRange
+  // converts to ms before writing here so the comparison is direct.
+  if (activeFilters.lat_min != null || activeFilters.lat_max != null) {
+    if (c.lat_total_ms == null) return false;
+    if (activeFilters.lat_min != null && c.lat_total_ms < activeFilters.lat_min) return false;
+    if (activeFilters.lat_max != null && c.lat_total_ms > activeFilters.lat_max) return false;
   }
   if (activeFilters.dim_pairs && activeFilters.dim_pairs.length) {
     // Group entries by dim — within a dim the selected scores are OR-ed,
@@ -5601,12 +5443,13 @@ function bindChips() {
     activeFilters.rc = null; activeFilters.flag = null;
     activeFilters.rel2_min = null; activeFilters.rel2_max = null;
     activeFilters.wavg_min = null; activeFilters.wavg_max = null;
+    activeFilters.lat_min = null; activeFilters.lat_max = null;
     activeFilters.dim_pairs = [];
     activeFilters.missed_enum = null;
     activeFilters.case_id_set = null;
     activeFilters.case_id_label = null;
     activeFilters.failure_modes.clear();
-    ["rel2-min","rel2-max","wavg-min","wavg-max"].forEach(id => {
+    ["rel2-min","rel2-max","wavg-min","wavg-max","lat-min","lat-max"].forEach(id => {
       const el = document.getElementById(id); if (el) el.value = "";
     });
     syncChipStates();
@@ -5637,6 +5480,32 @@ function bindRange(minId, maxId, resetId, minKey, maxKey) {
 function bindRel2Range() {
   bindRange("rel2-min", "rel2-max", "rel2-reset", "rel2_min", "rel2_max");
   bindRange("wavg-min", "wavg-max", "wavg-reset", "wavg_min", "wavg_max");
+}
+
+// Latency range — inputs are in SECONDS for readability; convert to ms
+// before writing into activeFilters since c.lat_total_ms is millis.
+// Only wired up when --include-latency was passed (the inputs aren't
+// even rendered otherwise).
+function bindLatencyRange() {
+  if (!INCLUDE_LATENCY) return;
+  const mn = document.getElementById("lat-min");
+  const mx = document.getElementById("lat-max");
+  const rs = document.getElementById("lat-reset");
+  if (!mn || !mx) return;
+  function onChange() {
+    const a = mn.value === "" ? null : parseFloat(mn.value);
+    const b = mx.value === "" ? null : parseFloat(mx.value);
+    activeFilters.lat_min = Number.isFinite(a) ? a * 1000 : null;
+    activeFilters.lat_max = Number.isFinite(b) ? b * 1000 : null;
+    renderList();
+  }
+  mn.addEventListener("input", onChange);
+  mx.addEventListener("input", onChange);
+  if (rs) rs.addEventListener("click", () => {
+    mn.value = ""; mx.value = "";
+    activeFilters.lat_min = null; activeFilters.lat_max = null;
+    renderList();
+  });
 }
 
 function fmt(v) { return v == null ? "–" : v.toFixed(2); }
@@ -5838,6 +5707,7 @@ function scoreStripHtml(c, suggHtml, latHtml) {
     `</div>` +
     suggBlock +
     (latHtml || "") +
+    spanErrorsBlockHtml(c) +
     `</div>`;
 }
 
@@ -5883,7 +5753,7 @@ function selectCase(id) {
   detailEl.dataset.lang = currentLang;
   detailEl.innerHTML = `
     <h2 class="case-detail-title" style="font-size:16px;margin-bottom:8px">
-      <span class="case-detail-title-main">${esc(c.id)} · <span class="scope-badge ${scopeCls}">${esc(c.scope)}</span>${c.last_agent ? ` · ${agentBadge(c.last_agent)}` : ""}${passTag ? ` · ${passTag}` : ""}${c.excluded_reason ? ` · ${exclusionBadge(c.excluded_reason)}` : ((c.failure_mode && c.failure_mode !== "pass") ? ` · ${fmBadge(c.failure_mode)}` : "")}${c.trace_id ? ` · <span class="trace-id" title="trace_id">trace: <code>${esc(c.trace_id)}</code></span>` : ""}</span>
+      <span class="case-detail-title-main">${esc(c.id)} · <span class="scope-badge ${scopeCls}">${esc(c.scope)}</span>${c.last_agent ? ` · ${agentBadge(c.last_agent)}` : ""}${passTag ? ` · ${passTag}` : ""}${c.has_span_error ? ` · ${spanErrorChipHtml(c)}` : ""}${c.excluded_reason ? ` · ${exclusionBadge(c.excluded_reason)}` : ((c.failure_mode && c.failure_mode !== "pass") ? ` · ${fmBadge(c.failure_mode)}` : "")}${c.trace_id ? ` · <span class="trace-id" title="trace_id">trace: <code>${esc(c.trace_id)}</code></span>` : ""}</span>
       ${langSwitch}
     </h2>
     <div style="margin-bottom:10px">${routeChips(c)}</div>
@@ -6007,6 +5877,7 @@ let kbCaseFilter = null;
 searchEl.addEventListener("input", renderList);
 bindChips();
 bindRel2Range();
+bindLatencyRange();
 bindTableFilters();
 bindSidebarToggle();
 bindKbSearch();
@@ -6265,6 +6136,7 @@ document.addEventListener("click", e => {
     activeFilters.rc = null; activeFilters.flag = null;
     activeFilters.rel2_min = null; activeFilters.rel2_max = null;
     activeFilters.wavg_min = null; activeFilters.wavg_max = null;
+    activeFilters.lat_min = null; activeFilters.lat_max = null;
     activeFilters.dim_pairs = [];
     activeFilters.missed_enum = null;
     activeFilters.case_id_set = null;
@@ -6290,6 +6162,7 @@ document.addEventListener("click", e => {
     activeFilters.rc = null; activeFilters.flag = null;
     activeFilters.rel2_min = null; activeFilters.rel2_max = null;
     activeFilters.wavg_min = null; activeFilters.wavg_max = null;
+    activeFilters.lat_min = null; activeFilters.lat_max = null;
     activeFilters.dim_pairs = [];
     activeFilters.missed_enum = null;
     activeFilters.case_id_set = null;
@@ -7402,7 +7275,22 @@ def render_html(df: pd.DataFrame, *, df_all: pd.DataFrame | None = None,
         '<button class="chip" data-group="flag" data-value="rerank_empty">Rerank ∅</button>'
         '<button class="chip" data-group="flag" data-value="kb_gap">KB gap</button>'
         '<button class="chip" data-group="flag" data-value="oversel" title="Reranker selected more than 6 ENUMs — over-selection band on Retrieval Findings">ENUMs &gt; 6</button>'
+        '<button class="chip chip-err" data-group="flag" data-value="span_errors" title="Cases with at least one span-level error (info.state=OK but a child span crashed — e.g. CancelledError, ConnectTimeout)">Span errors</button>'
     )
+    # Latency range filter — gated on --include-latency since lat_total_ms
+    # is only populated when the backfill ran. Inputs are in seconds for
+    # readability; the JS multiplies by 1000 to match c.lat_total_ms.
+    latency_range_html = (
+        '<div class="filter-group">'
+        '<span class="filter-label">Latency (s)</span>'
+        '<div class="rel2-range">'
+        '<input id="lat-min" type="number" min="0" step="0.5" placeholder="min">'
+        '<span>–</span>'
+        '<input id="lat-max" type="number" min="0" step="0.5" placeholder="max">'
+        '<button class="range-reset" id="lat-reset">reset</button>'
+        '</div>'
+        '</div>'
+    ) if include_latency else ""
     # Multi-select chips for failure mode. Matches against c.failure_modes_all
     # (every mode that fires for the case), so a row whose primary mode is
     # test_set_defect can still be selected when filtering for hallucination
@@ -7907,6 +7795,7 @@ def render_html(df: pd.DataFrame, *, df_all: pd.DataFrame | None = None,
               <button class="range-reset" id="wavg-reset">reset</button>
             </div>
           </div>
+          {latency_range_html}
         </div>
         <div id="active-filter" class="active-filter-banner">
           <span id="active-filter-text"></span>

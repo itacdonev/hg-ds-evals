@@ -65,6 +65,17 @@ _CHAT_MODEL = "CHAT_MODEL"
 _CHAIN = "CHAIN"
 _AGENT = "AGENT"
 
+# Post-#388 supervisor (ReAct tool-calling pattern) delegates to a child
+# agent via a synthetic TOOL whose name is ``transfer-to-<slug>``. From
+# the eval-scoring contract's perspective these are not real tool calls
+# — they're agent invocations — so we filter them out of
+# ``actual_tool_calls`` and surface them via ``actual_agents_path``
+# instead. The slug after the prefix may be kebab-case (commit
+# ``100f2a2b`` allowed kebab-case agent slugs); the canonical agent
+# name comes from the ``SubagentToolResult.agent`` field inside the
+# TOOL span's output payload.
+_TRANSFER_TOOL_PREFIX = "transfer-to-"
+
 # Trace-level keys carrying a native test-case id.
 TRACE_TEST_CASE_KEYS = (
     "eval.test_case_id",   # NEW orchestrator (trace_schema v3 / GCAI-3581)
@@ -443,6 +454,138 @@ def _span_matches_node(span: Mapping[str, Any], node_names: set[str]) -> bool:
     return span.get("name") in node_names or _span_langgraph_node(span) in node_names
 
 
+# ── Span-level errors ──────────────────────────────────────────────────
+#
+# Trace ``info.state`` reports the orchestrator-level outcome and stays
+# ``OK`` whenever the agent returned *some* answer, even if a child span
+# crashed (KB endpoint timeout, asyncio CancelledError on a retry, etc.).
+# These helpers surface error signals from two places per span and OR
+# them together:
+#
+#   - ``status.code == "STATUS_CODE_ERROR"`` (OpenTelemetry status), and
+#   - ``events[].name == "exception"`` (OpenTelemetry exception event,
+#     carrying ``exception.type`` / ``exception.message`` /
+#     ``exception.stacktrace`` attributes).
+#
+# Output is a flat list of per-span error records that downstream
+# reports can chip / drill into.
+
+SPAN_ERROR_COLUMNS = (
+    "trace_has_span_error",
+    "span_error_count",
+    "span_error_types_json",
+    "span_errors_json",
+)
+
+_STACKTRACE_TAIL_LINES = 10
+
+
+def _stacktrace_tail(value: Any, max_lines: int = _STACKTRACE_TAIL_LINES) -> str:
+    """Trim a stacktrace to its last ``max_lines`` non-empty lines.
+
+    Full stacktraces are multi-KB; the tail is the diagnostically useful
+    bit (innermost frame + the exception line). Keeping a short slice
+    means the column is safe to ship in a CSV / HTML report.
+    """
+    text = _to_str(value)
+    if not text:
+        return ""
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    if len(lines) > max_lines:
+        lines = lines[-max_lines:]
+    return "\n".join(lines)
+
+
+def _span_exception_events(span: Mapping[str, Any]) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    for raw in _coerce_list(span.get("events")):
+        event = _to_plain_data(raw)
+        if isinstance(event, dict) and event.get("name") == "exception":
+            events.append(event)
+    return events
+
+
+def _is_span_status_error(status: Mapping[str, Any]) -> bool:
+    code = _to_str(status.get("code")).upper()
+    return bool(code) and "ERROR" in code
+
+
+def extract_span_errors(spans: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return one record per error span (status ERROR OR exception event).
+
+    Each record carries enough context for a downstream report to label
+    *where* the error happened (span name / type / langgraph node) and
+    *what* it was (status message + exception type/message + trimmed
+    stacktrace tail). The last exception event on a span is kept (covers
+    LangGraph's retry loop, where the final attempt is the one that
+    bubbled out).
+    """
+    errors: list[dict[str, Any]] = []
+    for span in spans:
+        if not isinstance(span, Mapping):
+            continue
+        status = _coerce_mapping(span.get("status"))
+        status_is_error = _is_span_status_error(status)
+        exception_events = _span_exception_events(span)
+        if not status_is_error and not exception_events:
+            continue
+        last_event = exception_events[-1] if exception_events else {}
+        attrs = _coerce_mapping(last_event.get("attributes"))
+        errors.append({
+            "span_name": _to_str(span.get("name")),
+            "span_type": _span_type(span),
+            "langgraph_node": _span_langgraph_node(span),
+            "status_code": _to_str(status.get("code")),
+            "status_message": _to_str(status.get("message")),
+            "exception_type": _to_str(attrs.get("exception.type")),
+            "exception_message": _to_str(attrs.get("exception.message")),
+            "stacktrace_tail": _stacktrace_tail(attrs.get("exception.stacktrace")),
+        })
+    return errors
+
+
+def summarize_span_errors(errors: list[dict[str, Any]]) -> dict[str, Any]:
+    """Roll up :func:`extract_span_errors` into the four record columns.
+
+    Types are deduped (preserve first-seen order). Lists are JSON-encoded
+    so the columns round-trip through CSV unchanged.
+    """
+    types_seen: list[str] = []
+    for entry in errors:
+        etype = _to_str(entry.get("exception_type")) or _to_str(entry.get("status_code"))
+        if etype and etype not in types_seen:
+            types_seen.append(etype)
+    return {
+        "trace_has_span_error": bool(errors),
+        "span_error_count": len(errors),
+        "span_error_types_json": json.dumps(types_seen, ensure_ascii=False),
+        "span_errors_json": json.dumps(errors, ensure_ascii=False),
+    }
+
+
+def build_span_errors_dataframe(traces_df: pd.DataFrame) -> pd.DataFrame:
+    """Per-trace span-error summary indexed by ``trace_id`` (backfill aid).
+
+    Mirrors :func:`hg_ds_evals.preprocessing.latency.build_latency_dataframe`:
+    one row per trace, ``trace_id`` as the index, columns are exactly
+    :data:`SPAN_ERROR_COLUMNS`. Joinable into an existing checkpoint
+    without re-running the eval.
+    """
+    rows: list[dict[str, Any]] = []
+    for raw_row in traces_df.to_dict(orient="records"):
+        canonical = normalize_mlflow_trace_row(raw_row)
+        info = canonical.get("info") or {}
+        spans = (canonical.get("data") or {}).get("spans") or []
+        spans = _sort_spans_by_dependency_order(spans)
+        summary = summarize_span_errors(extract_span_errors(spans))
+        summary["trace_id"] = _to_str(info.get("trace_id"))
+        rows.append(summary)
+    df = pd.DataFrame.from_records(rows)
+    if df.empty:
+        return pd.DataFrame(columns=list(SPAN_ERROR_COLUMNS))
+    return df.set_index("trace_id")[list(SPAN_ERROR_COLUMNS)]
+
+
 # ── Assessments ────────────────────────────────────────────────────────
 
 def _assessment_name(assessment: Mapping[str, Any]) -> str:
@@ -722,13 +865,129 @@ def extract_agent_answer_span(spans: list[dict[str, Any]]) -> str:
 
 # ── Agent path / classification ────────────────────────────────────────
 
-def _extract_actual_agent_path(spans: list[dict[str, Any]]) -> tuple[list[str], str]:
-    """Return ``(agents_path, last_agent)`` from CHAIN span names.
+def _is_subagent_transfer_tool(span: Mapping[str, Any]) -> bool:
+    """A TOOL span whose name is ``transfer-to-<slug>`` — post-#388
+    supervisor's delegate marker, not a callable tool."""
+    return (
+        _span_type(span) == _TOOL
+        and _to_str(span.get("name")).startswith(_TRANSFER_TOOL_PREFIX)
+    )
 
-    Uses CHAIN span ``name`` (which is the agent's own name like
-    ``daily_banking_agent``) rather than ``langgraph_node`` (which for
-    inner spans is ``llm`` / ``tools`` / ``rerank`` etc.).
+
+def _transfer_tool_agent_slug(span: Mapping[str, Any]) -> str:
+    """Read the canonical sub-agent slug out of a transfer-to-* TOOL span.
+
+    Prefers ``SubagentToolResult.agent`` from the output payload (commit
+    ``100f2a2b`` allowed kebab-case tool slugs, so the payload field is
+    the source of truth); falls back to the suffix of the tool name
+    when the payload is absent (covers older traces written before the
+    payload field landed).
     """
+    out = _parse_attr_json(span.get("attributes") or {}, "mlflow.spanOutputs")
+    if isinstance(out, Mapping):
+        content = out.get("content")
+        if isinstance(content, str):
+            try:
+                payload = json.loads(content)
+                if isinstance(payload, Mapping):
+                    slug = _to_str(payload.get("agent")).strip()
+                    if slug:
+                        return slug
+            except json.JSONDecodeError:
+                pass
+    name = _to_str(span.get("name"))
+    if name.startswith(_TRANSFER_TOOL_PREFIX):
+        return name[len(_TRANSFER_TOOL_PREFIX):]
+    return ""
+
+
+# Post-#388 supervisor identity inference. The orchestrator no longer
+# emits a CHAIN span named after the supervisor; we recover its identity
+# from the set of ``transfer-to-<slug>`` tools registered in the
+# supervisor's LLM call (``mlflow.chat.tools`` attribute on the first
+# CHAT_MODEL span of the supervisor's graph). The mapping below converts
+# that set to the canonical supervisor name expected by the test set's
+# ``expected_agent`` field — same name the legacy contract produced via
+# the (now-removed) CHAIN span, so :class:`RoutingCorrectnessScorer`
+# keeps matching without any test-set rewrite.
+_SUPERVISOR_BY_DELEGATE: tuple[tuple[frozenset[str], str], ...] = (
+    (frozenset({"daily_banking_agent"}), "main_agent"),
+    (frozenset({HG_INVEST_AGENT_NAME}),  HG_INVEST_AGENT_NAME),
+)
+
+
+def _supervisor_from_delegate_registry(spans: list[dict[str, Any]]) -> str:
+    """Identify the post-#388 supervisor by which delegate tools its LLM
+    call has access to. Works even when no delegation fired (chit-chat)
+    because the tool-registry is set at LLM-binding time, not when a
+    delegate is actually called.
+
+    Returns the supervisor's canonical slug, or ``""`` when no
+    transfer-to-* tool is registered anywhere (signal absent — don't
+    invent one).
+    """
+    delegates: set[str] = set()
+    for span in spans:
+        if _span_type(span) != _CHAT_MODEL:
+            continue
+        attrs = span.get("attributes") or {}
+        tools = _parse_attr_json(attrs, "mlflow.chat.tools")
+        if not isinstance(tools, list):
+            continue
+        for tool in tools:
+            if not isinstance(tool, dict):
+                continue
+            fn = tool.get("function") or {}
+            name = _to_str(fn.get("name"))
+            if name.startswith(_TRANSFER_TOOL_PREFIX):
+                delegates.add(name[len(_TRANSFER_TOOL_PREFIX):])
+    if not delegates:
+        return ""
+    for delegate_set, supervisor in _SUPERVISOR_BY_DELEGATE:
+        if delegates & delegate_set:
+            return supervisor
+    return ""
+
+
+def _extract_actual_agent_path(spans: list[dict[str, Any]]) -> tuple[list[str], str]:
+    """Return ``(agents_path, last_agent)``.
+
+    Three-path dispatch (no version flag — auto-detected from the trace):
+
+    1. **Post-#388 (ReAct supervisor) with delegation**: each sub-agent
+       is invoked via a ``transfer-to-<slug>`` TOOL span. Walk those in
+       start-time order and read the canonical agent name from
+       :func:`_transfer_tool_agent_slug`.
+    2. **Post-#388 supervisor-direct (chit-chat)**: no transfer-to-*
+       fired, but the supervisor's LLM call still has delegate tools
+       *registered*. Infer the supervisor's name from that registry via
+       :func:`_supervisor_from_delegate_registry`. Returns
+       ``[supervisor]`` so ``last_agent`` is data-derived rather than
+       defaulted by the UI.
+    3. **Pre-#388 (handoff supervisor)**: each sub-agent emits its own
+       CHAIN span whose name is in :data:`KNOWN_AGENT_NAMES`. Unchanged
+       behavior — older runs still parse exactly as before.
+    """
+    # 1) Post-#388 delegated path.
+    new_path: list[str] = []
+    new_seen: set[str] = set()
+    for span in _sort_spans_by_dependency_order(spans):
+        if not _is_subagent_transfer_tool(span):
+            continue
+        slug = _transfer_tool_agent_slug(span)
+        if slug and slug not in new_seen:
+            new_seen.add(slug)
+            new_path.append(slug)
+    if new_path:
+        return new_path, new_path[-1]
+
+    # 2) Post-#388 chit-chat: no delegate fired, but the supervisor's
+    #    LLM has transfer-to-* tools registered.
+    supervisor = _supervisor_from_delegate_registry(spans)
+    if supervisor:
+        return [supervisor], supervisor
+
+    # 3) Legacy contract: CHAIN spans named after the known agents.
     seen: set[str] = set()
     path: list[str] = []
     for span in spans:
@@ -750,12 +1009,29 @@ def _classify_architecture(agents_path: list[str]) -> str:
 
 
 def extract_agent_and_tool_calls(spans: list[dict[str, Any]]) -> dict[str, Any]:
-    """Collect every ``langgraph_node`` and every TOOL span (SKKB flavor)."""
+    """Collect every ``langgraph_node`` and every TOOL span (SKKB flavor).
+
+    Handles both orchestrator contracts:
+
+    - **Legacy**: each sub-agent ran its own LangGraph subgraph, so
+      ``langgraph_node`` on inner spans equalled the agent slug
+      (``main_agent``, ``daily_banking_agent``) and surfaced in
+      ``agents_called`` directly.
+    - **Post-#388**: sub-agents are invoked as ``transfer-to-<slug>``
+      TOOL spans; the inner ``langgraph_node`` values are generic
+      (``llm``, ``tools``, ``tools_condition``). We surface the
+      delegate's canonical slug (from ``SubagentToolResult.agent``) as
+      an agent in ``agents_called`` so :func:`classify_query_scope`
+      can still detect ``daily_banking_agent`` reached, and we omit
+      the transfer-to-* TOOL span from ``tools_called`` because from
+      the eval scorer's perspective it is an agent invocation, not a
+      tool call.
+    """
     agents_seen: list[str] = []
     seen_set: set[str] = set()
     tools: list[dict[str, Any]] = []
 
-    for span in spans:
+    for span in _sort_spans_by_dependency_order(spans):
         attrs = span.get("attributes") or {}
         metadata = _parse_attr_json(attrs, "metadata")
         if isinstance(metadata, dict):
@@ -764,10 +1040,25 @@ def extract_agent_and_tool_calls(spans: list[dict[str, Any]]) -> dict[str, Any]:
                 seen_set.add(node)
                 agents_seen.append(node)
         if _span_type(span) == _TOOL:
+            if _is_subagent_transfer_tool(span):
+                slug = _transfer_tool_agent_slug(span)
+                if slug and slug not in seen_set:
+                    seen_set.add(slug)
+                    agents_seen.append(slug)
+                continue
             tools.append({
                 "name": span.get("name"),
                 "inputs": _parse_attr_json(attrs, "mlflow.spanInputs"),
             })
+
+    # Post-#388 chit-chat: no delegate fired, no legacy CHAIN names.
+    # Infer the supervisor from its delegate-tool registry so this case
+    # surfaces as "main_agent" instead of an empty path.
+    if not any(a in KNOWN_AGENT_NAMES for a in agents_seen):
+        supervisor = _supervisor_from_delegate_registry(spans)
+        if supervisor and supervisor not in seen_set:
+            seen_set.add(supervisor)
+            agents_seen.append(supervisor)
 
     agents_only = [node for node in agents_seen if node in KNOWN_AGENT_NAMES]
     return {
@@ -1411,11 +1702,18 @@ def _extract_actual_tool_calls(spans: list[dict[str, Any]]) -> list[dict[str, An
     ``parameters`` (same value) — the ``ToolParameterScorer`` reads
     ``arguments`` on the actual side, callers that mirror the expected
     side's ``parameters`` key still work.
+
+    Skips ``transfer-to-<slug>`` TOOL spans (post-#388 supervisor's
+    delegate marker) — those are surfaced via ``actual_agents_path``
+    instead. From the eval-scoring contract's perspective a sub-agent
+    invocation is not a tool call.
     """
     calls: list[dict[str, Any]] = []
     step = 0
     for span in spans:
         if _span_type(span) != _TOOL:
+            continue
+        if _is_subagent_transfer_tool(span):
             continue
         step += 1
         attrs = span.get("attributes") or {}
@@ -1705,6 +2003,7 @@ def parse_trace_skkb(test_case_id: str, trace: dict[str, Any]) -> dict[str, Any]
     data = trace.get("data") or {}
     spans = _sort_spans_by_dependency_order(data.get("spans") or [])
     children = _build_span_children(spans)
+    span_error_summary = summarize_span_errors(extract_span_errors(spans))
 
     trace_metadata = info.get("trace_metadata") or {}
     user_query = _extract_user_query(trace_metadata, spans)
@@ -1891,6 +2190,7 @@ def parse_trace_skkb(test_case_id: str, trace: dict[str, Any]) -> dict[str, Any]
         "reranker_unselected_context_ids": json.dumps(reranker_unselected_context_ids, ensure_ascii=False),
         "reranker_selection_status": reranker_selection_status,
         "reranker_selection_violations": json.dumps(reranker_selection_violations, ensure_ascii=False),
+        **span_error_summary,
     }
     record.update({key: value for key, value in reranker.items() if key != "reranker_raw_selected_ids"})
     record.update(agent_hashes)
@@ -1908,6 +2208,7 @@ def parse_trace_mlflow(
     info = trace.get("info") or {}
     data = trace.get("data") or {}
     spans = data.get("spans") or []
+    span_error_summary = summarize_span_errors(extract_span_errors(spans))
 
     trace_id = _to_str(info.get("trace_id"))
     request_time = _to_str(info.get("request_time"))
@@ -1986,6 +2287,7 @@ def parse_trace_mlflow(
         "mlflow_user": mlflow_user,
         "tags": tags,
         "assessments_raw": [_to_plain_data(a) for a in assessments_raw],
+        **span_error_summary,
     }
     return record, registry_by_node
 

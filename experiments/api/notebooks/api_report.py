@@ -31,8 +31,6 @@ import pandas as pd
 
 SCORERS = ("agent_routing", "tool_usage", "tool_parameter")
 BINARY_SCORERS = ("agent_routing", "tool_usage")
-NUMERIC_SCORERS = ("tool_parameter",)
-SUPERVISOR_AGENT = "main_agent"
 
 # Tools whose ``parameters`` are not meaningfully comparable by the
 # deterministic tool_parameter scorer (fuzzy semantic strings — search
@@ -46,9 +44,6 @@ SCORER_LABEL = {
     "tool_usage": "Tool usage",
     "tool_parameter": "Tool parameter",
 }
-
-# Mirror of CZKB color palette so the two reports read as one design system.
-GE_FONT = "Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif"
 
 
 # ─── Utility functions ───────────────────────────────────────────────────
@@ -141,8 +136,7 @@ def _tool_names(value: Any) -> list[str]:
 
 
 def _agent(value: Any) -> str:
-    text = _safe_str(value).strip()
-    return text or SUPERVISOR_AGENT
+    return _safe_str(value).strip()
 
 
 def _fmt_pct(value: float | int | None) -> str:
@@ -182,26 +176,19 @@ def enrich(df: pd.DataFrame) -> pd.DataFrame:
     for score_col in _score_columns(out):
         out[score_col] = pd.to_numeric(out[score_col], errors="coerce")
 
-    for col in (
-        "expected_tool_calls",
-        "actual_tool_calls",
-        "guidelines",
-        "scorers_to_run",
-        "actual_agents_path",
-        "available_tools",
-        "token_usage",
-        "tags",
-    ):
-        if col in out.columns:
-            out[f"_{col}_parsed"] = out[col].apply(_parse_obj)
-
-    out["_expected_agent"] = out.get("expected_agent", "").apply(_agent)
-    out["_actual_agent"] = out.get("actual_agent", "").apply(_agent)
-    out["_expected_tools"] = out.get("expected_tool_calls", "").apply(_tool_names)
-    out["_actual_tools"] = out.get("actual_tool_calls", "").apply(_tool_names)
+    # Parser contract: these columns must exist on the input CSV. Direct
+    # access (no .get default) so a missing column raises a clear KeyError
+    # at enrich time rather than silently producing an empty UI.
+    out["_expected_agent"] = out["expected_agent"].apply(_agent)
+    out["_actual_agent"] = out["actual_agent"].apply(_agent)
+    out["_expected_tools"] = out["expected_tool_calls"].apply(_tool_names)
+    out["_actual_tools"] = out["actual_tool_calls"].apply(_tool_names)
+    # Cached expected-norm column: also read by _tool_frequency_table to mask
+    # per-tool subsets. The actual side is only needed for the seq-match
+    # comparison so it's computed inline.
     out["_expected_tool_seq_norm"] = out["_expected_tools"].apply(lambda xs: [_norm_tool(x) for x in xs])
-    out["_actual_tool_seq_norm"] = out["_actual_tools"].apply(lambda xs: [_norm_tool(x) for x in xs])
-    out["_tool_seq_match"] = out["_expected_tool_seq_norm"] == out["_actual_tool_seq_norm"]
+    actual_tool_seq_norm = out["_actual_tools"].apply(lambda xs: [_norm_tool(x) for x in xs])
+    out["_tool_seq_match"] = out["_expected_tool_seq_norm"] == actual_tool_seq_norm
 
     out["_agent_routing_pass"] = out.get("agent_routing_score", pd.Series(index=out.index)).eq(1)
     out["_tool_usage_pass"] = out.get("tool_usage_score", pd.Series(index=out.index)).eq(1)
@@ -299,13 +286,6 @@ def scorer_summary(df: pd.DataFrame) -> list[dict[str, Any]]:
     return rows
 
 
-def _case_sort_key(row: pd.Series) -> tuple[int, float, str]:
-    case_id = _safe_str(row.get("test_case_id"))
-    number = re.search(r"\d+", case_id)
-    numeric = int(number.group()) if number else 10**9
-    return (-int(row.get("_issue_count", 0)), float(row.get("_score_mean", 0) or 0), f"{numeric:09d}:{case_id}")
-
-
 def case_payload(df: pd.DataFrame) -> list[dict[str, Any]]:
     cases: list[dict[str, Any]] = []
     # Sort by the numeric portion of test_case_id ascending (smoke-1, smoke-2, …)
@@ -377,6 +357,27 @@ def case_payload(df: pd.DataFrame) -> list[dict[str, Any]]:
             if n > 0:
                 extra_by_tool[str(k)] = n
 
+        # Span-level errors (emitted by parse_trace_mlflow → enriched CSV).
+        # info.state stays "OK" even when child spans crash, so without
+        # these columns the report would silently hide ConnectTimeout /
+        # CancelledError / etc. Missing on older CSVs → empty list.
+        span_errors = _as_list(row.get("span_errors_json"))
+        span_error_types = _as_list(row.get("span_error_types_json"))
+        has_span_error_raw = row.get("trace_has_span_error")
+        if isinstance(has_span_error_raw, bool):
+            has_span_error = has_span_error_raw
+        elif has_span_error_raw is None or (
+            isinstance(has_span_error_raw, float) and math.isnan(has_span_error_raw)
+        ):
+            has_span_error = bool(span_errors)
+        else:
+            has_span_error = str(has_span_error_raw).strip().lower() in {"true", "1", "1.0", "yes"}
+        span_error_count_raw = row.get("span_error_count")
+        try:
+            span_error_count = int(span_error_count_raw)
+        except (TypeError, ValueError):
+            span_error_count = len(span_errors)
+
         cases.append(
             {
                 "id": _safe_str(row.get("test_case_id")),
@@ -385,6 +386,10 @@ def case_payload(df: pd.DataFrame) -> list[dict[str, Any]]:
                 "domain": _safe_str(row.get("eval_domain")),
                 "persona": _safe_str(row.get("eval_persona")),
                 "state": _safe_str(row.get("state")),
+                "has_span_error": has_span_error,
+                "span_error_count": span_error_count,
+                "span_error_types": span_error_types,
+                "span_errors": span_errors,
                 "query": _safe_str(row.get("user_query")),
                 "query_en": _safe_str(row.get("user_query_en")),
                 "expected_agent": row.get("_expected_agent", ""),
@@ -462,7 +467,6 @@ def _unique_label(df: pd.DataFrame, column: str) -> str:
 
 
 def compute_metrics(df: pd.DataFrame) -> dict[str, Any]:
-    n_total = len(df)
     routing = pd.to_numeric(df.get("agent_routing_score", pd.Series(index=df.index)), errors="coerce")
     usage = pd.to_numeric(df.get("tool_usage_score", pd.Series(index=df.index)), errors="coerce")
     param = pd.to_numeric(df.get("tool_parameter_score", pd.Series(index=df.index)), errors="coerce")
@@ -473,7 +477,7 @@ def compute_metrics(df: pd.DataFrame) -> dict[str, Any]:
     usage_pass = int(usage.eq(1).sum())
     param_pass = int(param.eq(1).sum())
     return {
-        "n_total": n_total,
+        "n_total": len(df),
         "routing_scored": routing_scored,
         "routing_pass": routing_pass,
         "routing_pass_rate": (routing_pass / routing_scored) if routing_scored else None,
@@ -483,14 +487,6 @@ def compute_metrics(df: pd.DataFrame) -> dict[str, Any]:
         "param_scored": param_scored,
         "param_pass": param_pass,
         "param_pass_rate": (param_pass / param_scored) if param_scored else None,
-        "param_mean": param.mean(),
-        # Kept for filter chips that still group these (Core fail / Strict fail).
-        "n_core_pass": int(df["_core_pass"].sum()),
-        "n_strict_pass": int(df["_strict_pass"].sum()),
-        "core_pass_rate": df["_core_pass"].mean() if n_total else None,
-        "strict_pass_rate": df["_strict_pass"].mean() if n_total else None,
-        "tool_parameter_scored": param_scored,
-        "tool_parameter_mean": param.mean(),
     }
 
 
@@ -847,53 +843,6 @@ def _tool_frequency_table(df: pd.DataFrame) -> str:
     )
 
 
-def _extra_invocations_table(df: pd.DataFrame) -> str:
-    """Aggregate ``tool_parameter_extra_by_tool`` across cases — surfaces
-    tools the agent over-calls. Returns "" when the column is absent or
-    nothing has extras (older CSVs without scorer metadata)."""
-    col = df.get("tool_parameter_extra_by_tool")
-    if col is None:
-        return ""
-    per_tool_total = Counter()
-    per_tool_cases = Counter()
-    for cell in col.fillna(""):
-        d = _as_dict(cell)
-        if not d:
-            continue
-        for k, v in d.items():
-            try:
-                n = int(v)
-            except (TypeError, ValueError):
-                continue
-            if n <= 0:
-                continue
-            per_tool_total[str(k)] += n
-            per_tool_cases[str(k)] += 1
-    if not per_tool_total:
-        return ""
-    body_rows = []
-    for tool, total in sorted(per_tool_total.items(), key=lambda kv: (-kv[1], kv[0].lower())):
-        body_rows.append(
-            "<tr>"
-            f"<td><code>{_h(tool)}</code></td>"
-            f"<td class='num-cell'>{total}</td>"
-            f"<td class='num-cell'>{per_tool_cases[tool]}</td>"
-            f"<td class='num-cell'>{(total / max(1, per_tool_cases[tool])):.2f}</td>"
-            "</tr>"
-        )
-    return (
-        "<table class='tbl'>"
-        "<thead><tr>"
-        "<th>Tool</th>"
-        "<th class='num-head'>Extra calls</th>"
-        "<th class='num-head'>Cases</th>"
-        "<th class='num-head'>Avg per case</th>"
-        "</tr></thead>"
-        f"<tbody>{''.join(body_rows)}</tbody>"
-        "</table>"
-    )
-
-
 def _top_problem_cases(df: pd.DataFrame, limit: int = 15) -> str:
     sub = df[df["_issue_bucket"] != "pass"].copy()
     if sub.empty:
@@ -1243,6 +1192,11 @@ a.scorer-filter-link:hover { text-decoration: underline; }
 .chip-clear { background: transparent; border: 1px solid #e4eaf0; color: #cf2a1e;
               font-weight: 600; margin-left: auto; }
 .chip-clear:hover { background: #fde5e3; }
+/* Flag chip dedicated to span-level errors. Visible-red even inactive so
+   the reader knows it filters to crashes specifically. */
+.chip-err { background: #fde5e3; color: #8b1a10; border: 1px solid #f3d6d2; }
+.chip-err:hover { background: #fbd0cc; }
+.chip-err.active { background: #cf2a1e; color: #fff; border-color: #cf2a1e; }
 
 .range-filter { display: flex; align-items: center; gap: 6px; font-size: 11px;
                 color: #537090; flex-wrap: wrap; }
@@ -1340,6 +1294,51 @@ a.scorer-filter-link:hover { text-decoration: underline; }
                      text-transform: uppercase; letter-spacing: .1em;
                      margin-top: 2px; }
 .score-box.s-warn .sb-sub { color: #ad5700; }
+
+/* Span-level error surfaces. Trace info.state stays "OK" whenever the
+   agent returned an answer, so a child span crashing (ConnectTimeout,
+   CancelledError, etc.) is silent unless we surface it here. Chip on
+   the case-detail header is always rendered when has_span_error;
+   standalone <details> block lives in the score-strip so the reader
+   can drill into exception type + trimmed stacktrace. */
+.span-err-chip { display: inline-flex; align-items: center; gap: 4px;
+                  padding: 2px 8px; border-radius: 10px;
+                  background: #cf2a1e; color: #fff;
+                  font-size: 10px; font-weight: 700; letter-spacing: 0.02em;
+                  white-space: nowrap; cursor: help; }
+.span-err-chip .span-err-icon { font-size: 11px; line-height: 1; }
+.score-strip-err { border-top: 1px solid #f3d6d2; padding-top: 10px;
+                    margin-top: 4px; }
+.score-strip-err > summary { list-style: none; cursor: pointer;
+                              user-select: none; outline: none; }
+.score-strip-err > summary::-webkit-details-marker { display: none; }
+.score-strip-err-title { font-size: 9px; color: #8b1a10; font-weight: 700;
+                          text-transform: uppercase; letter-spacing: 0.12em;
+                          display: inline-flex; align-items: baseline; gap: 8px; }
+.score-strip-err-title::before { content: "▸"; display: inline-block;
+                                  width: 10px; font-size: 9px; color: #cf2a1e;
+                                  transition: transform 0.15s ease; }
+.score-strip-err[open] > summary > .score-strip-err-title::before { transform: rotate(90deg); }
+.score-strip-err-summary { font-size: 11px; color: #8b1a10; font-weight: 600;
+                            text-transform: none; letter-spacing: 0; margin-left: 4px; }
+.score-strip-err-list { margin: 8px 0 0; padding: 0; list-style: none;
+                         border: 1px solid #f3d6d2; border-radius: 6px;
+                         background: #fff8f7; }
+.score-strip-err-list li { padding: 8px 10px; border-bottom: 1px solid #f3d6d2;
+                            font-size: 11px; color: #0a285c; }
+.score-strip-err-list li:last-child { border-bottom: none; }
+.span-err-type { display: inline-block; padding: 1px 6px; border-radius: 4px;
+                  background: #cf2a1e; color: #fff; font-weight: 700;
+                  font-size: 10px; letter-spacing: 0.02em;
+                  font-variant-numeric: tabular-nums; }
+.span-err-where { color: #5c7999; font-size: 10px; margin-left: 6px; }
+.span-err-msg { display: block; margin-top: 4px; color: #8b1a10;
+                 font-style: italic; }
+.span-err-stack { display: block; margin-top: 4px; padding: 6px 8px;
+                   background: #fff; border: 1px solid #f3d6d2; border-radius: 4px;
+                   font-family: ui-monospace, Menlo, Consolas, monospace;
+                   font-size: 10px; color: #5c7999; white-space: pre-wrap;
+                   max-height: 160px; overflow: auto; }
 
 .scorer-plan { display: flex; flex-wrap: wrap; align-items: center;
                gap: 6px; margin: 6px 0 10px; font-size: 11px; }
@@ -1487,6 +1486,7 @@ let activeCaseId = CASES.length ? CASES[0].id : null;
 // `domains`/`personas` are Sets — multi-select.
 const activeFilters = {
   outcome: null,
+  flag: null,
   scorer_pairs: [],
   domains: new Set(),
   personas: new Set(),
@@ -1570,17 +1570,31 @@ const searchEl = document.getElementById("case-search");
 const detailEl = document.getElementById("case-detail");
 
 function scorerBucket(c, scorer) {
+  if (scorer === "tool_parameter") return c.param_bucket;
   const v = c.scores[scorer];
-  if (scorer === "tool_parameter") return c.param_bucket || (v == null ? "na" : (v >= 1 ? "pass" : v > 0 ? "partial" : "fail"));
   if (v == null) return "na";
   return v >= 1 ? "pass" : "fail";
 }
 
 function matchesFilters(c) {
   if (activeFilters.outcome) {
-    if (activeFilters.outcome === "pass" && c.issue_bucket !== "pass") return false;
-    if (activeFilters.outcome === "fail" && c.issue_bucket === "pass") return false;
+    // Three classes of value can land here:
+    //   "pass"           — sidebar Outcome chip / Primary-Outcomes "Pass" row
+    //   "fail"           — sidebar Outcome chip
+    //   <issue_bucket>   — Primary-Outcomes drill-down on a specific bucket
+    //                       ("agent_routing", "tool_usage", "tool_parameter")
+    // The third case requires an explicit bucket match — without it the
+    // click does nothing because the value is neither "pass" nor "fail".
+    const f = activeFilters.outcome;
+    if (f === "pass") {
+      if (c.issue_bucket !== "pass") return false;
+    } else if (f === "fail") {
+      if (c.issue_bucket === "pass") return false;
+    } else if (c.issue_bucket !== f) {
+      return false;
+    }
   }
+  if (activeFilters.flag === "span_errors" && !c.has_span_error) return false;
   if (activeFilters.scorer_pairs && activeFilters.scorer_pairs.length) {
     // Group by scorer: OR within a scorer, AND across scorers.
     const grouped = {};
@@ -1630,7 +1644,9 @@ function outcomeBadge(c) {
   if (c.issue_bucket === "agent_routing") return `<span class="fm-badge fm-routing">routing fail</span>`;
   if (c.issue_bucket === "tool_usage") return `<span class="fm-badge fm-usage">tool usage fail</span>`;
   if (c.issue_bucket === "tool_parameter") return `<span class="fm-badge fm-params">tool params</span>`;
-  return "";
+  // Any other value (only possible if enrich.issue_bucket regresses) is
+  // surfaced as a visible "?" so the bug doesn't hide as a missing badge.
+  return `<span class="fm-badge badge-na" title="issue_bucket=${esc(c.issue_bucket || "(empty)")}">?</span>`;
 }
 
 function scoreBadge(label, value, kind) {
@@ -1648,13 +1664,28 @@ function scoreBadge(label, value, kind) {
   return `<span class="badge ${cls}">${esc(label)}: ${txt}</span>`;
 }
 
+// Readable labels for the issue_bucket values surfaced as outcome
+// filters by the Primary Outcomes table. Falls through to the raw
+// value for anything else (pass / fail / future buckets).
+const OUTCOME_LABELS = {
+  pass: "Pass",
+  fail: "Fail",
+  agent_routing: "Agent routing fail",
+  tool_usage: "Tool usage fail",
+  tool_parameter: "Tool parameter mismatch",
+};
+
 function updateActiveFilterBanner() {
   const el = document.getElementById("active-filter");
   const txt = document.getElementById("active-filter-text");
   if (!el || !txt) return;
   const msgs = [];
   if (activeFilters.outcome) {
-    msgs.push(`outcome = <strong>${esc(activeFilters.outcome)}</strong>`);
+    const label = OUTCOME_LABELS[activeFilters.outcome] || activeFilters.outcome;
+    msgs.push(`outcome = <strong>${esc(label)}</strong>`);
+  }
+  if (activeFilters.flag) {
+    msgs.push(`flag = <strong>${esc(activeFilters.flag)}</strong>`);
   }
   if (activeFilters.scorer_pairs.length) {
     const parts = activeFilters.scorer_pairs.map(p =>
@@ -1771,6 +1802,7 @@ function bindChips() {
 
 function clearAllFilters() {
   activeFilters.outcome = null;
+  activeFilters.flag = null;
   activeFilters.scorer_pairs = [];
   activeFilters.domains.clear();
   activeFilters.personas.clear();
@@ -1839,6 +1871,58 @@ function bindSidebarToggle() {
   }
 }
 
+// Red chip rendered on the case-detail header. Always on when the
+// trace has a span-level error — info.state="OK" lies whenever the
+// orchestrator returned *some* response, even if a child span crashed.
+function spanErrorChipHtml(c) {
+  if (!c || !c.has_span_error) return "";
+  const errs = Array.isArray(c.span_errors) ? c.span_errors : [];
+  const n = errs.length || (c.span_error_count || 0);
+  const types = Array.isArray(c.span_error_types) ? c.span_error_types : [];
+  const label = types.length ? types.join(", ") : (n + " span error" + (n === 1 ? "" : "s"));
+  const where = errs.map(e =>
+    `${e.exception_type || e.status_code || "error"} @ ${e.span_name || "?"}`
+  ).join("\n");
+  const tip = "Span-level errors hidden by trace state=OK:\n" + where;
+  return `<span class="span-err-chip" title="${esc(tip)}">` +
+         `<span class="span-err-icon">⚠</span>${esc(label)}</span>`;
+}
+
+// Standalone errors <details> block inside the score-strip. Surfaces
+// exception type + trimmed stacktrace so the reader can see what
+// crashed without leaving the case-detail pane.
+function spanErrorsBlockHtml(c) {
+  if (!c || !c.has_span_error) return "";
+  const errs = Array.isArray(c.span_errors) ? c.span_errors : [];
+  if (!errs.length) return "";
+  const items = errs.map(e => {
+    const type = String(e.exception_type || e.status_code || "error");
+    const whereParts = [e.span_name, e.langgraph_node]
+      .map(v => (v == null ? "" : String(v).trim()))
+      .filter((v, i, a) => v && a.indexOf(v) === i);
+    const where = whereParts.join(" · ") || "(unknown span)";
+    const msg = String(e.exception_message || e.status_message || "").trim();
+    const stack = String(e.stacktrace_tail || "").trim();
+    return `<li>
+      <span class="span-err-type">${esc(type)}</span>` +
+        `<span class="span-err-where">at ${esc(where)}</span>` +
+        (msg ? `<span class="span-err-msg">${esc(msg)}</span>` : "") +
+        (stack ? `<pre class="span-err-stack">${esc(stack)}</pre>` : "") +
+    `</li>`;
+  }).join("");
+  const n = errs.length;
+  const summary = n === 1
+    ? "1 span crashed — trace state was OK so this would otherwise be hidden"
+    : `${n} spans crashed — trace state was OK so these would otherwise be hidden`;
+  return `<details class="score-strip-err">
+    <summary>
+      <span class="score-strip-err-title">Span errors</span>` +
+      `<span class="score-strip-err-summary">${esc(summary)}</span>
+    </summary>
+    <ul class="score-strip-err-list">${items}</ul>
+  </details>`;
+}
+
 function scoreClass(value, kind) {
   if (value == null) return "s-na";
   if (kind === "binary") return value >= 1 ? "s-good" : "s-bad";
@@ -1882,6 +1966,7 @@ function scoreStripHtml(c) {
       ${box("tool_usage", "Tool usage (0/1)", "binary", v => v.toFixed(0))}
       ${box("tool_parameter", "Tool parameter (0–1)", "numeric", v => v.toFixed(2))}
     </div>
+    ${spanErrorsBlockHtml(c)}
   </div>`;
 }
 
@@ -2007,6 +2092,7 @@ function selectCase(id) {
       ${outcomeBadge(c)}
       ${c.domain ? `<span class="badge badge-na">${esc(c.domain)}</span>` : ""}
       ${c.persona ? `<span class="badge badge-na">${esc(c.persona)}</span>` : ""}
+      ${spanErrorChipHtml(c)}
       ${c.trace_id ? `<span style="font-size:11px;color:#5c7999">trace: <code>${esc(c.trace_id)}</code></span>` : ""}
     </h2>
     <div style="margin-bottom:10px">${routeChips(c)}</div>
@@ -2526,6 +2612,11 @@ def render_html(df: pd.DataFrame, *, input_path: Path, output_path: Path) -> str
               <input id="param-max" type="number" min="0" max="1" step="0.05" placeholder="max">
               <button class="range-reset" id="param-reset">reset</button>
             </div>
+          </div>
+          <div class="filter-group">
+            <span class="filter-label">Flags</span>
+            <button class="chip chip-err" data-group="flag" data-value="span_errors"
+                    title="Cases with at least one span-level error (info.state=OK but a child span crashed — e.g. CancelledError, ConnectTimeout)">Span errors</button>
           </div>
           <div class="filter-group" style="justify-content:flex-end">
             <button class="chip chip-clear" id="chip-clear">Clear all</button>
