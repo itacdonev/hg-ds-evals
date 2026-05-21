@@ -107,6 +107,16 @@ def _as_list(value: Any) -> list[Any]:
     return [parsed]
 
 
+def _as_int_or_none(value: Any) -> int | None:
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(f):
+        return None
+    return int(f)
+
+
 def _as_dict(value: Any) -> dict[str, Any]:
     parsed = _parse_obj(value)
     return parsed if isinstance(parsed, dict) else {}
@@ -495,6 +505,15 @@ def case_payload(df: pd.DataFrame, *,
                     row.get("tool_parameter_actual_excused"),
                     len(row.get("_actual_tools") or []),
                 ),
+                # KB-retrieval ENUM stages (populated only for KB / KB&API
+                # cases; empty lists otherwise). The case-detail UI shows
+                # the section when any of these are non-empty.
+                "expected_enums":       _as_list(row.get("expected_enums")),
+                "pre_prune_enum_ids":   _as_list(row.get("pre_prune_enum_ids")),
+                "post_prune_enum_ids":  _as_list(row.get("post_prune_enum_ids")),
+                "reranked_enum_ids":    _as_list(row.get("reranked_enum_ids")),
+                "pre_prune_enum_count":  _as_int_or_none(row.get("pre_prune_enum_count")),
+                "post_prune_enum_count": _as_int_or_none(row.get("post_prune_enum_count")),
                 # Baseline comparison (see load_baseline / --baseline CLI flag).
                 # All False / None when no baseline was loaded.
                 "prev_known": prev_known,
@@ -856,14 +875,19 @@ def _group_table(df: pd.DataFrame, group_col: str, label: str, tip: str | None =
                  col_label: str | None = None) -> str:
     if group_col not in df.columns:
         return f"<div class='card'><div class='card-title'>{_h(label)}</div><p class='placeholder'>Column not available.</p></div>"
+    agg_spec: dict[str, tuple[str, str]] = {
+        "cases": ("test_case_id", "count"),
+    }
+    if "agent_routing_score" in df.columns:
+        agg_spec["routing"] = ("agent_routing_score", "mean")
+    if "tool_usage_score" in df.columns:
+        agg_spec["usage"] = ("tool_usage_score", "mean")
+    has_params = "tool_parameter_score" in df.columns
+    if has_params:
+        agg_spec["params"] = ("tool_parameter_score", "mean")
     grouped = (
         df.groupby(group_col, dropna=False)
-        .agg(
-            cases=("test_case_id", "count"),
-            routing=("agent_routing_score", "mean"),
-            usage=("tool_usage_score", "mean"),
-            params=("tool_parameter_score", "mean"),
-        )
+        .agg(**agg_spec)
         .reset_index()
         .sort_values(["cases", group_col], ascending=[False, True])
     )
@@ -872,9 +896,10 @@ def _group_table(df: pd.DataFrame, group_col: str, label: str, tip: str | None =
     for _, row in grouped.iterrows():
         raw_name = _safe_str(row[group_col])
         name = raw_name or "(blank)"
-        routing_cls = _rate_class(row["routing"])
-        usage_cls = _rate_class(row["usage"])
-        params_cls = _rate_class(row["params"])
+        routing_val = row["routing"] if "routing" in grouped.columns else None
+        usage_val = row["usage"] if "usage" in grouped.columns else None
+        routing_cls = _rate_class(routing_val)
+        usage_cls = _rate_class(usage_val)
         cases_n = int(row["cases"])
         if filter_group and raw_name:
             cases_cell = (
@@ -884,13 +909,18 @@ def _group_table(df: pd.DataFrame, group_col: str, label: str, tip: str | None =
             )
         else:
             cases_cell = str(cases_n)
+        if has_params:
+            params_cls = _rate_class(row["params"])
+            params_cell = f"<td class='num-cell {params_cls}'>{_fmt_pct(row['params'])}</td>"
+        else:
+            params_cell = "<td class='num-cell rate-na' title='tool_parameter_score not present in this run'>–</td>"
         body_rows.append(
             "<tr>"
             f"<td>{_h(name)}</td>"
             f"<td class='num-cell'>{cases_cell}</td>"
-            f"<td class='num-cell {routing_cls}'>{_fmt_pct(row['routing'])}</td>"
-            f"<td class='num-cell {usage_cls}'>{_fmt_pct(row['usage'])}</td>"
-            f"<td class='num-cell {params_cls}'>{_fmt_pct(row['params'])}</td>"
+            f"<td class='num-cell {routing_cls}'>{_fmt_pct(routing_val)}</td>"
+            f"<td class='num-cell {usage_cls}'>{_fmt_pct(usage_val)}</td>"
+            f"{params_cell}"
             "</tr>"
         )
     info = f" {_info_icon(tip)}" if tip else ""
@@ -1430,6 +1460,28 @@ a.scorer-filter-link:hover { text-decoration: underline; }
 .lang-seg:hover:not(.active) { background: #eef4fd; }
 .lang-seg.active { background: #135ee2; color: #fff; cursor: default; }
 
+/* ─── ENUM section (KB / KB&API cases only) ─── */
+.enum-chip { display: inline-block; padding: 1px 7px; border-radius: 10px;
+             font-size: 11px; font-weight: 600; margin: 1px 2px;
+             font-family: monospace; }
+.enum-chip.match   { background: #dff5ea; color: #0a285c; font-weight: 700; }
+.enum-chip.miss    { background: #fde5e3; color: #0a285c; font-weight: 700; }
+.enum-chip.neutral { background: #edf0f4; color: #5c7999; font-weight: 500; }
+.enum-chip.expected-row    { background: #e0eafd; color: #0a285c; font-weight: 800; }
+.enum-chip.expected-missed { background: #edf0f4; color: #5c7999; font-weight: 600; }
+.enum-rows { display: flex; flex-direction: column; gap: 4px;
+             background: #f4f6fa; border-radius: 6px;
+             padding: 10px 12px; font-size: 12px; font-family: monospace;
+             color: #0a285c; }
+.enum-row { display: grid; grid-template-columns: 180px 1fr; gap: 8px;
+            align-items: baseline; }
+.enum-row .enum-label { color: #5c7999; font-weight: 600;
+                        display: inline-flex; align-items: center; gap: 4px;
+                        font-family: Inter, -apple-system, sans-serif; }
+.enum-row .enum-count { color: #a3b5c9; font-weight: 500; font-size: 11px; }
+hr.enum-divider { border: none; border-top: 1px solid #c8d3e1;
+                  margin: 2px 0; }
+
 .score-strip { display: flex; flex-direction: column; gap: 10px;
                margin-bottom: 14px; padding: 12px; background: #f8fafc;
                border: 1px solid #edf0f4; border-radius: 10px; }
@@ -1860,6 +1912,100 @@ function compareBannerHtml(c) {
   return `<div class="compare-banner ${cls}">
     Compared to <code>${esc(BASELINE_NAME)}</code>:
     <strong>${esc(arrow)}</strong>
+  </div>`;
+}
+
+// ─── KB-retrieval ENUMs (KB / KB&API cases) ──────────────────────────
+// Mirrors the CZKB report's ENUM section. Coloring rules:
+//   • default     — green = in BOTH expected and reranked (right pick)
+//                   red   = in expected XOR reranked (missed / wrong)
+//                   grey  = in neither (pool noise)
+//   • "expected"  — used for the ground-truth row itself; bolds IDs the
+//                   reranker actually picked, greys out the ones it
+//                   didn't (expected-row vs expected-missed).
+function enumChipClass(id, expectedSet, rerankedSet, mode) {
+  const inExp = expectedSet.has(id);
+  const inRer = rerankedSet.has(id);
+  if (mode === "expected") {
+    return inRer ? "enum-chip expected-row" : "enum-chip expected-missed";
+  }
+  if (inExp && inRer) return "enum-chip match";
+  if (inExp || inRer) return "enum-chip miss";
+  return "enum-chip neutral";
+}
+
+function enumChipsApi(rawIds, expectedSet, rerankedSet, mode) {
+  if (!Array.isArray(rawIds) || !rawIds.length) {
+    return '<em class="lang-fallback">[]</em>';
+  }
+  return rawIds.map(id => {
+    const s = String(id);
+    return `<span class="${enumChipClass(s, expectedSet, rerankedSet, mode)}">${esc(s)}</span>`;
+  }).join(" ");
+}
+
+function enumRow(label, info, chipsHtml, countText) {
+  const count = countText != null ? ` <span class="enum-count">(${esc(String(countText))})</span>` : "";
+  return `<div class="enum-row">
+    <span class="enum-label">${esc(label)}${count}
+      <span class="info-icon" data-tip="${esc(info)}">&#9432;</span>
+    </span>
+    <span class="enum-chips">${chipsHtml}</span>
+  </div>`;
+}
+
+function enumSectionHtml(c) {
+  // Only KB / KB&API cases carry meaningful retrieval data. Hide the
+  // section entirely otherwise so api-only cases stay uncluttered.
+  const dom = String(c.domain || "").toLowerCase();
+  if (dom !== "kb" && dom !== "kb&api") return "";
+  const exp  = Array.isArray(c.expected_enums)      ? c.expected_enums      : [];
+  const pre  = Array.isArray(c.pre_prune_enum_ids)  ? c.pre_prune_enum_ids  : [];
+  const post = Array.isArray(c.post_prune_enum_ids) ? c.post_prune_enum_ids : [];
+  const rer  = Array.isArray(c.reranked_enum_ids)   ? c.reranked_enum_ids   : [];
+  if (!exp.length && !pre.length && !post.length && !rer.length) return "";
+  const expectedSet = new Set(exp.map(String));
+  const rerankedSet = new Set(rer.map(String));
+  const preCount  = c.pre_prune_enum_count  != null ? c.pre_prune_enum_count  : pre.length;
+  const postCount = c.post_prune_enum_count != null ? c.post_prune_enum_count : post.length;
+  // Computed miss/extra rows (mirrors CZKB layout).
+  const postSet = new Set(post.map(String));
+  const retrieverMiss = exp.filter(id => !postSet.has(String(id)));
+  const rerankerMiss  = exp.filter(id => postSet.has(String(id)) && !rerankedSet.has(String(id)));
+  const extraSelected = rer.filter(id => !expectedSet.has(String(id)));
+  return `<div class="detail-section">
+    <h3>ENUMs</h3>
+    <div class="enum-rows">
+      ${enumRow("expected",
+                "Ground-truth ENUM IDs that should be retrieved/selected for this query (from target_enums_to_relevance on the test set). Bold blue = picked by the reranker; grey = not picked.",
+                enumChipsApi(exp, expectedSet, rerankedSet, "expected"),
+                exp.length)}
+      <hr class="enum-divider">
+      ${enumRow("final selected",
+                "ENUM IDs the reranker actually picked — what the agent used (reranked_enum_ids). Green = also expected; red = picked but not in expected.",
+                enumChipsApi(rer, expectedSet, rerankedSet),
+                rer.length)}
+      <hr class="enum-divider">
+      ${enumRow("post-prune",
+                "Candidate pool after dedup/pruning, before reranking (post_prune_enum_ids).",
+                enumChipsApi(post, expectedSet, rerankedSet),
+                postCount)}
+      <hr class="enum-divider">
+      ${enumRow("retriever miss",
+                "Expected ENUMs that never made it into the post-prune pool — the retriever didn't surface them. Computed as expected_enums − post_prune_enum_ids.",
+                enumChipsApi(retrieverMiss, expectedSet, rerankedSet))}
+      ${enumRow("reranker miss",
+                "Expected ENUMs that WERE in the post-prune pool but the reranker did NOT pick them. Computed as (expected_enums ∩ post_prune_enum_ids) − reranked_enum_ids.",
+                enumChipsApi(rerankerMiss, expectedSet, rerankedSet))}
+      ${enumRow("extra selected",
+                "Reranker picks that aren't in the expected set — potential noise / distractors.",
+                enumChipsApi(extraSelected, expectedSet, rerankedSet))}
+      <hr class="enum-divider">
+      ${enumRow("pre-prune",
+                "Initial candidate pool returned by the retriever (pre_prune_enum_ids).",
+                enumChipsApi(pre, expectedSet, rerankedSet),
+                preCount)}
+    </div>
   </div>`;
 }
 
@@ -2392,6 +2538,8 @@ function selectCase(id) {
         </div>
       </div>
     </div>
+
+    ${enumSectionHtml(c)}
   `;
 }
 
@@ -2729,6 +2877,7 @@ def render_html(df: pd.DataFrame, *, input_path: Path, output_path: Path,
         run_time = "–"
     mlflow_run_id = _unique_label(df, "source_run_id")
     mlflow_user = _unique_label(df, "mlflow_user")
+    kb_version_label = _unique_label(df, "kb_version")
     git_branch = _unique_label(df, "git_branch")
     _git_commit_full = _unique_label(df, "git_commit")
     git_commit = (_git_commit_full[:10] if _git_commit_full not in ("–", None) and len(_git_commit_full) >= 10
@@ -2837,6 +2986,7 @@ def render_html(df: pd.DataFrame, *, input_path: Path, output_path: Path,
       </div>
       <div class="header-col">
         <span>Test cases: <strong>{len(df)}</strong></span>
+        <span>KB version: <code>{_h(kb_version_label)}</code></span>
         <span>Git branch: <code>{_h(git_branch)}</code></span>
         <span>Git commit: <code>{_h(git_commit)}</code></span>
       </div>
