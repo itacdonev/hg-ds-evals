@@ -12,6 +12,12 @@ Usage:
     python api_report.py \
         --input traces/traces_enriched_offline_smoke_pr12_kb_smoke_infer.csv \
         --output reports/api_smoke_report.html
+
+    # With a baseline run for regression comparison:
+    python api_report.py \
+        --input    .../enriched_traces_<CURRENT_RUN_ID>.csv \
+        --baseline .../enriched_traces_<PREVIOUS_RUN_ID>.csv \
+        --output reports/api_smoke_report.html
 """
 from __future__ import annotations
 
@@ -244,6 +250,35 @@ def enrich(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def load_baseline(path: Path) -> dict[str, dict[str, Any]]:
+    """Load a previously-scored enriched-traces CSV and reduce it to a
+    per-test-case lookup of strict-pass / issue-bucket.
+
+    Reuses ``enrich`` so the pass criterion is identical to the current
+    run (``_strict_pass`` = routing + tool_usage + tool_parameter when
+    scored). Duplicate ``test_case_id`` rows keep the last one and print
+    a one-line warning so it's visible.
+    """
+    df = pd.read_csv(path)
+    df = enrich(df)
+    if "test_case_id" not in df.columns:
+        raise KeyError(f"Baseline CSV missing 'test_case_id' column: {path}")
+    dup_mask = df.duplicated(subset="test_case_id", keep="last")
+    if int(dup_mask.sum()):
+        print(f"[baseline] {int(dup_mask.sum())} duplicate test_case_id rows in "
+              f"{path.name}; keeping last occurrence each.")
+    lookup: dict[str, dict[str, Any]] = {}
+    for _, row in df.iterrows():
+        tcid = _safe_str(row.get("test_case_id"))
+        if not tcid:
+            continue
+        lookup[tcid] = {
+            "strict_pass": bool(row.get("_strict_pass")),
+            "issue_bucket": _safe_str(row.get("_issue_bucket")),
+        }
+    return lookup
+
+
 def scorer_summary(df: pd.DataFrame) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for scorer in SCORERS:
@@ -286,7 +321,8 @@ def scorer_summary(df: pd.DataFrame) -> list[dict[str, Any]]:
     return rows
 
 
-def case_payload(df: pd.DataFrame) -> list[dict[str, Any]]:
+def case_payload(df: pd.DataFrame, *,
+                 baseline: dict[str, dict[str, Any]] | None = None) -> list[dict[str, Any]]:
     cases: list[dict[str, Any]] = []
     # Sort by the numeric portion of test_case_id ascending (smoke-1, smoke-2, …)
     # so the sidebar reads in dataset order rather than failure-first order.
@@ -378,6 +414,26 @@ def case_payload(df: pd.DataFrame) -> list[dict[str, Any]]:
         except (TypeError, ValueError):
             span_error_count = len(span_errors)
 
+        # Baseline comparison fields. When no baseline is provided every
+        # case gets `prev_known=False` and all comparison flags `False`,
+        # which the JS reads as "no comparison loaded" (no chips, no
+        # badge, no detail banner).
+        tcid_str = _safe_str(row.get("test_case_id"))
+        strict_pass_now = bool(row.get("_strict_pass"))
+        if baseline is not None and tcid_str in baseline:
+            prev = baseline[tcid_str]
+            prev_known = True
+            prev_pass = bool(prev["strict_pass"])
+            prev_issue_bucket = str(prev.get("issue_bucket") or "")
+        else:
+            prev_known = False
+            prev_pass = None
+            prev_issue_bucket = ""
+        regression = (baseline is not None) and prev_known and prev_pass and (not strict_pass_now)
+        persistent_failure = (baseline is not None) and prev_known and (not prev_pass) and (not strict_pass_now)
+        fixed = (baseline is not None) and prev_known and (not prev_pass) and strict_pass_now
+        new_case = (baseline is not None) and (not prev_known)
+
         cases.append(
             {
                 "id": _safe_str(row.get("test_case_id")),
@@ -414,6 +470,11 @@ def case_payload(df: pd.DataFrame) -> list[dict[str, Any]]:
                 "actual_tool_calls_pretty": _json_pretty(row.get("actual_tool_calls"), limit=12000),
                 "expected_response": _safe_str(row.get("expected_response")),
                 "actual_response": _safe_str(row.get("actual_response")),
+                # English translation of actual_response, when available
+                # (notebook step writes this column). Empty string falls
+                # back gracefully — the UI only shows the EN toggle when
+                # this is non-empty.
+                "actual_response_en": _safe_str(row.get("actual_response_en")),
                 "available_tools": _as_list(row.get("available_tools")),
                 "agents_path": _as_list(row.get("actual_agents_path")),
                 "tool_classification": tool_class,
@@ -434,6 +495,15 @@ def case_payload(df: pd.DataFrame) -> list[dict[str, Any]]:
                     row.get("tool_parameter_actual_excused"),
                     len(row.get("_actual_tools") or []),
                 ),
+                # Baseline comparison (see load_baseline / --baseline CLI flag).
+                # All False / None when no baseline was loaded.
+                "prev_known": prev_known,
+                "prev_pass": prev_pass,
+                "prev_issue_bucket": prev_issue_bucket,
+                "regression": bool(regression),
+                "persistent_failure": bool(persistent_failure),
+                "fixed": bool(fixed),
+                "new_case": bool(new_case),
             }
         )
     return cases
@@ -466,7 +536,8 @@ def _unique_label(df: pd.DataFrame, column: str) -> str:
     return f"{len(values)} values"
 
 
-def compute_metrics(df: pd.DataFrame) -> dict[str, Any]:
+def compute_metrics(df: pd.DataFrame, *,
+                    baseline: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
     routing = pd.to_numeric(df.get("agent_routing_score", pd.Series(index=df.index)), errors="coerce")
     usage = pd.to_numeric(df.get("tool_usage_score", pd.Series(index=df.index)), errors="coerce")
     param = pd.to_numeric(df.get("tool_parameter_score", pd.Series(index=df.index)), errors="coerce")
@@ -476,7 +547,7 @@ def compute_metrics(df: pd.DataFrame) -> dict[str, Any]:
     routing_pass = int(routing.eq(1).sum())
     usage_pass = int(usage.eq(1).sum())
     param_pass = int(param.eq(1).sum())
-    return {
+    out: dict[str, Any] = {
         "n_total": len(df),
         "routing_scored": routing_scored,
         "routing_pass": routing_pass,
@@ -487,7 +558,35 @@ def compute_metrics(df: pd.DataFrame) -> dict[str, Any]:
         "param_scored": param_scored,
         "param_pass": param_pass,
         "param_pass_rate": (param_pass / param_scored) if param_scored else None,
+        "baseline_loaded": baseline is not None,
     }
+    if baseline is not None:
+        # Count regression / persistent / fixed / new against the
+        # baseline lookup. Strict pass criterion (same as case_payload).
+        n_reg = n_persistent = n_fixed = n_new = n_comparable = 0
+        for _, row in df.iterrows():
+            tcid = _safe_str(row.get("test_case_id"))
+            strict_now = bool(row.get("_strict_pass"))
+            prev = baseline.get(tcid)
+            if prev is None:
+                n_new += 1
+                continue
+            n_comparable += 1
+            prev_pass = bool(prev["strict_pass"])
+            if prev_pass and not strict_now:
+                n_reg += 1
+            elif (not prev_pass) and (not strict_now):
+                n_persistent += 1
+            elif (not prev_pass) and strict_now:
+                n_fixed += 1
+        out.update(
+            n_regression=n_reg,
+            n_persistent=n_persistent,
+            n_fixed=n_fixed,
+            n_new=n_new,
+            n_comparable=n_comparable,
+        )
+    return out
 
 
 # ─── Info-icon tooltips ──────────────────────────────────────────────────
@@ -549,7 +648,7 @@ def _summary_cards(metrics: dict[str, Any]) -> str:
     # Per-card tooltips now also carry the small "X / Y cases scored"
     # footnote that used to sit visibly under the value (the visible
     # .hc-detail line is gone — the info-icon hover shows it instead).
-    cards = [
+    cards: list[dict[str, Any]] = [
         {
             "label": "Test cases",
             "value": str(metrics["n_total"]),
@@ -580,15 +679,45 @@ def _summary_cards(metrics: dict[str, Any]) -> str:
             ),
         },
     ]
+    if metrics.get("baseline_loaded"):
+        n_reg = int(metrics.get("n_regression", 0))
+        n_persistent = int(metrics.get("n_persistent", 0))
+        n_fixed = int(metrics.get("n_fixed", 0))
+        n_new = int(metrics.get("n_new", 0))
+        n_comp = int(metrics.get("n_comparable", 0))
+        cards.append({
+            "label": "Regressions",
+            "value": str(n_reg),
+            "tip": (
+                "Cases that passed in the baseline run but fail in this "
+                "run (strict pass = routing + tool_usage + tool_parameter "
+                "when scored).\n\n"
+                f"{n_reg} regression · {n_persistent} persistent fail · "
+                f"{n_fixed} fixed · {n_new} new · {n_comp} comparable.\n"
+                "Click the card to filter the Test Cases tab to regressions."
+            ),
+            "filter_link": "regression",
+            "tone": "bad" if n_reg else "good",
+        })
     out = []
     for c in cards:
         tip = _info_icon(c["tip"]) if c["tip"] else ""
-        out.append(
-            "<div class='headline-card'>"
-            f"<div class='hc-label'>{_h(c['label'])} {tip}</div>"
-            f"<div class='hc-value'>{c['value']}</div>"
-            "</div>"
-        )
+        if c.get("filter_link"):
+            tone_cls = f" hc-{c.get('tone', '')}" if c.get("tone") else ""
+            out.append(
+                f"<a href='#' class='headline-card hc-clickable{tone_cls}' "
+                f"data-compare-filter='{_h(c['filter_link'])}'>"
+                f"<div class='hc-label'>{_h(c['label'])} {tip}</div>"
+                f"<div class='hc-value'>{c['value']}</div>"
+                "</a>"
+            )
+        else:
+            out.append(
+                "<div class='headline-card'>"
+                f"<div class='hc-label'>{_h(c['label'])} {tip}</div>"
+                f"<div class='hc-value'>{c['value']}</div>"
+                "</div>"
+            )
     return "".join(out)
 
 
@@ -1046,10 +1175,38 @@ code { font-family: monospace; font-size: 12px; background: #e7effd;
 
 .fm-badge { display: inline-block; padding: 1px 8px; border-radius: 10px;
             font-size: 11px; font-weight: 600; white-space: nowrap; }
-.fm-pass    { background: #dff5ea; color: #028661; }
-.fm-routing { background: #fde5e3; color: #cf2a1e; }
-.fm-usage   { background: #fde5e3; color: #cf2a1e; }
-.fm-params  { background: #fef4e2; color: #b46504; }
+.fm-pass       { background: #dff5ea; color: #028661; }
+.fm-routing    { background: #fde5e3; color: #cf2a1e; }
+.fm-usage      { background: #fde5e3; color: #cf2a1e; }
+.fm-params     { background: #fef4e2; color: #b46504; }
+/* Baseline-comparison badges (see compareBadge / compareBannerHtml). */
+.fm-regression { background: #fde5e3; color: #cf2a1e; }
+.fm-persistent { background: #fef4e2; color: #b46504; }
+.fm-fixed      { background: #dff5ea; color: #028661; }
+.fm-new        { background: #e7effd; color: #1d69ec; }
+
+/* Detail-pane banner showing PASS → FAIL etc. against the baseline. */
+.compare-banner { display: inline-flex; align-items: center; gap: 6px;
+                  padding: 4px 10px; border-radius: 6px;
+                  font-size: 12px; margin-bottom: 10px; }
+.compare-banner.fm-regression { background: #fde5e3; color: #8a1a12; }
+.compare-banner.fm-persistent { background: #fef4e2; color: #6a3c01; }
+.compare-banner.fm-fixed      { background: #dff5ea; color: #024a3a; }
+.compare-banner.fm-new        { background: #e7effd; color: #0a285c; }
+.compare-banner.fm-pass       { background: #dff5ea; color: #024a3a; }
+.compare-banner code { background: rgba(255,255,255,0.6); color: inherit; }
+
+/* Clickable headline card (Regressions). Mirrors the static card
+   style but adds a hover lift + tone-coded left border. */
+a.headline-card.hc-clickable { text-decoration: none; cursor: pointer;
+                                color: inherit; transition: box-shadow 0.15s ease,
+                                transform 0.15s ease; }
+a.headline-card.hc-clickable:hover { box-shadow: 0 4px 12px rgba(10,40,92,0.12);
+                                      transform: translateY(-1px); }
+a.headline-card.hc-bad  { border-left: 3px solid #cf2a1e; }
+a.headline-card.hc-bad  .hc-value  { color: #cf2a1e; }
+a.headline-card.hc-good { border-left: 3px solid #057f19; }
+a.headline-card.hc-good .hc-value  { color: #057f19; }
 
 .tbl { width: 100%; border-collapse: collapse; font-size: 12px;
        table-layout: auto; }
@@ -1257,6 +1414,21 @@ a.scorer-filter-link:hover { text-decoration: underline; }
                padding: 1px 8px; border-radius: 10px; cursor: pointer;
                margin-left: 8px; vertical-align: middle; }
 .body-toggle:hover { background: #eef4fd; }
+
+/* Segmented language switch — two pills sharing a border. The
+   highlighted segment shows which body is currently visible; clicking
+   the other segment switches to that body. Both labels stay visible
+   so it's unambiguous which one is the action and which is the state. */
+.lang-switch { display: inline-flex; margin-left: 6px;
+               border: 1px solid #dbe5f8; border-radius: 10px;
+               overflow: hidden; vertical-align: middle; }
+.lang-seg { background: transparent; border: none; color: #135ee2;
+            font: inherit; font-size: 10px; font-weight: 600;
+            text-transform: uppercase; letter-spacing: .04em;
+            padding: 1px 8px; cursor: pointer; }
+.lang-seg + .lang-seg { border-left: 1px solid #dbe5f8; }
+.lang-seg:hover:not(.active) { background: #eef4fd; }
+.lang-seg.active { background: #135ee2; color: #fff; cursor: default; }
 
 .score-strip { display: flex; flex-direction: column; gap: 10px;
                margin-bottom: 14px; padding: 12px; background: #f8fafc;
@@ -1491,9 +1663,17 @@ const activeFilters = {
   domains: new Set(),
   personas: new Set(),
   tools: new Set(),
+  // `compare` is multi-select (Set), populated only when --baseline was
+  // provided. Values: "regression", "persistent_failure", "fixed",
+  // "new_case". Empty Set = no comparison filter.
+  compare: new Set(),
   param_min: null,
   param_max: null,
 };
+
+// Baseline filename injected by render_html. Empty string means
+// no comparison was loaded, so the detail banner stays hidden.
+const BASELINE_NAME = __BASELINE_NAME__;
 
 function esc(s) {
   if (s == null) return "";
@@ -1595,6 +1775,16 @@ function matchesFilters(c) {
     }
   }
   if (activeFilters.flag === "span_errors" && !c.has_span_error) return false;
+  if (activeFilters.compare && activeFilters.compare.size) {
+    // OR within the group: case matches if any selected baseline-comparison
+    // flag is true on the case. Flags are mutually exclusive per case
+    // (regression / persistent / fixed / new_case) so OR is what we want.
+    let hit = false;
+    for (const v of activeFilters.compare) {
+      if (c[v]) { hit = true; break; }
+    }
+    if (!hit) return false;
+  }
   if (activeFilters.scorer_pairs && activeFilters.scorer_pairs.length) {
     // Group by scorer: OR within a scorer, AND across scorers.
     const grouped = {};
@@ -1649,6 +1839,41 @@ function outcomeBadge(c) {
   return `<span class="fm-badge badge-na" title="issue_bucket=${esc(c.issue_bucket || "(empty)")}">?</span>`;
 }
 
+// One-line banner in the case-detail header showing how this case
+// compares to the baseline run. Only rendered when a baseline was
+// loaded (BASELINE_NAME is non-empty).
+function compareBannerHtml(c) {
+  if (!BASELINE_NAME) return "";
+  let arrow, cls;
+  if (c.new_case) {
+    arrow = "(no baseline)";
+    cls = "fm-new";
+  } else {
+    const prev = c.prev_pass ? "PASS" : "FAIL";
+    const now = c.issue_bucket === "pass" ? "PASS" : "FAIL";
+    arrow = `${prev} → ${now}`;
+    if (c.regression) cls = "fm-regression";
+    else if (c.persistent_failure) cls = "fm-persistent";
+    else if (c.fixed) cls = "fm-fixed";
+    else cls = "fm-pass";
+  }
+  return `<div class="compare-banner ${cls}">
+    Compared to <code>${esc(BASELINE_NAME)}</code>:
+    <strong>${esc(arrow)}</strong>
+  </div>`;
+}
+
+// Pill rendered next to the outcome badge in the case list and in
+// the case-detail header. Mutually exclusive — at most one of
+// regression / persistent / fixed / new_case is true per case.
+function compareBadge(c) {
+  if (c.regression) return `<span class="fm-badge fm-regression" title="Passed in baseline, fails now">regression</span>`;
+  if (c.persistent_failure) return `<span class="fm-badge fm-persistent" title="Failed in both runs">persistent</span>`;
+  if (c.fixed) return `<span class="fm-badge fm-fixed" title="Failed in baseline, passes now">fixed</span>`;
+  if (c.new_case) return `<span class="fm-badge fm-new" title="Not present in baseline">new</span>`;
+  return "";
+}
+
 function scoreBadge(label, value, kind) {
   if (value === null || value === undefined || Number.isNaN(value)) {
     return `<span class="badge badge-na" title="${esc(label)}: not scored">${esc(label)}: –</span>`;
@@ -1701,6 +1926,12 @@ function updateActiveFilterBanner() {
   if (activeFilters.tools.size) {
     msgs.push(`tool ∈ {<strong>${[...activeFilters.tools].map(esc).join(", ")}</strong>}`);
   }
+  if (activeFilters.compare && activeFilters.compare.size) {
+    const labels = {regression: "regression", persistent_failure: "persistent fail",
+                    fixed: "fixed", new_case: "new"};
+    const parts = [...activeFilters.compare].map(v => esc(labels[v] || v));
+    msgs.push(`vs. baseline ∈ {<strong>${parts.join(", ")}</strong>}`);
+  }
   if (activeFilters.param_min != null || activeFilters.param_max != null) {
     const a = activeFilters.param_min == null ? "" : activeFilters.param_min;
     const b = activeFilters.param_max == null ? "" : activeFilters.param_max;
@@ -1718,7 +1949,7 @@ function syncChipStates() {
   document.querySelectorAll(".chip[data-group]").forEach(btn => {
     const group = btn.dataset.group;
     const value = btn.dataset.value;
-    if (group === "domains" || group === "personas" || group === "tools") {
+    if (group === "domains" || group === "personas" || group === "tools" || group === "compare") {
       btn.classList.toggle("active", activeFilters[group].has(value));
     } else {
       btn.classList.toggle("active", activeFilters[group] === value);
@@ -1752,6 +1983,7 @@ function renderList() {
       <li data-id="${esc(c.id)}" class="${c.id === activeCaseId ? 'active' : ''}">
         <span class="case-id">${esc(c.id)}</span>
         ${outcomeBadge(c)}
+        ${compareBadge(c)}
         ${c.domain ? `<span class="badge badge-na">${esc(c.domain)}</span>` : ""}
         <span style="margin-left:auto;font-weight:600;color:#135ee2">${c.score_mean != null ? c.score_mean.toFixed(2) : '–'}</span>
         <span class="case-q">${esc(shortText(c.query, 110))}</span>
@@ -1773,7 +2005,7 @@ function bindChips() {
     btn.addEventListener("click", () => {
       const group = btn.dataset.group;
       const value = btn.dataset.value;
-      if (group === "domains" || group === "personas" || group === "tools") {
+      if (group === "domains" || group === "personas" || group === "tools" || group === "compare") {
         if (activeFilters[group].has(value)) activeFilters[group].delete(value);
         else activeFilters[group].add(value);
       } else {
@@ -1807,6 +2039,7 @@ function clearAllFilters() {
   activeFilters.domains.clear();
   activeFilters.personas.clear();
   activeFilters.tools.clear();
+  if (activeFilters.compare) activeFilters.compare.clear();
   activeFilters.param_min = null;
   activeFilters.param_max = null;
   ["param-min", "param-max"].forEach(id => {
@@ -2090,11 +2323,13 @@ function selectCase(id) {
     <h2 class="case-detail-title" style="font-size:16px;margin-bottom:8px">
       <span style="font-weight:700">${esc(c.id)}</span>
       ${outcomeBadge(c)}
+      ${compareBadge(c)}
       ${c.domain ? `<span class="badge badge-na">${esc(c.domain)}</span>` : ""}
       ${c.persona ? `<span class="badge badge-na">${esc(c.persona)}</span>` : ""}
       ${spanErrorChipHtml(c)}
       ${c.trace_id ? `<span style="font-size:11px;color:#5c7999">trace: <code>${esc(c.trace_id)}</code></span>` : ""}
     </h2>
+    ${compareBannerHtml(c)}
     <div style="margin-bottom:10px">${routeChips(c)}</div>
     ${scorerPlanLine(c)}
     ${scoreStripHtml(c)}
@@ -2145,10 +2380,15 @@ function selectCase(id) {
       </div>
       <div class="detail-section">
         <h3>Actual response
+          ${c.actual_response_en ? `<span class="lang-switch" data-target="actual-resp-body">
+            <button type="button" class="lang-seg active" data-lang="orig">orig</button>
+            <button type="button" class="lang-seg" data-lang="en">EN</button>
+          </span>` : ""}
           <button type="button" class="body-toggle" data-target="actual-resp-body">expand</button>
         </h3>
         <div class="bodywrap" id="actual-resp-body">
-          <div class="body">${esc(c.actual_response || "–")}</div>
+          <div class="body lang-orig">${esc(c.actual_response || "–")}</div>
+          ${c.actual_response_en ? `<div class="body lang-en" style="display:none">${esc(c.actual_response_en)}</div>` : ""}
         </div>
       </div>
     </div>
@@ -2376,6 +2616,32 @@ document.addEventListener("click", e => {
   }
 });
 
+// Language switch (Actual response). Segmented two-button control —
+// `data-lang` on the clicked segment decides which body is shown. The
+// non-clicked segment becomes the next click target, so the label
+// always describes a switch action rather than a current state.
+document.addEventListener("click", e => {
+  const seg = e.target.closest && e.target.closest(".lang-seg");
+  if (!seg) return;
+  const switchEl = seg.closest(".lang-switch");
+  if (!switchEl) return;
+  const wrap = document.getElementById(switchEl.dataset.target);
+  if (!wrap) return;
+  const orig = wrap.querySelector(".lang-orig");
+  const en   = wrap.querySelector(".lang-en");
+  if (!orig || !en) return;
+  const lang = seg.dataset.lang;
+  if (lang === "en") {
+    orig.style.display = "none";
+    en.style.display = "";
+  } else {
+    orig.style.display = "";
+    en.style.display = "none";
+  }
+  switchEl.querySelectorAll(".lang-seg").forEach(b =>
+    b.classList.toggle("active", b === seg));
+});
+
 // Drill-down links: Summary table cells + Top Problem case links.
 document.addEventListener("click", e => {
   const caseA = e.target.closest && e.target.closest("a.case-link");
@@ -2407,6 +2673,18 @@ document.addEventListener("click", e => {
       renderList();
     }
   }
+  const compareA = e.target.closest && e.target.closest("[data-compare-filter]");
+  if (compareA) {
+    e.preventDefault();
+    const v = compareA.dataset.compareFilter;
+    if (v) {
+      clearAllFilters();
+      activeFilters.compare.add(v);
+      document.querySelector('[data-target="tab-cases"]').click();
+      renderList();
+    }
+    return;
+  }
   const scorerA = e.target.closest && e.target.closest("a.scorer-filter-link");
   if (scorerA) {
     e.preventDefault();
@@ -2434,10 +2712,12 @@ renderList();
 
 # ─── render_html ────────────────────────────────────────────────────────
 
-def render_html(df: pd.DataFrame, *, input_path: Path, output_path: Path) -> str:
-    metrics = compute_metrics(df)
+def render_html(df: pd.DataFrame, *, input_path: Path, output_path: Path,
+                baseline: dict[str, dict[str, Any]] | None = None,
+                baseline_path: Path | None = None) -> str:
+    metrics = compute_metrics(df, baseline=baseline)
     summaries = scorer_summary(df)
-    cases = case_payload(df)
+    cases = case_payload(df, baseline=baseline)
     # MLflow run time = earliest trace request_time (ms-since-epoch). For
     # a single-run CSV this equals when the run started; for a mixed CSV
     # it's the start of the earliest trace, which is still the most useful
@@ -2454,6 +2734,20 @@ def render_html(df: pd.DataFrame, *, input_path: Path, output_path: Path) -> str
     git_commit = (_git_commit_full[:10] if _git_commit_full not in ("–", None) and len(_git_commit_full) >= 10
                   else _git_commit_full)
     js = JS.replace("__CASES__", json.dumps(cases, ensure_ascii=False))
+    # Inject the baseline filename into the JS (used by the case-detail
+    # comparison banner). Empty string when no baseline was loaded — the
+    # JS reads that as "skip the banner".
+    baseline_name = baseline_path.name if baseline_path is not None else ""
+    js = js.replace("__BASELINE_NAME__", json.dumps(baseline_name, ensure_ascii=False))
+
+    # Header line surfacing the baseline filename — only when --baseline
+    # was provided so the existing single-input report is byte-identical.
+    if baseline_path is not None:
+        baseline_header_line = (
+            f"<span>Baseline: <code>{_h(baseline_path.name)}</code></span>"
+        )
+    else:
+        baseline_header_line = ""
 
     domains = sorted({str(v) for v in df.get("eval_domain", pd.Series(dtype=str)).dropna().unique() if str(v).strip()})
     personas = sorted({str(v) for v in df.get("eval_persona", pd.Series(dtype=str)).dropna().unique() if str(v).strip()})
@@ -2475,6 +2769,23 @@ def render_html(df: pd.DataFrame, *, input_path: Path, output_path: Path) -> str
     domain_group = _chip_group("Domain", "domains", [(d, d) for d in domains], foldable=True) if domains else ""
     persona_group = _chip_group("Persona", "personas", [(p, p) for p in personas], foldable=True) if personas else ""
     tool_group = _chip_group("Tool", "tools", [(t, t) for t in tools], foldable=True) if tools else ""
+
+    # "Vs. baseline" filter group — only rendered when --baseline was provided.
+    # Multi-select (Set semantics in JS, matching domains / personas / tools),
+    # so e.g. "Regression + Persistent fail" can be combined.
+    if baseline is not None:
+        compare_group = _chip_group(
+            "Vs. baseline",
+            "compare",
+            [
+                ("regression",         "Regression"),
+                ("persistent_failure", "Persistent fail"),
+                ("fixed",              "Fixed"),
+                ("new_case",           "New"),
+            ],
+        )
+    else:
+        compare_group = ""
 
     # Tooltip strings hoisted out of the f-string template — newlines
     # inside an `_info_icon(...)` call inside an f-string expression are
@@ -2531,6 +2842,7 @@ def render_html(df: pd.DataFrame, *, input_path: Path, output_path: Path) -> str
       </div>
       <div class="header-footer">
         <span>Input: <code>{_h(input_path.name)}</code></span>
+        {baseline_header_line}
       </div>
     </div>
   </div>
@@ -2613,6 +2925,7 @@ def render_html(df: pd.DataFrame, *, input_path: Path, output_path: Path) -> str
               <button class="range-reset" id="param-reset">reset</button>
             </div>
           </div>
+          {compare_group}
           <div class="filter-group">
             <span class="filter-label">Flags</span>
             <button class="chip chip-err" data-group="flag" data-value="span_errors"
@@ -2661,6 +2974,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, default=default_input_path(), help="Scored traces CSV.")
     parser.add_argument("--output", type=Path, default=None, help="Output HTML report path.")
+    parser.add_argument("--baseline", type=Path, default=None,
+                        help="Optional previous-run enriched-traces CSV. When set, "
+                             "the report adds Regression / Persistent / Fixed / New "
+                             "filters on the Test Cases tab and a Regressions card "
+                             "on the Summary tab. Cases are joined by test_case_id.")
     args = parser.parse_args()
 
     input_path = args.input.expanduser().resolve()
@@ -2668,9 +2986,19 @@ def main() -> None:
         raise FileNotFoundError(f"Input CSV does not exist: {input_path}")
     output_path = (args.output.expanduser().resolve() if args.output else default_output_path(input_path))
 
+    baseline_path: Path | None = None
+    baseline_lookup: dict[str, dict[str, Any]] | None = None
+    if args.baseline is not None:
+        baseline_path = args.baseline.expanduser().resolve()
+        if not baseline_path.exists():
+            raise FileNotFoundError(f"Baseline CSV does not exist: {baseline_path}")
+        baseline_lookup = load_baseline(baseline_path)
+        print(f"[baseline] loaded {len(baseline_lookup)} cases from {baseline_path.name}")
+
     df = pd.read_csv(input_path)
     df = enrich(df)
-    html_text = render_html(df, input_path=input_path, output_path=output_path)
+    html_text = render_html(df, input_path=input_path, output_path=output_path,
+                            baseline=baseline_lookup, baseline_path=baseline_path)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(html_text, encoding="utf-8")
