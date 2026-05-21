@@ -109,6 +109,10 @@ class AssessmentNames:
     EXPECTED_RESPONSE = "expected_response"
     GUIDELINES = "guidelines"
     SCORERS = "scorers"
+    # Per-ENUM relevance weights set by the test author for KB cases.
+    # Same payload shape used by SKKB (dict[str, int|float]); the keys
+    # are the expected ENUM IDs and the values are relevance weights.
+    TARGET_ENUMS_TO_RELEVANCE = "target_enums_to_relevance"
 
 
 # Read the canonical assessment name first, fall back to legacy. Each
@@ -2240,6 +2244,14 @@ def parse_trace_mlflow(
     guidelines = assessments.get(AssessmentNames.GUIDELINES) or []
     scorers_to_run = _normalize_scorers_to_run(assessments.get(AssessmentNames.SCORERS))
 
+    # Ground-truth KB-retrieval ENUMs (KB / KB&API cases only). Same
+    # extraction helper used by parse_trace_skkb so the shape matches.
+    # Returns ("{}", {}) when the assessment is absent — non-KB cases.
+    ter_value_str, expected_enums_weights = _extract_expected_enums_weights(
+        assessments.get(AssessmentNames.TARGET_ENUMS_TO_RELEVANCE) or {}
+    )
+    expected_enums = sorted(expected_enums_weights.keys())
+
     actual_agents_path, actual_agent = _extract_actual_agent_path(spans)
     actual_tool_calls = _extract_actual_tool_calls(spans)
     actual_response = extract_agent_answer_span(spans)
@@ -2269,6 +2281,8 @@ def parse_trace_mlflow(
         "expected_response": expected_response,
         "guidelines": guidelines,
         "scorers_to_run": scorers_to_run,
+        "expected_enums": expected_enums,
+        "expected_enums_weights": ter_value_str,
         "actual_agent": actual_agent,
         "actual_agents_path": actual_agents_path,
         "actual_tool_calls": actual_tool_calls,
