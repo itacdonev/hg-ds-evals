@@ -1925,6 +1925,178 @@ def _info_icon(tip: str) -> str:
     return f'<span class="info-icon" data-tip="{_h(tip)}">{_INFO_ICON}</span>'
 
 
+# ─── Prompts tab (run-level system prompts + tool descriptions) ─────────
+# Sidecar JSON `prompt_{mlflow_run_id}.json` is produced by the import
+# notebook (write_prompt_sidecar). It carries the supervisor prompt,
+# sub-agent prompts, and the union of tool descriptions. The per-trace
+# *_prompt_hash + tool_descriptions_hash columns on the checkpoint let
+# us flag runs that mixed multiple deploys.
+
+import hashlib as _hashlib  # noqa: E402
+
+_EMPTY_PROMPT_HASH = _hashlib.md5(b"").hexdigest()[:10]
+
+_PROMPT_HASH_COLS = (
+    ("main_agent_prompt_hash", "Supervisor (main_agent) prompt"),
+    ("daily_banking_agent_prompt_hash", "daily_banking_agent prompt"),
+    ("tool_descriptions_hash", "Tool descriptions"),
+)
+
+
+def _load_prompt_sidecar(prompts_path: Path | None,
+                          checkpoint_path: Path | None,
+                          run_id: str) -> dict | None:
+    """Find ``prompt_{run_id}.json``: explicit flag → next to checkpoint."""
+    candidate: Path | None = None
+    if prompts_path is not None:
+        if prompts_path.is_dir():
+            candidate = prompts_path / f"prompt_{run_id}.json" if run_id else None
+        else:
+            candidate = prompts_path
+    elif checkpoint_path is not None and run_id:
+        candidate = checkpoint_path.parent / f"prompt_{run_id}.json"
+    if candidate is None or not candidate.exists():
+        return None
+    try:
+        return json.loads(candidate.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def _prompt_hash_warnings(df: pd.DataFrame) -> list[dict]:
+    warnings: list[dict] = []
+    for col, label in _PROMPT_HASH_COLS:
+        if col not in df.columns:
+            continue
+        series = df[col].dropna()
+        series = series[series.astype(str).str.len() > 0]
+        if series.empty:
+            continue
+        counts = series.value_counts()
+        has_missing = _EMPTY_PROMPT_HASH in counts.index
+        if len(counts) == 1 and not has_missing:
+            continue
+        id_col = "trace_id" if "trace_id" in df.columns else (
+            "id" if "id" in df.columns else None
+        )
+        breakdown: list[dict] = []
+        for hash_value, count in counts.items():
+            if id_col is not None:
+                sample_ids = df.loc[df[col] == hash_value, id_col].head(3).tolist()
+            else:
+                sample_ids = []
+            breakdown.append({
+                "hash": str(hash_value),
+                "count": int(count),
+                "is_missing": str(hash_value) == _EMPTY_PROMPT_HASH,
+                "sample_trace_ids": [str(t) for t in sample_ids if t],
+            })
+        warnings.append({
+            "column": col,
+            "label": label,
+            "distinct": int(len(counts)),
+            "total": int(series.shape[0]),
+            "has_missing": has_missing,
+            "breakdown": breakdown,
+        })
+    return warnings
+
+
+def _prompt_warning_card(warnings: list[dict]) -> str:
+    if not warnings:
+        return ""
+    items: list[str] = []
+    for w in warnings:
+        rows: list[str] = []
+        for b in w["breakdown"]:
+            sample = ", ".join(b["sample_trace_ids"]) or "–"
+            tag = (
+                "<span class='prompt-missing-tag'>missing</span>"
+                if b["is_missing"] else ""
+            )
+            rows.append(
+                "<tr>"
+                f"<td><code>{_h(b['hash'])}</code> {tag}</td>"
+                f"<td class='num-cell'>{b['count']}</td>"
+                f"<td><code>{_h(sample)}</code></td>"
+                "</tr>"
+            )
+        headline = (
+            f"<strong>{_h(w['label'])}</strong>: "
+            f"{w['distinct']} distinct hashes across {w['total']} traces"
+        )
+        if w["has_missing"]:
+            headline += " — includes traces with no prompt extracted"
+        items.append(
+            "<div class='prompt-warning-item'>"
+            f"<div>{headline}</div>"
+            "<table class='tbl prompt-warning-tbl'>"
+            "<thead><tr><th>Hash</th><th>Traces</th><th>Sample trace IDs</th></tr></thead>"
+            f"<tbody>{''.join(rows)}</tbody>"
+            "</table>"
+            "</div>"
+        )
+    return (
+        "<div class='card prompt-warning-card'>"
+        "<div class='card-title prompt-warning-title'>"
+        "⚠ Prompt / tool-registry mismatch detected"
+        f"{_info_icon('A uniform eval run produces one hash per agent-prompt and one for the tool-registry. More than one — or any trace with no prompt at all — means the run mixed deploys or had span-extraction failures.')}"
+        "</div>"
+        f"{''.join(items)}"
+        "</div>"
+    )
+
+
+def _prompts_tab(sidecar: dict | None, run_id: str) -> str:
+    if not sidecar:
+        return (
+            "<div class='card'>"
+            "<div class='card-title'>Prompts</div>"
+            "<p class='prompt-empty'>No prompt sidecar found for this run. "
+            f"Expected <code>prompt_{_h(run_id) or '&lt;run_id&gt;'}.json</code> "
+            "next to the checkpoint CSV (or pass <code>--prompts</code>). Re-run "
+            "the import notebook to produce one for new runs.</p>"
+            "</div>"
+        )
+
+    supervisor = sidecar.get("main_agent_system_prompt") or ""
+    dba_prompt = sidecar.get("daily_banking_agent_system_prompt") or ""
+    tool_descriptions = sidecar.get("tool_descriptions") or {}
+
+    def _block(label: str, body: str, *, open_: bool = False) -> str:
+        attr = " open" if open_ else ""
+        empty_note = " <em class='prompt-empty-note'>(not extracted from any trace)</em>" if not body.strip() else ""
+        return (
+            f"<details class='prompt-block'{attr}>"
+            f"<summary>{_h(label)}{empty_note}</summary>"
+            f"<pre class='prompt-pre'>{_h(body)}</pre>"
+            "</details>"
+        )
+
+    tool_blocks = "".join(
+        _block(name, tool_descriptions.get(name) or "")
+        for name in sorted(tool_descriptions.keys())
+    )
+    tool_section = tool_blocks or "<p class='prompt-empty'>No tool descriptions captured for this run.</p>"
+
+    return (
+        "<div class='card prompts-card'>"
+        "<div class='card-title'>Supervisor prompt</div>"
+        f"{_block('main_agent', supervisor, open_=True)}"
+        "</div>"
+        "<div class='card prompts-card'>"
+        "<div class='card-title'>Agent prompts</div>"
+        f"{_block('daily_banking_agent', dba_prompt)}"
+        "</div>"
+        "<div class='card prompts-card'>"
+        "<div class='card-title'>"
+        f"Tool descriptions <span class='tool-count'>({len(tool_descriptions)})</span>"
+        "</div>"
+        f"{tool_section}"
+        "</div>"
+    )
+
+
 def _ids_filter_link(ids: list[str], label: str, *, classes: str = "judge-eval-link",
                        inner: str = "") -> str:
     """Inline link that filters the Test Cases tab to ``ids`` when clicked."""
@@ -3745,6 +3917,26 @@ code { font-family: monospace; font-size: 12px; background: #e7effd; padding: 1p
 /* Summary tab gets a soft blue background so it reads as the "home" tab. */
 .tab-btn.tab-home { background: #eef4fd; }
 .tab-btn.tab-home:hover { background: #e0eafd; }
+/* Prompts tab + summary mismatch warning. */
+.prompts-card { margin-bottom: 16px; }
+.prompts-card .tool-count { color: #5c7999; font-weight: 400; font-size: 12px; }
+.prompt-block { margin: 6px 0; border: 1px solid #e4eaf0; border-radius: 4px;
+                background: #fafbfc; }
+.prompt-block > summary { cursor: pointer; padding: 8px 12px; font-weight: 500;
+                          font-family: ui-monospace, Menlo, monospace; font-size: 13px; }
+.prompt-block[open] > summary { border-bottom: 1px solid #e4eaf0; background: #f3f6fa; }
+.prompt-pre { margin: 0; padding: 12px 14px; font-family: ui-monospace, Menlo, monospace;
+              font-size: 12.5px; line-height: 1.5; white-space: pre-wrap; word-break: break-word;
+              max-height: 60vh; overflow-y: auto; }
+.prompt-empty { color: #5c7999; font-style: italic; margin: 8px 0; }
+.prompt-empty-note { color: #5c7999; font-weight: 400; font-size: 12px; }
+.prompt-warning-card { border-left: 3px solid #d83a3a; background: #fff5f5; margin-bottom: 16px; }
+.prompt-warning-title { color: #b32424; }
+.prompt-warning-item { margin-top: 8px; }
+.prompt-warning-item + .prompt-warning-item { border-top: 1px dashed #f0c5c5; padding-top: 8px; }
+.prompt-warning-tbl { margin-top: 4px; }
+.prompt-missing-tag { display: inline-block; padding: 1px 6px; border-radius: 3px;
+                       background: #fbe2e2; color: #b32424; font-size: 11px; margin-left: 6px; }
 .tab-btn.tab-home.active { background: #d8e6fc; }
 /* KB browser tab — very pale hooker-green tint to mark it as the
    reference / browse-knowledge surface (separate from the Summary "home"
@@ -7159,7 +7351,9 @@ def render_html(df: pd.DataFrame, *, df_all: pd.DataFrame | None = None,
                 mlflow_run_id: str = "",
                 mlflow_experiment_id: str = "",
                 mlflow_run_timestamp: str = "",
-                include_latency: bool = False) -> str:
+                include_latency: bool = False,
+                checkpoint_path: Path | None = None,
+                prompts_path: Path | None = None) -> str:
     if df_all is None:
         df_all = df
     if not experiment_name:
@@ -7198,6 +7392,11 @@ def render_html(df: pd.DataFrame, *, df_all: pd.DataFrame | None = None,
     summary_metrics = compute_summary_metrics(df, df_all)
     naming_mismatches_agg = _aggregate_naming_mismatches(df)
     pass_rate = df["pass"].mean()
+
+    prompts_sidecar = _load_prompt_sidecar(prompts_path, checkpoint_path, mlflow_run_id)
+    prompt_warnings = _prompt_hash_warnings(df_all if df_all is not None else df)
+    prompt_warning_card = _prompt_warning_card(prompt_warnings)
+    prompts_tab_html = _prompts_tab(prompts_sidecar, mlflow_run_id)
 
     def _count_cell(dim: str, score: int, n: int) -> str:
         """Clickable count cell — jumps to Test Cases with dim+score applied."""
@@ -7598,6 +7797,7 @@ def render_html(df: pd.DataFrame, *, df_all: pd.DataFrame | None = None,
     <button class="tab-btn tab-home active" data-target="tab-summary">Summary</button>
     <button class="tab-btn" data-target="tab-cases">Test Cases</button>
     <button class="tab-btn" data-target="tab-issues">Issues</button>
+    <button class="tab-btn" data-target="tab-prompts">Prompts</button>
     {'<button class="tab-btn" data-target="tab-latency">Latency</button>' if include_latency else ''}
     <button class="tab-btn" data-target="tab-dims">Scorers</button>
     <button class="tab-btn" data-target="tab-missed">Retrieval Findings</button>
@@ -7616,6 +7816,7 @@ def render_html(df: pd.DataFrame, *, df_all: pd.DataFrame | None = None,
 <main class="content">
 
   <div id="tab-summary" class="tab-panel active">
+    {prompt_warning_card}
     <div class="headline-row headline-row-3">
       <div class="headline-card pass-rate-card">
         <div class="hc-label">Pass rate · excl. test-set issues {_info_icon(pass_rate_tooltip)}
@@ -7850,6 +8051,10 @@ def render_html(df: pd.DataFrame, *, df_all: pd.DataFrame | None = None,
         {_plot(fig_fm_cooccurrence, div_id="fm-cooccurrence-chart") if fig_fm_cooccurrence is not None else "<p class='placeholder'>not enough data to compute co-occurrence</p>"}
       </div>
     </div>
+  </div>
+
+  <div id="tab-prompts" class="tab-panel">
+    {prompts_tab_html}
   </div>
 
   {latency_tab_panel}
@@ -8205,6 +8410,10 @@ def main():
                          "the header reads reasoning_effort directly from the YAML.")
     ap.add_argument("--suffix", default="",
                     help="optional filename suffix (e.g. '_test' for a test run)")
+    ap.add_argument("--prompts", default=None, type=Path,
+                    help="Path to the prompt sidecar JSON (or its directory). "
+                         "If omitted, the report looks for "
+                         "prompt_{mlflow_run_id}.json next to the checkpoint.")
     ap.add_argument("--include-latency", action="store_true",
                     help="Include the experimental Latency surfaces "
                          "(headline card on Summary row 2, Latency tab, "
@@ -8258,6 +8467,8 @@ def main():
         mlflow_experiment_id=meta["mlflow_experiment_id"],
         mlflow_run_timestamp=meta["mlflow_run_timestamp"],
         include_latency=args.include_latency,
+        checkpoint_path=ckpt,
+        prompts_path=args.prompts,
     )
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(html_str)

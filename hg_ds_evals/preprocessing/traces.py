@@ -32,6 +32,7 @@ import json
 import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -1849,18 +1850,47 @@ def _get_agent_chat_system_prompt(
     return ""
 
 
+def extract_agent_system_prompts(
+    spans: list[dict[str, Any]],
+    children: dict[str, list[dict[str, Any]]],
+) -> dict[str, str]:
+    """Return the timestamp-stripped system prompts for the named agents.
+
+    Empty string when the corresponding agent span or ChatDatabricks system
+    message is missing. The stripping mirrors what the hash sees, so the
+    hash of the returned text equals the column hash.
+    """
+    main_raw = _get_agent_chat_system_prompt(spans, children, "main_agent")
+    dba_raw = _get_agent_chat_system_prompt(spans, children, "daily_banking_agent")
+    return {
+        "main_agent_system_prompt": _TS_TAIL_RE.sub("", main_raw).rstrip(),
+        "daily_banking_agent_system_prompt": _TS_TAIL_RE.sub("", dba_raw).rstrip(),
+    }
+
+
 def extract_agent_prompt_hashes(
     spans: list[dict[str, Any]],
     children: dict[str, list[dict[str, Any]]],
 ) -> dict[str, str]:
-    main_raw = _get_agent_chat_system_prompt(spans, children, "main_agent")
-    dba_raw = _get_agent_chat_system_prompt(spans, children, "daily_banking_agent")
-    main_stripped = _TS_TAIL_RE.sub("", main_raw).rstrip()
-    dba_stripped = _TS_TAIL_RE.sub("", dba_raw).rstrip()
+    prompts = extract_agent_system_prompts(spans, children)
     return {
-        "main_agent_prompt_hash": _md5_short(main_stripped),
-        "daily_banking_agent_prompt_hash": _md5_short(dba_stripped),
+        "main_agent_prompt_hash": _md5_short(prompts["main_agent_system_prompt"]),
+        "daily_banking_agent_prompt_hash": _md5_short(prompts["daily_banking_agent_system_prompt"]),
     }
+
+
+def hash_tool_descriptions(tool_descriptions: dict[str, str]) -> str:
+    """Stable hash of a tool-name → description mapping.
+
+    Sorted-key JSON serialization so hash equality means semantic equality
+    regardless of insertion order. Empty registry hashes the same as the
+    empty string, so an absent / missing-span case stays distinguishable
+    from a non-empty registry that happens to be uniform.
+    """
+    if not tool_descriptions:
+        return _md5_short("")
+    canonical = json.dumps(tool_descriptions, sort_keys=True, ensure_ascii=False)
+    return _md5_short(canonical)
 
 
 # ── KB pipeline problem-cause + dataframe-level helpers ────────────────
@@ -2061,6 +2091,10 @@ def parse_trace_skkb(test_case_id: str, trace: dict[str, Any]) -> dict[str, Any]
         reranked_enum_ids = []
 
     agent_hashes = extract_agent_prompt_hashes(spans, children)
+    available_tools, tool_descriptions, _ = _extract_tool_registry(spans)
+    tool_descriptions_hash = hash_tool_descriptions(tool_descriptions)
+    trace_metadata_map = _coerce_mapping(info.get("trace_metadata"))
+    source_run_id = _to_str(trace_metadata_map.get("mlflow.sourceRun"))
     calls = extract_agent_and_tool_calls(spans)
     query_scope = classify_query_scope(calls["agents_called"], calls["tools_called"])
     trace_invariant_violations = check_trace_invariants(
@@ -2198,6 +2232,10 @@ def parse_trace_skkb(test_case_id: str, trace: dict[str, Any]) -> dict[str, Any]
     }
     record.update({key: value for key, value in reranker.items() if key != "reranker_raw_selected_ids"})
     record.update(agent_hashes)
+    record["available_tools"] = available_tools
+    record["tool_descriptions"] = tool_descriptions
+    record["tool_descriptions_hash"] = tool_descriptions_hash
+    record["source_run_id"] = source_run_id
     return record
 
 
@@ -2257,6 +2295,9 @@ def parse_trace_mlflow(
     actual_response = extract_agent_answer_span(spans)
 
     available_tools, tool_descriptions, registry_by_node = _extract_tool_registry(spans)
+    tool_descriptions_hash = hash_tool_descriptions(tool_descriptions)
+    children = _build_span_children(spans)
+    agent_hashes = extract_agent_prompt_hashes(spans, children)
 
     token_usage = _decode_json(trace_metadata.get("mlflow.trace.tokenUsage")) or {}
     git_branch = _to_str(trace_metadata.get("mlflow.source.git.branch"))
@@ -2289,9 +2330,11 @@ def parse_trace_mlflow(
         "actual_response": actual_response,
         "available_tools": available_tools,
         "tool_descriptions": tool_descriptions,
+        "tool_descriptions_hash": tool_descriptions_hash,
         "tool_registry_by_node": {
             node: list(tools.keys()) for node, tools in registry_by_node.items()
         },
+        **agent_hashes,
         "architecture": architecture,
         "model": _extract_model(spans),
         "token_usage": token_usage,
@@ -2373,3 +2416,63 @@ def build_dataframe_from_mlflow_traces(traces_df: pd.DataFrame) -> MlflowParseRe
         untagged_trace_ids=untagged,
         run_tool_registry=run_registry,
     )
+
+
+def collect_run_prompts(traces_df: pd.DataFrame) -> dict[str, Any]:
+    """Pull run-level system prompts + tool descriptions out of raw traces.
+
+    Walks every row of the mlflow.search_traces output. For each agent's
+    system prompt, returns the first non-empty value encountered. For tool
+    descriptions, returns the union by tool name (description from the
+    first row that defined it — the registry is stable within a run).
+
+    Output shape matches :func:`write_prompt_sidecar`'s JSON payload.
+    Per-trace uniformity is verified separately via the ``*_prompt_hash``
+    and ``tool_descriptions_hash`` columns on the parsed dataframe.
+    """
+    main_prompt = ""
+    dba_prompt = ""
+    tool_descriptions: dict[str, str] = {}
+
+    for raw_row in traces_df.to_dict(orient="records"):
+        try:
+            canonical = normalize_mlflow_trace_row(raw_row)
+        except Exception:
+            continue
+        spans = canonical.get("data", {}).get("spans") or []
+        if not main_prompt or not dba_prompt:
+            children = _build_span_children(spans)
+            prompts = extract_agent_system_prompts(spans, children)
+            if not main_prompt:
+                main_prompt = prompts["main_agent_system_prompt"]
+            if not dba_prompt:
+                dba_prompt = prompts["daily_banking_agent_system_prompt"]
+        _, descriptions, _ = _extract_tool_registry(spans)
+        for name, desc in descriptions.items():
+            tool_descriptions.setdefault(name, desc)
+
+    return {
+        "main_agent_system_prompt": main_prompt,
+        "daily_banking_agent_system_prompt": dba_prompt,
+        "tool_descriptions": tool_descriptions,
+    }
+
+
+def write_prompt_sidecar(
+    traces_df: pd.DataFrame,
+    run_id: str,
+    out_dir: Path | str,
+) -> Path:
+    """Write ``prompt_{run_id}.json`` next to the traces CSV.
+
+    Sidecar carries the run-level system prompts + tool descriptions in
+    full text. The CSV stores only the per-trace hashes; reports load
+    this file to display the prompts and use the hashes to flag any
+    cross-trace inconsistency.
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    payload = {"run_id": run_id, **collect_run_prompts(traces_df)}
+    path = out_dir / f"prompt_{run_id}.json"
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
+    return path

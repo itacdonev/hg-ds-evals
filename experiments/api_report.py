@@ -1040,6 +1040,184 @@ def _top_problem_cases(df: pd.DataFrame, limit: int = 15) -> str:
     )
 
 
+# ─── Prompts tab ────────────────────────────────────────────────────────
+# Reads `prompt_{source_run_id}.json` (written by write_prompt_sidecar in
+# the import notebook) and surfaces the supervisor + sub-agent system
+# prompts and the run's tool descriptions on a dedicated tab. Per-trace
+# hash columns let us flag runs that mix multiple deploys (uniform run ⇒
+# nunique == 1 on each hash column).
+
+import hashlib as _hashlib  # noqa: E402
+
+_EMPTY_PROMPT_HASH = _hashlib.md5(b"").hexdigest()[:10]
+
+_PROMPT_HASH_COLS = (
+    ("main_agent_prompt_hash", "Supervisor (main_agent) prompt"),
+    ("daily_banking_agent_prompt_hash", "daily_banking_agent prompt"),
+    ("tool_descriptions_hash", "Tool descriptions"),
+)
+
+
+def _load_prompt_sidecar(input_path: Path, source_run_id: str,
+                          prompts_path: Path | None = None) -> dict[str, Any] | None:
+    """Locate the prompt sidecar JSON: explicit flag → next to input CSV."""
+    candidate: Path | None = None
+    if prompts_path is not None:
+        candidate = prompts_path
+        if candidate.is_dir() and source_run_id:
+            candidate = candidate / f"prompt_{source_run_id}.json"
+    elif source_run_id and source_run_id not in ("–", "—", "mixed"):
+        candidate = input_path.parent / f"prompt_{source_run_id}.json"
+    if candidate is None or not candidate.exists():
+        return None
+    try:
+        return json.loads(candidate.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def _prompt_hash_warnings(df: pd.DataFrame) -> list[dict[str, Any]]:
+    """Per-column breakdown for any prompt/tool hash that isn't uniform.
+
+    Empty rows for a given hash column → no warning for that column (the
+    column was never populated, e.g. older CSV). Mixed values OR any row
+    with the empty-string hash (== missing prompt) → warning entry.
+    """
+    warnings: list[dict[str, Any]] = []
+    for col, label in _PROMPT_HASH_COLS:
+        if col not in df.columns:
+            continue
+        series = df[col].dropna()
+        series = series[series.astype(str).str.len() > 0]
+        if series.empty:
+            continue
+        counts = series.value_counts()
+        has_missing = _EMPTY_PROMPT_HASH in counts.index
+        if len(counts) == 1 and not has_missing:
+            continue
+        breakdown: list[dict[str, Any]] = []
+        for hash_value, count in counts.items():
+            sample_ids = df.loc[df[col] == hash_value, "trace_id"].head(3).tolist()
+            breakdown.append({
+                "hash": str(hash_value),
+                "count": int(count),
+                "is_missing": str(hash_value) == _EMPTY_PROMPT_HASH,
+                "sample_trace_ids": [str(t) for t in sample_ids if t],
+            })
+        warnings.append({
+            "column": col,
+            "label": label,
+            "distinct": int(len(counts)),
+            "total": int(series.shape[0]),
+            "has_missing": has_missing,
+            "breakdown": breakdown,
+        })
+    return warnings
+
+
+def _prompt_warning_card(warnings: list[dict[str, Any]]) -> str:
+    if not warnings:
+        return ""
+    items: list[str] = []
+    for w in warnings:
+        rows: list[str] = []
+        for b in w["breakdown"]:
+            sample = ", ".join(b["sample_trace_ids"]) or "–"
+            tag = (
+                "<span class='prompt-missing-tag'>missing</span>"
+                if b["is_missing"] else ""
+            )
+            rows.append(
+                "<tr>"
+                f"<td><code>{_h(b['hash'])}</code> {tag}</td>"
+                f"<td class='num-cell'>{b['count']}</td>"
+                f"<td><code>{_h(sample)}</code></td>"
+                "</tr>"
+            )
+        headline = (
+            f"<strong>{_h(w['label'])}</strong>: "
+            f"{w['distinct']} distinct hashes across {w['total']} traces"
+        )
+        if w["has_missing"]:
+            headline += " — includes traces with no prompt extracted"
+        items.append(
+            "<div class='prompt-warning-item'>"
+            f"<div>{headline}</div>"
+            "<table class='tbl prompt-warning-tbl'>"
+            "<thead><tr><th>Hash</th><th>Traces</th><th>Sample trace IDs</th></tr></thead>"
+            f"<tbody>{''.join(rows)}</tbody>"
+            "</table>"
+            "</div>"
+        )
+    return (
+        "<div class='card prompt-warning-card'>"
+        "<div class='card-title prompt-warning-title'>"
+        "⚠ Prompt / tool-registry mismatch detected"
+        f"{_info_icon('A uniform eval run produces one hash per agent-prompt and one for the tool-registry. More than one — or any trace with no prompt at all — means the run mixed deploys or had span-extraction failures.')}"
+        "</div>"
+        f"{''.join(items)}"
+        "</div>"
+    )
+
+
+def _prompts_tab(sidecar: dict[str, Any] | None, source_run_id: str) -> str:
+    """Render the Prompts tab body.
+
+    Empty sidecar → small explainer + path of where the file is expected.
+    """
+    if not sidecar:
+        return (
+            "<div class='card'>"
+            "<div class='card-title'>Prompts</div>"
+            "<p class='prompt-empty'>No prompt sidecar found for this run. "
+            f"Expected <code>prompt_{_h(source_run_id) or '&lt;run_id&gt;'}.json</code> "
+            "next to the input CSV. Re-run the import notebook (it now writes "
+            "the sidecar automatically) to populate this tab.</p>"
+            "</div>"
+        )
+
+    supervisor = sidecar.get("main_agent_system_prompt") or ""
+    dba_prompt = sidecar.get("daily_banking_agent_system_prompt") or ""
+    tool_descriptions = sidecar.get("tool_descriptions") or {}
+
+    def _prompt_block(label: str, body: str, *, open_: bool = False) -> str:
+        attr = " open" if open_ else ""
+        empty_note = " <em class='prompt-empty-note'>(not extracted from any trace)</em>" if not body.strip() else ""
+        return (
+            f"<details class='prompt-block'{attr}>"
+            f"<summary>{_h(label)}{empty_note}</summary>"
+            f"<pre class='prompt-pre'>{_h(body)}</pre>"
+            "</details>"
+        )
+
+    tool_blocks: list[str] = []
+    for name in sorted(tool_descriptions.keys()):
+        desc = tool_descriptions.get(name) or ""
+        tool_blocks.append(_prompt_block(name, desc))
+    tool_section = (
+        "".join(tool_blocks)
+        if tool_blocks
+        else "<p class='prompt-empty'>No tool descriptions captured for this run.</p>"
+    )
+
+    return (
+        "<div class='card prompts-card'>"
+        "<div class='card-title'>Supervisor prompt</div>"
+        f"{_prompt_block('main_agent', supervisor, open_=True)}"
+        "</div>"
+        "<div class='card prompts-card'>"
+        "<div class='card-title'>Agent prompts</div>"
+        f"{_prompt_block('daily_banking_agent', dba_prompt)}"
+        "</div>"
+        "<div class='card prompts-card'>"
+        "<div class='card-title'>"
+        f"Tool descriptions <span class='tool-count'>({len(tool_descriptions)})</span>"
+        "</div>"
+        f"{tool_section}"
+        "</div>"
+    )
+
+
 def _chip_group(label: str, group: str, options: list[tuple[str, str]], *, foldable: bool = False) -> str:
     chips = "".join(
         f'<button class="chip" data-group="{_h(group)}" data-value="{_h(value)}">{_h(text)}</button>'
@@ -1149,6 +1327,26 @@ code { font-family: monospace; font-size: 12px; background: #e7effd;
 .tab-btn.active, .tab-btn:hover { color: #1d69ec; border-bottom-color: #1d69ec; }
 .tab-btn.tab-home { background: #eef4fd; }
 .tab-btn.tab-home:hover { background: #e0eafd; }
+/* Prompts tab + summary mismatch warning. */
+.prompts-card { margin-bottom: 16px; }
+.prompts-card .tool-count { color: #5c7999; font-weight: 400; font-size: 12px; }
+.prompt-block { margin: 6px 0; border: 1px solid #e4eaf0; border-radius: 4px;
+                background: #fafbfc; }
+.prompt-block > summary { cursor: pointer; padding: 8px 12px; font-weight: 500;
+                          font-family: ui-monospace, Menlo, monospace; font-size: 13px; }
+.prompt-block[open] > summary { border-bottom: 1px solid #e4eaf0; background: #f3f6fa; }
+.prompt-pre { margin: 0; padding: 12px 14px; font-family: ui-monospace, Menlo, monospace;
+              font-size: 12.5px; line-height: 1.5; white-space: pre-wrap; word-break: break-word;
+              max-height: 60vh; overflow-y: auto; }
+.prompt-empty { color: #5c7999; font-style: italic; margin: 8px 0; }
+.prompt-empty-note { color: #5c7999; font-weight: 400; font-size: 12px; }
+.prompt-warning-card { border-left: 3px solid #d83a3a; background: #fff5f5; margin-bottom: 16px; }
+.prompt-warning-title { color: #b32424; }
+.prompt-warning-item { margin-top: 8px; }
+.prompt-warning-item + .prompt-warning-item { border-top: 1px dashed #f0c5c5; padding-top: 8px; }
+.prompt-warning-tbl { margin-top: 4px; }
+.prompt-missing-tag { display: inline-block; padding: 1px 6px; border-radius: 3px;
+                       background: #fbe2e2; color: #b32424; font-size: 11px; margin-left: 6px; }
 .tab-btn.tab-home.active { background: #d8e6fc; }
 .content { max-width: 1280px; margin: 0 auto; padding: 20px 24px; }
 .tab-panel { display: none; } .tab-panel.active { display: block; }
@@ -2862,7 +3060,8 @@ renderList();
 
 def render_html(df: pd.DataFrame, *, input_path: Path, output_path: Path,
                 baseline: dict[str, dict[str, Any]] | None = None,
-                baseline_path: Path | None = None) -> str:
+                baseline_path: Path | None = None,
+                prompts_path: Path | None = None) -> str:
     metrics = compute_metrics(df, baseline=baseline)
     summaries = scorer_summary(df)
     cases = case_payload(df, baseline=baseline)
@@ -2875,7 +3074,12 @@ def render_html(df: pd.DataFrame, *, input_path: Path, output_path: Path,
         run_time = datetime.fromtimestamp(rt.min() / 1000).strftime("%b %d, %Y, %I:%M %p")
     else:
         run_time = "–"
-    mlflow_run_id = _unique_label(df, "source_run_id")
+    source_run_id_raw = _unique_label(df, "source_run_id")
+    mlflow_run_id = source_run_id_raw
+    sidecar = _load_prompt_sidecar(input_path, source_run_id_raw, prompts_path)
+    prompt_warnings = _prompt_hash_warnings(df)
+    prompt_warning_card = _prompt_warning_card(prompt_warnings)
+    prompts_tab_html = _prompts_tab(sidecar, source_run_id_raw)
     mlflow_user = _unique_label(df, "mlflow_user")
     kb_version_label = _unique_label(df, "kb_version")
     git_branch = _unique_label(df, "git_branch")
@@ -3002,6 +3206,7 @@ def render_html(df: pd.DataFrame, *, input_path: Path, output_path: Path,
   <div class="tab-nav-inner">
     <button class="tab-btn tab-home active" data-target="tab-summary">Summary</button>
     <button class="tab-btn" data-target="tab-cases">Test Cases</button>
+    <button class="tab-btn" data-target="tab-prompts">Prompts</button>
   </div>
 </nav>
 </div>
@@ -3009,6 +3214,7 @@ def render_html(df: pd.DataFrame, *, input_path: Path, output_path: Path,
 <main class="content">
 
   <div id="tab-summary" class="tab-panel active">
+    {prompt_warning_card}
     <div class="headline-row">
       {_summary_cards(metrics)}
     </div>
@@ -3100,6 +3306,10 @@ def render_html(df: pd.DataFrame, *, input_path: Path, output_path: Path,
     </div>
   </div>
 
+  <div id="tab-prompts" class="tab-panel">
+    {prompts_tab_html}
+  </div>
+
 </main>
 
 <script>{js}</script>
@@ -3129,6 +3339,10 @@ def main() -> None:
                              "the report adds Regression / Persistent / Fixed / New "
                              "filters on the Test Cases tab and a Regressions card "
                              "on the Summary tab. Cases are joined by test_case_id.")
+    parser.add_argument("--prompts", type=Path, default=None,
+                        help="Path to the prompt sidecar JSON (or its directory). "
+                             "If omitted, the report looks for "
+                             "prompt_{source_run_id}.json next to the input CSV.")
     args = parser.parse_args()
 
     input_path = args.input.expanduser().resolve()
@@ -3148,7 +3362,8 @@ def main() -> None:
     df = pd.read_csv(input_path)
     df = enrich(df)
     html_text = render_html(df, input_path=input_path, output_path=output_path,
-                            baseline=baseline_lookup, baseline_path=baseline_path)
+                            baseline=baseline_lookup, baseline_path=baseline_path,
+                            prompts_path=args.prompts)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(html_text, encoding="utf-8")
