@@ -1,8 +1,58 @@
+import hashlib
 import json
+from pathlib import Path
 
 import pandas as pd
 
 from hg_ds_evals.preprocessing.skkb_traces import build_skkb_dataframe_from_mlflow_search_traces
+from hg_ds_evals.preprocessing.traces import (
+    build_dataframe_from_mlflow_traces,
+    collect_run_prompts,
+    extract_agent_system_prompts,
+    hash_tool_descriptions,
+    write_prompt_sidecar,
+)
+
+
+_EMPTY_PROMPT_HASH = hashlib.md5(b"").hexdigest()[:10]
+
+
+def _chat_tools_attr(tool_descriptions: dict[str, str]) -> dict[str, object]:
+    """Encode a ChatDatabricks tool registry under the attribute name the parser reads."""
+    return {
+        "mlflow.chat.tools": json.dumps(
+            [
+                {"type": "function", "function": {"name": name, "description": desc}}
+                for name, desc in tool_descriptions.items()
+            ],
+            ensure_ascii=False,
+        )
+    }
+
+
+def _agent_chat_spans(
+    *,
+    agent_name: str,
+    agent_span_id: str,
+    system_prompt: str,
+    tool_descriptions: dict[str, str] | None = None,
+    chat_span_id: str | None = None,
+) -> list[dict[str, object]]:
+    """Build the agent → ChatDatabricks span pair the prompt extractor walks."""
+    chat_id = chat_span_id or f"{agent_span_id}-chat"
+    extra = _chat_tools_attr(tool_descriptions) if tool_descriptions else None
+    return [
+        _span(agent_name, span_id=agent_span_id, span_type="AGENT", node=agent_name),
+        _span(
+            "ChatDatabricks",
+            span_id=chat_id,
+            parent_span_id=agent_span_id,
+            span_type="CHAT_MODEL",
+            node=agent_name,
+            inputs=[[{"role": "system", "content": system_prompt}]],
+            extra_attrs=extra,
+        ),
+    ]
 
 
 def _span(
@@ -681,3 +731,187 @@ def test_agent_response_ignores_agent_answer_span_with_wrong_type() -> None:
 
     assert result.parse_errors == []
     assert result.dataframe.loc[0, "agent_response"] == ""
+
+
+# ── Prompt-extraction + tool-registry helpers ──────────────────────────
+
+
+def test_hash_tool_descriptions_is_order_independent() -> None:
+    a = {"alpha": "first", "beta": "second"}
+    b = {"beta": "second", "alpha": "first"}
+    assert hash_tool_descriptions(a) == hash_tool_descriptions(b)
+    assert hash_tool_descriptions({}) == _EMPTY_PROMPT_HASH
+
+
+def test_extract_agent_system_prompts_strips_timestamp_tail() -> None:
+    body = "You are George.\nFollow the rules.\n"
+    spans = _agent_chat_spans(
+        agent_name="main_agent",
+        agent_span_id="m1",
+        system_prompt=body + "Current date and time: 2026-05-21 12:00:00",
+    )
+    children: dict[str, list[dict[str, object]]] = {}
+    for span in spans:
+        children.setdefault(span["parent_span_id"], []).append(span)
+
+    prompts = extract_agent_system_prompts(spans, children)
+    assert prompts["main_agent_system_prompt"] == body.rstrip()
+    assert prompts["daily_banking_agent_system_prompt"] == ""
+
+
+# ── parse_trace_skkb column surface ─────────────────────────────────────
+
+
+def test_parse_trace_skkb_emits_prompt_and_tool_descriptor_columns() -> None:
+    main_prompt = "You are the supervisor."
+    dba_prompt = "You handle daily banking."
+    tools = {"transfer-to-daily_banking_agent": "Transfer to DBA.", "knowledge_search": "Search KB."}
+    spans = [
+        *_agent_chat_spans(
+            agent_name="main_agent",
+            agent_span_id="m1",
+            system_prompt=main_prompt,
+            tool_descriptions=tools,
+        ),
+        *_agent_chat_spans(
+            agent_name="daily_banking_agent",
+            agent_span_id="d1",
+            system_prompt=dba_prompt,
+        ),
+    ]
+    traces_df = pd.DataFrame(
+        [
+            {
+                "trace_id": "tr-skkb-1",
+                "trace_metadata": {"mlflow.sourceRun": "run-abc-123"},
+                "tags": {},
+                "assessments": [],
+                "spans": spans,
+            }
+        ]
+    )
+
+    result = build_skkb_dataframe_from_mlflow_search_traces(traces_df)
+    row = result.dataframe.iloc[0]
+
+    assert result.parse_errors == []
+    assert row["main_agent_prompt_hash"] != _EMPTY_PROMPT_HASH
+    assert row["daily_banking_agent_prompt_hash"] != _EMPTY_PROMPT_HASH
+    assert row["tool_descriptions"] == tools
+    assert row["tool_descriptions_hash"] == hash_tool_descriptions(tools)
+    assert row["source_run_id"] == "run-abc-123"
+    assert sorted(row["available_tools"]) == sorted(tools.keys())
+
+
+def test_parse_trace_skkb_missing_prompts_hash_to_empty() -> None:
+    traces_df = pd.DataFrame(
+        [
+            {
+                "trace_id": "tr-skkb-empty",
+                "trace_metadata": {},
+                "tags": {},
+                "assessments": [],
+                "spans": [],
+            }
+        ]
+    )
+    result = build_skkb_dataframe_from_mlflow_search_traces(traces_df)
+    row = result.dataframe.iloc[0]
+    assert row["main_agent_prompt_hash"] == _EMPTY_PROMPT_HASH
+    assert row["daily_banking_agent_prompt_hash"] == _EMPTY_PROMPT_HASH
+    assert row["tool_descriptions_hash"] == _EMPTY_PROMPT_HASH
+    assert row["source_run_id"] == ""
+
+
+# ── parse_trace_mlflow column surface ───────────────────────────────────
+
+
+def _mlflow_trace_row(
+    *,
+    trace_id: str,
+    spans: list[dict[str, object]],
+    source_run_id: str = "",
+) -> dict[str, object]:
+    """Build the JSONL-shape input that build_dataframe_from_mlflow_traces expects."""
+    return {
+        "info": {
+            "trace_id": trace_id,
+            "request_time": "0",
+            "execution_duration_ms": 0,
+            "state": "OK",
+            "trace_metadata": {"mlflow.sourceRun": source_run_id} if source_run_id else {},
+            "tags": {},
+            "assessments": [],
+        },
+        "data": {"spans": spans},
+    }
+
+
+def test_parse_trace_mlflow_emits_prompt_and_tool_hashes() -> None:
+    main_prompt = "You are the API supervisor."
+    tools = {"george-gcg-product_getLoans": "Fetch loans.", "transfer-to-daily_banking_agent": "Transfer."}
+    spans = _agent_chat_spans(
+        agent_name="main_agent",
+        agent_span_id="m1",
+        system_prompt=main_prompt,
+        tool_descriptions=tools,
+    )
+    traces_df = pd.DataFrame([_mlflow_trace_row(trace_id="tr-api-1", spans=spans, source_run_id="run-xyz")])
+
+    result = build_dataframe_from_mlflow_traces(traces_df)
+    row = result.dataframe.iloc[0]
+    assert row["main_agent_prompt_hash"] != _EMPTY_PROMPT_HASH
+    assert row["daily_banking_agent_prompt_hash"] == _EMPTY_PROMPT_HASH
+    assert row["tool_descriptions_hash"] == hash_tool_descriptions(tools)
+    assert row["source_run_id"] == "run-xyz"
+
+
+# ── Sidecar writer ──────────────────────────────────────────────────────
+
+
+def test_collect_run_prompts_picks_first_nonempty_and_unions_tools() -> None:
+    # Trace 1: empty (no spans). Trace 2: main prompt + tool_a. Trace 3:
+    # DBA prompt + a different description for tool_a + tool_b.
+    # First-seen-wins on tool descriptions keeps the union deterministic;
+    # the registry is stable within a real run anyway.
+    spans_2 = _agent_chat_spans(
+        agent_name="main_agent",
+        agent_span_id="m1",
+        system_prompt="Main prompt.",
+        tool_descriptions={"tool_a": "Description A"},
+    )
+    spans_3 = _agent_chat_spans(
+        agent_name="daily_banking_agent",
+        agent_span_id="d1",
+        system_prompt="DBA prompt.",
+        tool_descriptions={"tool_a": "DIFFERENT", "tool_b": "Description B"},
+    )
+    traces_df = pd.DataFrame(
+        [
+            _mlflow_trace_row(trace_id="tr-1", spans=[]),
+            _mlflow_trace_row(trace_id="tr-2", spans=spans_2),
+            _mlflow_trace_row(trace_id="tr-3", spans=spans_3),
+        ]
+    )
+
+    payload = collect_run_prompts(traces_df)
+    assert payload["main_agent_system_prompt"] == "Main prompt."
+    assert payload["daily_banking_agent_system_prompt"] == "DBA prompt."
+    assert payload["tool_descriptions"] == {"tool_a": "Description A", "tool_b": "Description B"}
+
+
+def test_write_prompt_sidecar_writes_named_json(tmp_path: Path) -> None:
+    spans = _agent_chat_spans(
+        agent_name="main_agent",
+        agent_span_id="m1",
+        system_prompt="Supervisor.",
+        tool_descriptions={"tool_x": "X desc"},
+    )
+    traces_df = pd.DataFrame([_mlflow_trace_row(trace_id="tr-1", spans=spans)])
+
+    out = write_prompt_sidecar(traces_df, "run-abcd1234", tmp_path)
+    assert out == tmp_path / "prompt_run-abcd1234.json"
+    payload = json.loads(out.read_text(encoding="utf-8"))
+    assert payload["run_id"] == "run-abcd1234"
+    assert payload["main_agent_system_prompt"] == "Supervisor."
+    assert payload["tool_descriptions"] == {"tool_x": "X desc"}
