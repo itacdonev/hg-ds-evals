@@ -1,0 +1,7 @@
+Evaluate this agent response:
+
+{% for field in rubric.input_fields %}
+**{{ field.name }}**: {{ example.get(field.name, 'N/A') }}
+{% endfor %}
+
+Analyze using the rubrics provided and return JSON only.

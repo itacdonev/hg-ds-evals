@@ -1,0 +1,256 @@
+# ─────────────────────────────────────────────────────────────
+# api_exp_001_language
+# ─────────────────────────────────────────────────────────────
+# Minimal first-pass LLM-as-a-judge evaluation focused on
+# LANGUAGE only for the API/agent-routing side of Hey George.
+#
+# GOAL:
+#   (a) detect the language of `user_query`,
+#   (b) detect the language of `agent_response`,
+#   (c) score whether the agent answered in the same language
+#       the user wrote in (the actual production concern: agent
+#       drifting to a different language than the user).
+#
+# This is intentionally narrow. Other API-side judges (routing
+# intent alignment, refusal appropriateness, answer alignment vs
+# expected) can be added in later experiments.
+#
+# Data prep:  experiments/api/notebooks/import_traces_local.ipynb
+#             with RUN_DATE = "hajek_prompt"
+# Input source: UC table written at the bottom of that notebook.
+# ─────────────────────────────────────────────────────────────
+
+
+# ── Experiment Metadata ───────────────────────────────────────
+experiment:
+  name: "api_exp_001_language"
+  persona: >
+    You are an expert linguist evaluating the Hey George retail-banking
+    conversational AI. Your job is to (1) identify the language of the
+    user's query, (2) identify the language of the agent's reply, and
+    (3) judge whether the agent answered in the same language the user
+    wrote in.
+  task: >
+    Per-trace language detection (user query + agent response) and
+    a language-compliance score.
+  description: >
+    Read the user's original message and the agent's final reply. Detect
+    the language of each using ISO 639-1 codes, then score whether the
+    agent matched the user's language. Czech and Slovak are NOT
+    interchangeable. Return all reasoning in English.
+
+  version: "0.1.0"
+  author: "Ita Ćirović Donev"
+  created_date: "2026-05-22"
+  tags:
+    - "api"
+    - "language"
+    - "diagnostic"
+
+
+# ── Model Configuration ──────────────────────────────────────
+model:
+  model_deployment_name: "gpt-5-1"
+  api_provider: "databricks_async"
+  databricks_endpoint_url: "https://adb-3174992876438447.7.azuredatabricks.net/serving-endpoints/gpt-5-1/invocations"
+  temperature: null
+  max_output_tokens: 4000
+  reasoning_effort: "medium"
+  max_concurrent_calls: 5
+  tpm_limit: 100000
+
+
+# ── Dataset Configuration ────────────────────────────────────
+# Source table produced by experiments/api/notebooks/import_traces_local.ipynb
+# with RUN_DATE = "hajek_prompt" (RUN_ID = 76b28353ceb2474b8aad150d1ce7313f).
+dataset:
+  mlflow_run_id: "76b28353ceb2474b8aad150d1ce7313f"
+  mlflow_experiment_id: "471458066277040"
+  mlflow_run_name: "offline/smoke/pr12-kb-smoke/infer (hajek_prompt)"
+  input_catalog: "prod_aut_chat00_lab_catalog"
+  input_schema: "private_uc0115_aix_db"
+  input_dataset: "dts_eval_ts100_exp_001_76b28353ceb2474b8aad150d1ce7313f"
+  test_num_rows: 5
+  id_columns:
+    - test_case_id
+  eval_columns:
+    - test_case_id
+    - trace_id
+    - user_query
+    - agent_response
+  passthrough_columns:
+    - test_case_id
+    - trace_id
+    - user_query
+    - agent_response
+    - user_query_en
+    - agent_response_en
+    - expected_response
+    - expected_response_en
+    - eval_domain
+    - eval_persona
+    - expected_agent
+    - actual_agent
+    - expected_tool_calls
+    - actual_tool_calls
+    - agent_routing_score
+    - agent_routing_status
+    - tool_usage_score
+    - tool_usage_status
+    - tool_parameter_score
+    - tool_parameter_status
+    - query_scope
+    - execution_duration_s
+    - request_time
+
+
+# ── Paths ─────────────────────────────────────────────────────
+paths:
+  checkpoint_dir: "checkpoints"
+  system_template_path: "../configs/system.md.j2"
+  user_template_path: "../configs/user.md.j2"
+
+
+# ── Rubric Configuration ─────────────────────────────────────
+rubric:
+  base: null
+  pass_threshold: 1.4
+
+  critical_evaluation_rules: |
+    OUTPUT CONTRACT:
+      - Return ONLY valid JSON.
+      - All JSON string values MUST be written in English only.
+      - Do not copy raw user-query or agent-response text into output fields.
+
+    Detection rules:
+      - Use ISO 639-1 lowercase codes for detected languages:
+        `cs` (Czech), `sk` (Slovak), `en` (English), `uk` (Ukrainian),
+        `de` (German), `hu` (Hungarian), `pl` (Polish), `ru` (Russian),
+        `ro` (Romanian), `hr` (Croatian), `sr` (Serbian).
+        Use the closest standard ISO 639-1 code for any other language.
+      - Use `mixed` only when two or more languages share a roughly
+        comparable share of the text (not when one language dominates
+        with a few foreign loanwords).
+      - Use `unknown` only when the language genuinely cannot be
+        determined (e.g. empty text, pure numerals, single emoji).
+      - For `agent_response_detected_language` ONLY, use the additional
+        value `empty` when `agent_response` is empty or whitespace only.
+
+    Compliance rules:
+      - The agent_response language MUST match the user_query language.
+      - Czech (`cs`) and Slovak (`sk`) are NOT interchangeable. A Czech
+        user question answered in Slovak (or vice versa) is a mismatch.
+      - A personalized greeting that just uses the user's first name
+        (e.g. "Krystýna,") does not affect language scoring.
+      - A single isolated loanword or technical term that is the same
+        spelling across the languages involved (e.g. "OK", "online",
+        "PIN") is not a language switch.
+
+  domain_specific_guidance: |
+    - This is the Slovak (`sk`) production deployment of Hey George, but
+      real users write in Czech, Slovak, English, Ukrainian, German, and
+      occasionally other languages. The agent SHOULD respond in whatever
+      language the USER wrote in.
+    - Czech ↔ Slovak drift is a known recurring issue. Score it as a
+      mismatch when the user wrote one and the agent answered in the
+      other.
+    - Banking-specific terms (`spoření`, `bežný účet`, `trvalý príkaz`,
+      etc.) are language-bearing — they should be in the same language
+      as the rest of the answer.
+
+  final_reminders: |
+    1. **Output ONLY valid JSON** — no markdown fencing, no prose
+       outside JSON.
+    2. **English-only output is mandatory** for all JSON string values.
+    3. `user_query_detected_language` and `agent_response_detected_language`
+       MUST be lowercase ISO 639-1 codes, or `mixed`, `unknown`, or
+       (agent only) `empty`.
+    4. `language_mismatch_description` MUST be `""` when
+       `language_compliance.score == 2`, and non-empty otherwise.
+       Max 200 chars.
+    5. `overall_explanation` between 80 and 300 characters.
+
+  # ── Dimensions ──────────────────────────────
+  dimensions:
+    - id: language_compliance
+      name: "Language Compliance"
+      weight: 1.0
+      description: >
+        Is `agent_response` written in the same language as `user_query`?
+      scale:
+        - score: 2
+          label: "matches"
+          description: Response is in the same language as the user query throughout.
+        - score: 1
+          label: "mostly_matches"
+          description: Response is mostly in the user's language with one or two isolated foreign words or short phrases (a single idiom or loanword slipped in), but the dominant language matches.
+        - score: 0
+          label: "mismatch"
+          description: Response is in a different language than the user query, OR substantially mixes multiple languages, OR exhibits Czech↔Slovak drift, OR `agent_response` is empty when the user asked a question.
+
+  # ── Input Fields ────────────────────────────────────────────
+  input_fields:
+    - name: user_query
+      description: >
+        The user's original message, in the user's own language.
+      required: true
+
+    - name: agent_response
+      description: >
+        The agent's final reply to the user. The text whose language
+        compliance is being judged.
+      required: true
+
+  # ── Output Schema ───────────────────────────────────────────
+  output_schema:
+    fields:
+      - name: user_query_detected_language
+        type: string
+        description: >
+          ISO 639-1 lowercase code for the language of `user_query`
+          (e.g. `cs`, `sk`, `en`, `uk`, `de`, `hu`, `pl`, `ru`).
+          Use `mixed` when two or more languages share roughly equal
+          share. Use `unknown` when the language genuinely cannot be
+          determined.
+
+      - name: agent_response_detected_language
+        type: string
+        description: >
+          ISO 639-1 lowercase code for the language of `agent_response`,
+          using the same scheme as `user_query_detected_language`.
+          Additionally, use `empty` when `agent_response` is empty or
+          whitespace only.
+
+      - name: language_mismatch_description
+        type: string
+        description: >
+          When `language_compliance.score < 2`, briefly describe the
+          mismatch in English (e.g. "user wrote in Czech, agent
+          answered in Slovak", or "agent response is fully in English
+          while user wrote in Slovak"). Max 200 chars. Empty string
+          (`""`) when the score is 2.
+
+      - name: overall_explanation
+        type: string
+        description: >
+          English only. 1–3 sentences justifying the score and naming
+          the detected languages on both sides. 80–300 chars.
+
+    additional_instructions: |
+      ## Cross-field rules
+
+      - **Detection first, then compliance**: detect
+        `user_query_detected_language` and
+        `agent_response_detected_language` BEFORE scoring
+        `language_compliance`. The score follows from the detected
+        languages, not the other way around.
+      - **Empty agent response**: if `agent_response` is empty or
+        whitespace only, set `agent_response_detected_language` to
+        `empty` and `language_compliance.score` to 0 with
+        `language_mismatch_description` = "agent response is empty".
+      - **Same-language guarantee**: when both detected languages are
+        the same standard code (e.g. both `sk`), score MUST be 2 and
+        `language_mismatch_description` MUST be `""`.
+      - **Czech↔Slovak rule**: detected `cs` vs `sk` (in either
+        direction) is a mismatch and scores 0, even though the
+        languages look similar.
