@@ -6,7 +6,7 @@
 #
 # GOAL:
 #   (a) detect the language of `user_query`,
-#   (b) detect the language of `agent_response`,
+#   (b) detect the language of `actual_response`,
 #   (c) score whether the agent answered in the same language
 #       the user wrote in (the actual production concern: agent
 #       drifting to a different language than the user).
@@ -77,14 +77,14 @@ dataset:
     - test_case_id
     - trace_id
     - user_query
-    - agent_response
+    - actual_response
   passthrough_columns:
     - test_case_id
     - trace_id
     - user_query
-    - agent_response
+    - actual_response
     - user_query_en
-    - agent_response_en
+    - actual_response_en
     - expected_response
     - expected_response_en
     - eval_domain
@@ -133,11 +133,11 @@ rubric:
         with a few foreign loanwords).
       - Use `unknown` only when the language genuinely cannot be
         determined (e.g. empty text, pure numerals, single emoji).
-      - For `agent_response_detected_language` ONLY, use the additional
-        value `empty` when `agent_response` is empty or whitespace only.
+      - For `actual_response_detected_language` ONLY, use the additional
+        value `empty` when `actual_response` is empty or whitespace only.
 
     Compliance rules:
-      - The agent_response language MUST match the user_query language.
+      - The actual_response language MUST match the user_query language.
       - Czech (`cs`) and Slovak (`sk`) are NOT interchangeable. A Czech
         user question answered in Slovak (or vice versa) is a mismatch.
       - A personalized greeting that just uses the user's first name
@@ -162,7 +162,7 @@ rubric:
     1. **Output ONLY valid JSON** — no markdown fencing, no prose
        outside JSON.
     2. **English-only output is mandatory** for all JSON string values.
-    3. `user_query_detected_language` and `agent_response_detected_language`
+    3. `user_query_detected_language` and `actual_response_detected_language`
        MUST be lowercase ISO 639-1 codes, or `mixed`, `unknown`, or
        (agent only) `empty`.
     4. `language_mismatch_description` MUST be `""` when
@@ -176,7 +176,7 @@ rubric:
       name: "Language Compliance"
       weight: 1.0
       description: >
-        Is `agent_response` written in the same language as `user_query`?
+        Is `actual_response` written in the same language as `user_query`?
       scale:
         - score: 2
           label: "matches"
@@ -186,7 +186,7 @@ rubric:
           description: Response is mostly in the user's language with one or two isolated foreign words or short phrases (a single idiom or loanword slipped in), but the dominant language matches.
         - score: 0
           label: "mismatch"
-          description: Response is in a different language than the user query, OR substantially mixes multiple languages, OR exhibits Czech↔Slovak drift, OR `agent_response` is empty when the user asked a question.
+          description: Response is in a different language than the user query, OR substantially mixes multiple languages, OR exhibits Czech↔Slovak drift, OR `actual_response` is empty when the user asked a question.
 
   # ── Input Fields ────────────────────────────────────────────
   input_fields:
@@ -195,7 +195,7 @@ rubric:
         The user's original message, in the user's own language.
       required: true
 
-    - name: agent_response
+    - name: actual_response
       description: >
         The agent's final reply to the user. The text whose language
         compliance is being judged.
@@ -213,12 +213,12 @@ rubric:
           share. Use `unknown` when the language genuinely cannot be
           determined.
 
-      - name: agent_response_detected_language
+      - name: actual_response_detected_language
         type: string
         description: >
-          ISO 639-1 lowercase code for the language of `agent_response`,
+          ISO 639-1 lowercase code for the language of `actual_response`,
           using the same scheme as `user_query_detected_language`.
-          Additionally, use `empty` when `agent_response` is empty or
+          Additionally, use `empty` when `actual_response` is empty or
           whitespace only.
 
       - name: language_mismatch_description
@@ -241,11 +241,11 @@ rubric:
 
       - **Detection first, then compliance**: detect
         `user_query_detected_language` and
-        `agent_response_detected_language` BEFORE scoring
+        `actual_response_detected_language` BEFORE scoring
         `language_compliance`. The score follows from the detected
         languages, not the other way around.
-      - **Empty agent response**: if `agent_response` is empty or
-        whitespace only, set `agent_response_detected_language` to
+      - **Empty agent response**: if `actual_response` is empty or
+        whitespace only, set `actual_response_detected_language` to
         `empty` and `language_compliance.score` to 0 with
         `language_mismatch_description` = "agent response is empty".
       - **Same-language guarantee**: when both detected languages are

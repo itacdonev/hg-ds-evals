@@ -1767,6 +1767,18 @@ def compute_summary_metrics(df: pd.DataFrame, df_all: pd.DataFrame) -> dict:
     # The renderer inserts an "All valid cases" denominator row between the
     # two groups so the switch is explicit.
     fm_counts = df["failure_mode"].value_counts().to_dict() if "failure_mode" in df.columns else {}
+    # Per-mode judge-fail counts: rows whose primary failure_mode == X AND
+    # pass_mask is False. The "Clean pass" row is 0 by construction (a
+    # failure_mode of "pass" requires weighted_avg ≥ threshold AND no
+    # weight-2 scorer at 0, which is exactly the pass_mask predicate). The
+    # sum over the clean group (everything except test_set_defect /
+    # enum_name_mismatch / pass) equals n_fail_clean — surfaced as the
+    # "Hard fail" summary row in _failure_mode_table_html so the reader can
+    # see how the headline "total clean failures" decomposes by mode.
+    if "failure_mode" in df.columns:
+        fm_fail_counts = df.loc[~pass_mask, "failure_mode"].value_counts().to_dict()
+    else:
+        fm_fail_counts = {}
     test_set_group = ("test_set_defect", "enum_name_mismatch")
     valid_group_order = ("pass", "scope_misroute", "retrieval_gap", "pruning_loss",
                           "reranker_miss", "pool_content_gap", "context_use_failure",
@@ -1779,14 +1791,21 @@ def compute_summary_metrics(df: pd.DataFrame, df_all: pd.DataFrame) -> dict:
         pct = (n / denom) if denom else float("nan")
         ids = df.loc[df["failure_mode"] == fm, "test_case_id"].astype(str).tolist() \
             if ("test_case_id" in df.columns and "failure_mode" in df.columns) else []
+        n_fail = int(fm_fail_counts.get(fm, 0))
+        fail_ids = (df.loc[(df["failure_mode"] == fm) & ~pass_mask, "test_case_id"]
+                      .astype(str).tolist()
+                    if ("test_case_id" in df.columns and "failure_mode" in df.columns)
+                    else [])
         fm_rows.append({
-            "key":   fm,
-            "label": FAILURE_MODE_LABEL[fm],
-            "owner": FAILURE_MODE_OWNER[fm],
-            "info":  FAILURE_MODE_INFO[fm],
-            "n":     n,
-            "pct":   pct,
-            "ids":   ids,
+            "key":     fm,
+            "label":   FAILURE_MODE_LABEL[fm],
+            "owner":   FAILURE_MODE_OWNER[fm],
+            "info":    FAILURE_MODE_INFO[fm],
+            "n":       n,
+            "pct":     pct,
+            "ids":     ids,
+            "n_fail":  n_fail,
+            "fail_ids": fail_ids,
         })
 
     # Funnel — micro-averaged expected-ENUM recall at each pipeline stage.
@@ -2018,6 +2037,10 @@ def compute_summary_metrics(df: pd.DataFrame, df_all: pd.DataFrame) -> dict:
     fail_mask  = ~pass_mask                                  # judge_pass == False
     top_filter_mask = clean_mask & fail_mask                 # clean AND failed
     n_fail_clean = int(top_filter_mask.sum())                # denominator for Top-3
+    # IDs of every clean case the judge actually failed — backs the
+    # click-through on the new "Hard fail" row in _failure_mode_table_html.
+    hard_fail_ids = (df.loc[top_filter_mask, "test_case_id"].astype(str).tolist()
+                     if "test_case_id" in df.columns else [])
     fm_in_scope = (df.loc[top_filter_mask, "failure_mode"]
                     if "failure_mode" in df.columns
                     else pd.Series(dtype=object))
@@ -2066,6 +2089,7 @@ def compute_summary_metrics(df: pd.DataFrame, df_all: pd.DataFrame) -> dict:
         "rel2_naming_excluded": n_rel2_naming_excluded,
         "top_failures_clean": top_failures_clean,
         "n_fail_clean":    n_fail_clean,
+        "hard_fail_ids":   hard_fail_ids,
         "count_cmp_n":              cmp_n,
         "count_cmp_mean_expected":  cmp_mean_expected,
         "count_cmp_mean_selected":  cmp_mean_selected,
@@ -2323,16 +2347,36 @@ def _failure_mode_table_html(metrics: dict) -> str:
     n_eval       = metrics["n_eval"]
     n_clean      = metrics["n_clean"]
     fm_rows      = metrics["failure_modes"]
+    n_fail_clean = metrics.get("n_fail_clean", 0)
+    hard_fail_ids = metrics.get("hard_fail_ids", []) or []
     excl_empty_ids = metrics.get("excluded_empty_ids", []) or []
     excl_scope_ids = metrics.get("excluded_scope_ids", []) or []
 
     pct = lambda n, d: _fmt_pct(n / d) if d else "–"
+
+    # Tooltip on the new "N fail" column header. Surfaces the difference
+    # between "primary failure mode fired" (column N) and "judge said FAIL"
+    # (column N fail) — see _classify_failure for the cascade and the
+    # `pass_mask` definition near n_pass.
+    n_fail_col_tip = (
+        "Number of cases in this row whose primary failure_mode is this "
+        "AND the judge returned FAIL (weighted_avg < pass threshold OR a "
+        "weight-2 scorer at 0).\n\n"
+        "Differs from the N column because a case can hit a non-pass "
+        "failure_mode and still judge-pass (e.g. reranker missed an ENUM "
+        "but the agent's answer was still correct enough to clear the "
+        "threshold). The sum over the clean-group rows (everything below "
+        "'All valid cases', excluding the 'Clean pass' row) equals the "
+        "'total clean failures' figure on the Top-issues card on the "
+        "Summary tab — surfaced as the 'Hard fail' row below 'Clean pass'."
+    )
 
     head = (
         "<thead><tr>"
         "<th>Row</th>"
         "<th style='text-align:right'>N</th>"
         "<th style='text-align:right'>%</th>"
+        f"<th style='text-align:right'>N fail {_info_icon(n_fail_col_tip)}</th>"
         "<th>Owner</th>"
         "<th>Description</th>"
         "</tr></thead>"
@@ -2340,11 +2384,15 @@ def _failure_mode_table_html(metrics: dict) -> str:
 
     body = ""
     # ── Composition: percentages relative to n_total ─────────────────────
+    # The "N fail" column is a "—" placeholder on every composition /
+    # denominator marker row — those rows aren't failure-mode buckets so
+    # the judge-fail count is not defined for them.
     body += (
         "<tr class='fm-composition-total'>"
         "<td><strong>Total test cases</strong></td>"
         f"<td style='text-align:right'><strong>{n_total}</strong></td>"
         f"<td style='text-align:right'><strong>{pct(n_total, n_total)}</strong></td>"
+        "<td style='text-align:right;color:#5c7999'>—</td>"
         "<td>—</td>"
         "<td>All rows processed by evaluation.</td>"
         "</tr>"
@@ -2352,6 +2400,7 @@ def _failure_mode_table_html(metrics: dict) -> str:
         f"<td><span class='fm-indent'>↳</span> Empty <code>user_query</code> (excluded)</td>"
         f"<td style='text-align:right'>{(_ids_filter_link(excl_empty_ids, 'excluded: empty user_query', classes='judge-eval-link', inner=str(n_empty)) if n_empty and excl_empty_ids else str(n_empty))}</td>"
         f"<td style='text-align:right'>{pct(n_empty, n_total)}</td>"
+        "<td style='text-align:right;color:#5c7999'>—</td>"
         "<td>Test set</td>"
         "<td>Judge had nothing to score; excluded from analysis.</td>"
         "</tr>"
@@ -2366,6 +2415,7 @@ def _failure_mode_table_html(metrics: dict) -> str:
         "<td><strong>All analyzed cases</strong> (denominator below)</td>"
         f"<td style='text-align:right'><strong>{eval_link}</strong></td>"
         f"<td style='text-align:right'><strong>{pct(n_eval, n_total)}</strong></td>"
+        "<td style='text-align:right;color:#5c7999'>—</td>"
         "<td>—</td>"
         f"<td>Cases with non-empty user_query (the only Stage-1 exclusion). "
         f"Includes non-KB case_scope rows — they go through the issues "
@@ -2390,6 +2440,23 @@ def _failure_mode_table_html(metrics: dict) -> str:
             )
         else:
             count_cell = "0"
+        # "N fail" cell: rows of this failure mode that the judge actually
+        # said FAIL. Coloured red. Clickable when > 0 — drills into the
+        # subset (failure_mode == X AND ~pass_mask) on the Test Cases tab.
+        # For the "Clean pass" row this is 0 by construction.
+        n_fail_row = int(row.get("n_fail", 0))
+        if n_fail_row > 0:
+            n_fail_inner = _ids_filter_link(
+                row.get("fail_ids", []) or [],
+                f"failed issue: {row['label']}",
+                classes="judge-eval-link",
+                inner=f"<strong>{n_fail_row}</strong>",
+            )
+        else:
+            n_fail_inner = "0"
+        n_fail_cell = (
+            f"<td style='text-align:right;color:#cf2a1e'>{n_fail_inner}</td>"
+        )
         row_cls = (" class='fm-row-defect'"
                     if row["key"] in {"test_set_defect", "enum_name_mismatch"}
                     else "")
@@ -2402,6 +2469,7 @@ def _failure_mode_table_html(metrics: dict) -> str:
             f"<td><span class='fm-indent'>↳</span> {_h(row['label'])}</td>"
             f"<td style='text-align:right'>{count_cell}</td>"
             f"<td style='text-align:right'>{_fmt_pct(row['pct'])}</td>"
+            f"{n_fail_cell}"
             f"<td>{_h(row['owner'])}</td>"
             f"<td style='font-size:11px;color:#5c7999'>{info_cell}</td></tr>"
         )
@@ -2416,6 +2484,7 @@ def _failure_mode_table_html(metrics: dict) -> str:
                 "<td><strong>All valid cases</strong> (denominator for rows below)</td>"
                 f"<td style='text-align:right'><strong>{valid_link}</strong></td>"
                 f"<td style='text-align:right'><strong>{pct(n_clean, n_total)}</strong></td>"
+                "<td style='text-align:right;color:#5c7999'>—</td>"
                 "<td>—</td>"
                 "<td>All analyzed cases minus test-set issues and ENUM name mismatches. "
                 "Same denominator as the Top-3 issues card above and the "
@@ -2423,6 +2492,36 @@ def _failure_mode_table_html(metrics: dict) -> str:
                 "% of this number so the values reflect agent-side performance on "
                 "the trustworthy subset.</td>"
                 "</tr>"
+            )
+        # After Clean pass, insert the "Hard fail" summary row — total
+        # judge-failures across the clean group. Equals the
+        # "total clean failures" figure in the Top-issues card on Summary.
+        # Coloured red; click-through filters to those case IDs.
+        if row["key"] == "pass":
+            if hard_fail_ids:
+                hf_inner = _ids_filter_link(
+                    hard_fail_ids, "hard fail: clean cases the judge failed",
+                    classes="judge-eval-link",
+                    inner=f"<strong>{n_fail_clean}</strong>",
+                )
+            else:
+                hf_inner = f"<strong>{n_fail_clean}</strong>"
+            hf_pct = pct(n_fail_clean, n_clean)
+            body += (
+                "<tr class='fm-row-hard-fail'>"
+                "<td><span class='fm-indent'>↳</span> <strong>Hard fail</strong></td>"
+                f"<td style='text-align:right;color:#cf2a1e'><strong>{hf_inner}</strong></td>"
+                f"<td style='text-align:right;color:#cf2a1e'><strong>{hf_pct}</strong></td>"
+                f"<td style='text-align:right;color:#cf2a1e'><strong>{n_fail_clean}</strong></td>"
+                "<td>—</td>"
+                "<td style='font-size:11px;color:#5c7999'>"
+                "Clean cases the judge actually returned FAIL on "
+                "(weighted_avg below threshold or weight-2 scorer at 0). "
+                "Equals the sum of the red <em>N fail</em> values on the "
+                "failure-mode rows below, and matches the "
+                "&ldquo;total clean failures&rdquo; figure on the Top-issues "
+                "card on the Summary tab."
+                "</td></tr>"
             )
     return f"<table class='tbl fm-table'>{head}<tbody>{body}</tbody></table>"
 
@@ -5016,6 +5115,9 @@ hr.enum-divider { border: none; border-top: 1px solid #c8d3e1;
 /* Test-set-side failures (gold-defect + naming mismatch) get a soft cream
    tint so the same maintainer team can see at a glance which rows belong
    to them. Light enough to coexist with the orange accent strip. */
+.fm-table tr.fm-row-hard-fail td { background: #fdeceb; }
+.fm-table tr.fm-row-hard-fail td:first-child { box-shadow: inset 3px 0 0 #cf2a1e; }
+.fm-table tr.fm-row-hard-fail:hover td { background: #fcdedc; }
 .fm-table tr.fm-row-defect td { background: #fffaeb; }
 .fm-table tr.fm-row-defect td:first-child { box-shadow: inset 3px 0 0 #f2a91e;
                                               font-weight: 600; }
@@ -5184,14 +5286,33 @@ a.fm-clear-link:hover { text-decoration: underline; }
                        border: 1px solid #cdb4eb; }
 
 /* KB Findings row 1 — small Empty-queries card (1/4) next to the wider
-   naming-mismatches card (3/4). Drops to single column on narrow screens. */
+   naming-mismatches card (3/4). Drops to single column on narrow screens.
+   When only one of the two cards is rendered (e.g. zero empty user
+   queries, so _empty_user_queries_card_html returns ""), make the sole
+   surviving card span both tracks instead of collapsing into the 1fr
+   column with empty space on its right — that's what caused the
+   naming-mismatch table to render at ~25% of the row width with the
+   "Cases affected" column overflowing past the card border. */
 .kb-findings-row1 { display: grid;
                      grid-template-columns: minmax(0, 1fr) minmax(0, 3fr);
                      gap: 16px; margin-bottom: 16px; }
 .kb-findings-row1 > .card { min-width: 0; }
+.kb-findings-row1 > .card:only-child { grid-column: 1 / -1; }
 @media (max-width: 900px) {
   .kb-findings-row1 { grid-template-columns: minmax(0, 1fr); }
 }
+
+/* Naming-mismatches table: long ENUM names with underscores / "@" don't
+   wrap by default (browsers only break on whitespace / hyphen). Force
+   wrapping inside the pill `<code>` so the cells never push the table
+   wider than its card. */
+.naming-table { table-layout: auto; }
+.naming-table td { overflow-wrap: anywhere; word-break: break-word; }
+.naming-table .naming-expected,
+.naming-table .naming-kb-form { display: inline-block; max-width: 100%;
+                                  overflow-wrap: anywhere;
+                                  word-break: break-word;
+                                  white-space: normal; }
 
 /* KB findings review-queue table — wider issue column with proper wrapping. */
 .kb-findings-table td.kb-findings-query { max-width: 280px; white-space: normal;
