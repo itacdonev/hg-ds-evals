@@ -808,7 +808,7 @@ def enrich(df: pd.DataFrame) -> pd.DataFrame:
     # for hallucination if both fired).
     def _all_modes(r) -> list[str]:
         modes: list[str] = []
-        if r.get("_gold_defect", False):
+        if r.get("_gold_defect", False) or r.get("_case_scope_test_defect", False):
             modes.append("test_set_defect")
         if r.get("_naming_mismatch", False):
             modes.append("enum_name_mismatch")
