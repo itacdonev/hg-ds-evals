@@ -2295,7 +2295,7 @@ def _prompts_tab(sidecar: dict | None, run_id: str) -> str:
     return (
         "<div class='card prompts-card'>"
         "<div class='card-title'>Supervisor prompt</div>"
-        f"{_block('main_agent', supervisor, open_=True)}"
+        f"{_block('main_agent', supervisor)}"
         "</div>"
         "<div class='card prompts-card'>"
         "<div class='card-title'>Agent prompts</div>"
@@ -2441,22 +2441,29 @@ def _failure_mode_table_html(metrics: dict) -> str:
         else:
             count_cell = "0"
         # "N fail" cell: rows of this failure mode that the judge actually
-        # said FAIL. Coloured red. Clickable when > 0 — drills into the
-        # subset (failure_mode == X AND ~pass_mask) on the Test Cases tab.
-        # For the "Clean pass" row this is 0 by construction.
+        # said FAIL. Red ONLY when > 0 so a column of zeros doesn't
+        # visually scream — zero rows render in the default text colour
+        # (the "Clean pass" row is 0 by construction; modes like
+        # retrieval_gap can also legitimately be 0). Clickable when > 0
+        # — drills into the subset (failure_mode == X AND ~pass_mask)
+        # on the Test Cases tab.
         n_fail_row = int(row.get("n_fail", 0))
         if n_fail_row > 0:
+            # `link-red` overrides the base .judge-eval-link blue so the
+            # count itself reads as failure-coloured. Without it the
+            # parent <td>'s color: is silently overridden by the <a>'s
+            # own color rule and the number renders blue.
             n_fail_inner = _ids_filter_link(
                 row.get("fail_ids", []) or [],
                 f"failed issue: {row['label']}",
-                classes="judge-eval-link",
+                classes="judge-eval-link link-red",
                 inner=f"<strong>{n_fail_row}</strong>",
             )
+            n_fail_cell = (
+                f"<td style='text-align:right;color:#cf2a1e'>{n_fail_inner}</td>"
+            )
         else:
-            n_fail_inner = "0"
-        n_fail_cell = (
-            f"<td style='text-align:right;color:#cf2a1e'>{n_fail_inner}</td>"
-        )
+            n_fail_cell = "<td style='text-align:right'>0</td>"
         row_cls = (" class='fm-row-defect'"
                     if row["key"] in {"test_set_defect", "enum_name_mismatch"}
                     else "")
@@ -2501,7 +2508,7 @@ def _failure_mode_table_html(metrics: dict) -> str:
             if hard_fail_ids:
                 hf_inner = _ids_filter_link(
                     hard_fail_ids, "hard fail: clean cases the judge failed",
-                    classes="judge-eval-link",
+                    classes="judge-eval-link link-red",
                     inner=f"<strong>{n_fail_clean}</strong>",
                 )
             else:
@@ -4816,6 +4823,13 @@ a.case-link:hover { text-decoration: underline; }
 a.judge-eval-link { color: #1d69ec; text-decoration: none; font-weight: 600;
                     cursor: pointer; padding: 0 4px; border-radius: 4px; }
 a.judge-eval-link:hover { background: #135ee2; color: #fff; }
+/* Red variant — applied to the per-row "N fail" links and the "Hard fail"
+   summary row in the Issues-tab failure-mode table. The base
+   judge-eval-link rule sets an explicit `color: #1d69ec` on the <a>,
+   which wins over any parent-cell `color:` style; this modifier
+   overrides it on the elements that need to read as failures. */
+a.judge-eval-link.link-red { color: #cf2a1e; }
+a.judge-eval-link.link-red:hover { background: #cf2a1e; color: #fff; }
 .triage-card-title { display: flex; justify-content: space-between;
                      align-items: center; gap: 12px; flex-wrap: wrap; }
 .triage-card-title a.triage-show { font-size: 12px; font-weight: 600;
@@ -5092,14 +5106,16 @@ hr.enum-divider { border: none; border-top: 1px solid #c8d3e1;
                                    letter-spacing: .08em; font-weight: 600;
                                    margin-bottom: 4px; }
 /* Rel2 Mean / KB Recall turn green when the run value strictly exceeds
-   its CSAS benchmark. Same #057f19 used by the dim-bar / num-good
+   its external benchmark (default per-lang BENCHMARKS table, override
+   via --benchmark-rel2 / --benchmark-recall, suppress via
+   --no-benchmark). Same #057f19 used by the dim-bar / num-good
    styling so it reads consistently as "good" across the report. */
 .rel2-stats-card .hc-stat-value.rel2-mean-good,
 .kb-recall-card .hc-stat-value.kb-recall-good { color: #057f19; }
 /* Generic "reference / benchmark / target" stat value — rendered in
    dark grey so it reads as a fixed comparison anchor rather than a
-   measured run value. Used by the Pass-rate Target, the Rel2 CSAS
-   benchmark, and the KB Recall CSAS benchmark. */
+   measured run value. Used by the Pass-rate Target, the Rel2
+   benchmark, and the KB Recall benchmark. */
 .headline-card .hc-stat-value.hc-stat-reference { color: #4a5566; }
 .rel2-stats-card .hc-stat-value,
 .test-cases-stats-card .hc-stat-value,
@@ -7919,42 +7935,63 @@ def render_html(df: pd.DataFrame, *, df_all: pd.DataFrame | None = None,
         else "–"
     )
 
-    # ── Rel2 mean vs CSAS benchmark — green tint when the run beats it ───────
+    # ── Rel2 mean vs benchmark — green tint when the run beats it ────────────
     # Kept as a precomputed flag so the f-string below stays readable and
-    # the comparison is done once, in one place.
+    # the comparison is done once, in one place. When no benchmark is
+    # configured for the run (CSAS_BENCHMARK_REL2 is None — set by
+    # --no-benchmark or absent from the per-lang BENCHMARKS dict), the
+    # cell shows "–" with no green tint and the tooltip explains why.
     _rel2_mean_val = summary_metrics.get("rel2_mean")
     _rel2_beats_csas = (
-        isinstance(_rel2_mean_val, (int, float))
+        CSAS_BENCHMARK_REL2 is not None
+        and isinstance(_rel2_mean_val, (int, float))
         and not (isinstance(_rel2_mean_val, float) and np.isnan(_rel2_mean_val))
         and _rel2_mean_val > CSAS_BENCHMARK_REL2
     )
     rel2_mean_cls = " rel2-mean-good" if _rel2_beats_csas else ""
-    rel2_mean_title = (
-        f"Run mean ({_fmt_score(_rel2_mean_val)}) beats the CSAS benchmark "
-        f"({CSAS_BENCHMARK_REL2:.3f})."
-        if _rel2_beats_csas else
-        f"Run mean vs CSAS benchmark ({CSAS_BENCHMARK_REL2:.3f}). "
-        f"Green when the run mean strictly exceeds the benchmark."
-    )
+    if CSAS_BENCHMARK_REL2 is None:
+        rel2_mean_title = (
+            f"Run mean ({_fmt_score(_rel2_mean_val)}). No external benchmark "
+            f"configured for this run — pass --benchmark-rel2 to add one."
+        )
+    elif _rel2_beats_csas:
+        rel2_mean_title = (
+            f"Run mean ({_fmt_score(_rel2_mean_val)}) beats the benchmark "
+            f"({CSAS_BENCHMARK_REL2:.3f})."
+        )
+    else:
+        rel2_mean_title = (
+            f"Run mean vs benchmark ({CSAS_BENCHMARK_REL2:.3f}). "
+            f"Green when the run mean strictly exceeds the benchmark."
+        )
 
-    # ── KB Recall vs CSAS benchmark recall ───────────────────────────────────
+    # ── KB Recall vs benchmark recall ────────────────────────────────────────
     # Same pattern as the Rel2 mean above: turn the Recall cell green
     # when the run's micro-averaged recall strictly exceeds the
-    # external benchmark.
+    # external benchmark. None benchmark → "–" cell, no tint.
     _recall_val = summary_metrics.get("dataset_recall")
     _recall_beats_csas = (
-        isinstance(_recall_val, (int, float))
+        CSAS_BENCHMARK_RECALL is not None
+        and isinstance(_recall_val, (int, float))
         and not (isinstance(_recall_val, float) and np.isnan(_recall_val))
         and _recall_val > CSAS_BENCHMARK_RECALL
     )
     kb_recall_cls = " kb-recall-good" if _recall_beats_csas else ""
-    kb_recall_title = (
-        f"Run recall ({_fmt_pct(_recall_val)}) beats the CSAS benchmark "
-        f"({CSAS_BENCHMARK_RECALL:.1%})."
-        if _recall_beats_csas else
-        f"Run recall vs CSAS benchmark ({CSAS_BENCHMARK_RECALL:.1%}). "
-        f"Green when the run recall strictly exceeds the benchmark."
-    )
+    if CSAS_BENCHMARK_RECALL is None:
+        kb_recall_title = (
+            f"Run recall ({_fmt_pct(_recall_val)}). No external benchmark "
+            f"configured for this run — pass --benchmark-recall to add one."
+        )
+    elif _recall_beats_csas:
+        kb_recall_title = (
+            f"Run recall ({_fmt_pct(_recall_val)}) beats the benchmark "
+            f"({CSAS_BENCHMARK_RECALL:.1%})."
+        )
+    else:
+        kb_recall_title = (
+            f"Run recall vs benchmark ({CSAS_BENCHMARK_RECALL:.1%}). "
+            f"Green when the run recall strictly exceeds the benchmark."
+        )
 
     # ── Pass-rate (excl. test-set issues) vs internal target ─────────────────
     # Pre-computed flag so the f-string below stays readable. Met when the
@@ -8022,9 +8059,12 @@ def render_html(df: pd.DataFrame, *, df_all: pd.DataFrame | None = None,
         + f"This run: {summary_metrics['dataset_recall_tp']} true "
           f"positives · denominator = "
           f"{summary_metrics['dataset_recall_total_expected']} expected "
-          f"ENUMs. CSAS benchmark recall = "
-          f"{CSAS_BENCHMARK_RECALL:.1%} (external baseline; the Recall "
-          f"cell turns green when the run value strictly exceeds it)."
+          f"ENUMs."
+        + (f" Benchmark recall = {CSAS_BENCHMARK_RECALL:.1%} "
+           f"(external baseline; the Recall cell turns green when the "
+           f"run value strictly exceeds it)."
+           if CSAS_BENCHMARK_RECALL is not None else
+           " No external benchmark configured for this run.")
     )
     _rel2_excluded_note = (
         f" Excluded {summary_metrics['rel2_naming_excluded']} "
@@ -8180,12 +8220,12 @@ def render_html(df: pd.DataFrame, *, df_all: pd.DataFrame | None = None,
     <button class="tab-btn tab-home active" data-target="tab-summary">Summary</button>
     <button class="tab-btn" data-target="tab-cases">Test Cases</button>
     <button class="tab-btn" data-target="tab-issues">Issues</button>
-    <button class="tab-btn" data-target="tab-prompts">Prompts</button>
     {'<button class="tab-btn" data-target="tab-latency">Latency</button>' if include_latency else ''}
     <button class="tab-btn" data-target="tab-dims">Scorers</button>
     <button class="tab-btn" data-target="tab-missed">Retrieval Findings</button>
     <button class="tab-btn" data-target="tab-kb-findings">KB Findings</button>
     <span class="tab-tools">
+      <button class="tab-btn" data-target="tab-prompts">Prompts</button>
       <button class="tab-btn tab-kb-highlight" data-target="tab-kb">KB</button>
       <button class="tab-btn" data-target="tab-doc">Notes</button>
     </span>
@@ -8199,7 +8239,6 @@ def render_html(df: pd.DataFrame, *, df_all: pd.DataFrame | None = None,
 <main class="content">
 
   <div id="tab-summary" class="tab-panel active">
-    {prompt_warning_card}
     <div class="headline-row headline-row-3">
       <div class="headline-card pass-rate-card">
         <div class="hc-label">Pass rate · excl. test-set issues {_info_icon(pass_rate_tooltip)}
@@ -8225,9 +8264,9 @@ def render_html(df: pd.DataFrame, *, df_all: pd.DataFrame | None = None,
             <div class="hc-stat-value{kb_recall_cls}">{_fmt_pct(summary_metrics['dataset_recall'])}</div>
             {recall_delta_chip}
           </div>
-          <div class="hc-stat" title="External baseline recall (Σ TP / Σ expected) from the CSAS benchmark, kept here for at-a-glance comparison with the run's recall.">
-            <div class="hc-stat-label">CSAS benchmark</div>
-            <div class="hc-stat-value hc-stat-reference">{CSAS_BENCHMARK_RECALL:.1%}</div>
+          <div class="hc-stat" title="External baseline recall (Σ TP / Σ expected). Pass --benchmark-recall on the CLI (or --no-benchmark to suppress) to set the value for this run; default comes from the per-lang BENCHMARKS table.">
+            <div class="hc-stat-label">Benchmark</div>
+            <div class="hc-stat-value hc-stat-reference">{_fmt_pct(CSAS_BENCHMARK_RECALL) if CSAS_BENCHMARK_RECALL is not None else "–"}</div>
           </div>
         </div>
       </div>
@@ -8240,9 +8279,9 @@ def render_html(df: pd.DataFrame, *, df_all: pd.DataFrame | None = None,
             <div class="hc-stat-value{rel2_mean_cls}">{_fmt_score(summary_metrics['rel2_mean'])}</div>
             {rel2_mean_delta_chip}
           </div>
-          <div class="hc-stat" title="External baseline rel2 score from the CSAS benchmark, kept here for at-a-glance comparison with the run's mean.">
-            <div class="hc-stat-label">CSAS benchmark</div>
-            <div class="hc-stat-value hc-stat-reference">{CSAS_BENCHMARK_REL2:.3f}</div>
+          <div class="hc-stat" title="External baseline rel2 score. Pass --benchmark-rel2 on the CLI (or --no-benchmark to suppress) to set the value for this run; default comes from the per-lang BENCHMARKS table.">
+            <div class="hc-stat-label">Benchmark</div>
+            <div class="hc-stat-value hc-stat-reference">{f'{CSAS_BENCHMARK_REL2:.3f}' if CSAS_BENCHMARK_REL2 is not None else "–"}</div>
           </div>
         </div>
       </div>
@@ -8437,6 +8476,7 @@ def render_html(df: pd.DataFrame, *, df_all: pd.DataFrame | None = None,
   </div>
 
   <div id="tab-prompts" class="tab-panel">
+    {prompt_warning_card}
     {prompts_tab_html}
   </div>
 
@@ -8867,11 +8907,49 @@ def main():
                          "heuristic and can mis-fire. Off by default so the "
                          "shareable report stays clean; turn on for "
                          "internal perf reviews.")
+    # ─── Benchmark overrides ────────────────────────────────────────────
+    # Per-lang defaults live in the BENCHMARKS table above. These flags
+    # let a specific run override or suppress the headline "Benchmark"
+    # cell on the Rel2 and KB Recall cards. Use --no-benchmark for runs
+    # that have no comparable external baseline (the cell renders "–"
+    # and the "beats benchmark" green tint is skipped). Use the
+    # per-metric flags to point at a different external number
+    # (e.g. a competitor's published score, an older internal baseline,
+    # a custom CSAS variant) without touching the BENCHMARKS dict.
+    ap.add_argument("--no-benchmark", action="store_true",
+                    help="Suppress the external benchmark cells on the "
+                         "Summary's KB Recall and Rel2 cards (renders '–' "
+                         "instead of the per-lang BENCHMARKS default). "
+                         "Use for runs without a comparable external baseline.")
+    ap.add_argument("--benchmark-rel2", type=float, default=None,
+                    help="Override the Rel2 benchmark for this run (a float, "
+                         "e.g. 0.643). Falls back to the per-lang default. "
+                         "Ignored when --no-benchmark is set.")
+    ap.add_argument("--benchmark-recall", type=float, default=None,
+                    help="Override the KB recall benchmark for this run "
+                         "(a fraction in 0..1, e.g. 0.656). Falls back to "
+                         "the per-lang default. Ignored when --no-benchmark "
+                         "is set.")
     args = ap.parse_args()
 
     # Apply language before any rendering so the FAILURE_MODE_INFO_LONG
     # placeholders and the visible button labels reflect the run's language.
     _apply_lang(args.lang)
+
+    # Per-run benchmark overrides — applied AFTER _apply_lang so they
+    # win over the per-lang defaults written by that function. Setting
+    # CSAS_BENCHMARK_REL2 / CSAS_BENCHMARK_RECALL to None makes the
+    # corresponding "Benchmark" cell render "–" and disables the
+    # "beats benchmark" green tint on the run value above it.
+    if args.no_benchmark:
+        global CSAS_BENCHMARK_REL2, CSAS_BENCHMARK_RECALL
+        CSAS_BENCHMARK_REL2 = None
+        CSAS_BENCHMARK_RECALL = None
+    else:
+        if args.benchmark_rel2 is not None:
+            globals()["CSAS_BENCHMARK_REL2"] = args.benchmark_rel2
+        if args.benchmark_recall is not None:
+            globals()["CSAS_BENCHMARK_RECALL"] = args.benchmark_recall
     if args.config_dir is not None:
         global _CONFIG_DIR_OVERRIDE
         _CONFIG_DIR_OVERRIDE = args.config_dir

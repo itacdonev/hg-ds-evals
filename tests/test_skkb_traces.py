@@ -847,6 +847,48 @@ def _mlflow_trace_row(
     }
 
 
+def test_parse_trace_mlflow_extracts_expected_enums_from_serialized_expectation() -> None:
+    """Regression: previously, _extract_expected_enums_weights only knew
+    the raw-assessment shape used by parse_trace_skkb. In parse_trace_mlflow
+    ``_extract_assessments`` already decodes the expectation envelope, so the
+    helper received the bare ``{enum_id: weight}`` mapping and fell through
+    to ({}, {}). Every MLflow-parsed row was emitting expected_enums=[].
+    """
+    spans = _agent_chat_spans(
+        agent_name="main_agent",
+        agent_span_id="m1",
+        system_prompt="prompt",
+        tool_descriptions={},
+    )
+    row = _mlflow_trace_row(trace_id="tr-enums-1", spans=spans)
+    row["info"]["assessments"] = [
+        {
+            "assessment_name": "target_enums_to_relevance",
+            "last_update_time": "2026-05-22T13:04:51.613Z",
+            "expectation": {
+                "serialized_value": {
+                    "serialization_format": "JSON_FORMAT",
+                    "value": '{"CALL_PHONE_AUTHORISED_V2": 4, "FRAUD@ABOUT": 4, "LOCK_CARD_PERM": 4}',
+                }
+            },
+        },
+    ]
+    traces_df = pd.DataFrame([row])
+
+    result = build_dataframe_from_mlflow_traces(traces_df)
+    out = result.dataframe.iloc[0]
+    assert out["expected_enums"] == [
+        "CALL_PHONE_AUTHORISED_V2",
+        "FRAUD@ABOUT",
+        "LOCK_CARD_PERM",
+    ]
+    assert json.loads(out["expected_enums_weights"]) == {
+        "CALL_PHONE_AUTHORISED_V2": 4,
+        "FRAUD@ABOUT": 4,
+        "LOCK_CARD_PERM": 4,
+    }
+
+
 def test_parse_trace_mlflow_emits_prompt_and_tool_hashes() -> None:
     main_prompt = "You are the API supervisor."
     tools = {"george-gcg-product_getLoans": "Fetch loans.", "transfer-to-daily_banking_agent": "Transfer."}

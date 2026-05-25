@@ -70,7 +70,7 @@ dataset:
   input_catalog: "prod_aut_chat00_lab_catalog"
   input_schema: "private_uc0115_aix_db"
   input_dataset: "dts_eval_ts100_exp_001_76b28353ceb2474b8aad150d1ce7313f"
-  test_num_rows: 5
+  test_num_rows: null
   id_columns:
     - test_case_id
   eval_columns:

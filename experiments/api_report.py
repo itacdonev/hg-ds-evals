@@ -663,10 +663,35 @@ def _bar(width_pct: float, color: str = "#1d69ec") -> str:
     )
 
 
+def _render_headline_card(card: dict[str, Any]) -> str:
+    """Render one headline-row card. Supports a clickable variant with
+    a ``filter_link`` + ``tone`` ("good" / "bad") for baseline-comparison
+    cards."""
+    tip = _info_icon(card["tip"]) if card.get("tip") else ""
+    if card.get("filter_link"):
+        tone_cls = f" hc-{card.get('tone', '')}" if card.get("tone") else ""
+        return (
+            f"<a href='#' class='headline-card hc-clickable{tone_cls}' "
+            f"data-compare-filter='{_h(card['filter_link'])}'>"
+            f"<div class='hc-label'>{_h(card['label'])} {tip}</div>"
+            f"<div class='hc-value'>{card['value']}</div>"
+            "</a>"
+        )
+    return (
+        "<div class='headline-card'>"
+        f"<div class='hc-label'>{_h(card['label'])} {tip}</div>"
+        f"<div class='hc-value'>{card['value']}</div>"
+        "</div>"
+    )
+
+
 def _summary_cards(metrics: dict[str, Any]) -> str:
-    # Per-card tooltips now also carry the small "X / Y cases scored"
-    # footnote that used to sit visibly under the value (the visible
-    # .hc-detail line is gone — the info-icon hover shows it instead).
+    """First headline row — always-present run-level pass-rate cards.
+
+    Per-card tooltips also carry the small "X / Y cases scored" footnote
+    that used to sit visibly under the value (the visible ``.hc-detail``
+    line is gone — the info-icon hover shows it instead).
+    """
     cards: list[dict[str, Any]] = [
         {
             "label": "Test cases",
@@ -698,46 +723,73 @@ def _summary_cards(metrics: dict[str, Any]) -> str:
             ),
         },
     ]
-    if metrics.get("baseline_loaded"):
-        n_reg = int(metrics.get("n_regression", 0))
-        n_persistent = int(metrics.get("n_persistent", 0))
-        n_fixed = int(metrics.get("n_fixed", 0))
-        n_new = int(metrics.get("n_new", 0))
-        n_comp = int(metrics.get("n_comparable", 0))
-        cards.append({
+    return "".join(_render_headline_card(c) for c in cards)
+
+
+def _baseline_compare_cards(metrics: dict[str, Any]) -> str:
+    """Second headline row — Improvements / Regressions / Persistent fail.
+
+    Rendered only when a baseline run was supplied via ``--baseline``;
+    returns an empty string otherwise so the template can drop the whole
+    row when comparison isn't available.
+
+    Tones are fixed (improvements = green, regressions / persistent
+    fail = red) rather than adaptive — the colour is a category cue,
+    not a verdict on the count.
+    """
+    if not metrics.get("baseline_loaded"):
+        return ""
+
+    n_reg = int(metrics.get("n_regression", 0))
+    n_persistent = int(metrics.get("n_persistent", 0))
+    n_fixed = int(metrics.get("n_fixed", 0))
+    n_new = int(metrics.get("n_new", 0))
+    n_comp = int(metrics.get("n_comparable", 0))
+    summary_line = (
+        f"{n_reg} regression · {n_persistent} persistent fail · "
+        f"{n_fixed} fixed · {n_new} new · {n_comp} comparable."
+    )
+    cards: list[dict[str, Any]] = [
+        {
+            "label": "Improvements",
+            "value": str(n_fixed),
+            "tip": (
+                "Cases that failed in the baseline run but pass in this run "
+                "(strict pass = routing + tool_usage + tool_parameter when "
+                "scored).\n\n"
+                f"{summary_line}\n"
+                "Click the card to filter the Test Cases tab to fixed cases."
+            ),
+            "filter_link": "fixed",
+            "tone": "good",
+        },
+        {
             "label": "Regressions",
             "value": str(n_reg),
             "tip": (
                 "Cases that passed in the baseline run but fail in this "
                 "run (strict pass = routing + tool_usage + tool_parameter "
                 "when scored).\n\n"
-                f"{n_reg} regression · {n_persistent} persistent fail · "
-                f"{n_fixed} fixed · {n_new} new · {n_comp} comparable.\n"
+                f"{summary_line}\n"
                 "Click the card to filter the Test Cases tab to regressions."
             ),
             "filter_link": "regression",
-            "tone": "bad" if n_reg else "good",
-        })
-    out = []
-    for c in cards:
-        tip = _info_icon(c["tip"]) if c["tip"] else ""
-        if c.get("filter_link"):
-            tone_cls = f" hc-{c.get('tone', '')}" if c.get("tone") else ""
-            out.append(
-                f"<a href='#' class='headline-card hc-clickable{tone_cls}' "
-                f"data-compare-filter='{_h(c['filter_link'])}'>"
-                f"<div class='hc-label'>{_h(c['label'])} {tip}</div>"
-                f"<div class='hc-value'>{c['value']}</div>"
-                "</a>"
-            )
-        else:
-            out.append(
-                "<div class='headline-card'>"
-                f"<div class='hc-label'>{_h(c['label'])} {tip}</div>"
-                f"<div class='hc-value'>{c['value']}</div>"
-                "</div>"
-            )
-    return "".join(out)
+            "tone": "bad",
+        },
+        {
+            "label": "Persistent fail",
+            "value": str(n_persistent),
+            "tip": (
+                "Cases that failed in BOTH runs — strict pass missed in "
+                "the baseline AND in this run.\n\n"
+                f"{summary_line}\n"
+                "Click the card to filter the Test Cases tab to persistent fails."
+            ),
+            "filter_link": "persistent_failure",
+            "tone": "bad",
+        },
+    ]
+    return "".join(_render_headline_card(c) for c in cards)
 
 
 def _scorer_count_link(scorer: str, bucket: str, count: int, tone: str) -> str:
@@ -3065,6 +3117,15 @@ def render_html(df: pd.DataFrame, *, input_path: Path, output_path: Path,
     metrics = compute_metrics(df, baseline=baseline)
     summaries = scorer_summary(df)
     cases = case_payload(df, baseline=baseline)
+    # Second headline row (Improvements / Regressions / Persistent fail)
+    # only renders when --baseline was supplied; otherwise drop the whole
+    # row from the template so we don't leave an empty grid taking up space.
+    _baseline_cards_html = _baseline_compare_cards(metrics)
+    baseline_compare_row = (
+        f"<div class=\"headline-row\">{_baseline_cards_html}</div>"
+        if _baseline_cards_html
+        else ""
+    )
     # MLflow run time = earliest trace request_time (ms-since-epoch). For
     # a single-run CSV this equals when the run started; for a mixed CSV
     # it's the start of the earliest trace, which is still the most useful
@@ -3214,10 +3275,10 @@ def render_html(df: pd.DataFrame, *, input_path: Path, output_path: Path,
 <main class="content">
 
   <div id="tab-summary" class="tab-panel active">
-    {prompt_warning_card}
     <div class="headline-row">
       {_summary_cards(metrics)}
     </div>
+    {baseline_compare_row}
 
     <div class="grid-2">
       <div class="card">
@@ -3307,6 +3368,7 @@ def render_html(df: pd.DataFrame, *, input_path: Path, output_path: Path,
   </div>
 
   <div id="tab-prompts" class="tab-panel">
+    {prompt_warning_card}
     {prompts_tab_html}
   </div>
 

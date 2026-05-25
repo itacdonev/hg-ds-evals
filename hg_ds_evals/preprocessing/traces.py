@@ -651,6 +651,23 @@ def _extract_assessments(assessments_raw: Iterable[Any]) -> dict[str, Any]:
 def _extract_expected_enums_weights(
     assessment: Mapping[str, Any],
 ) -> tuple[str, dict[str, Any]]:
+    """Pull ``{enum_id: weight}`` out of a ``target_enums_to_relevance`` assessment.
+
+    Accepts either shape that the two call sites pass in:
+
+    - **SKKB path** (``parse_trace_skkb``) passes the *raw assessment
+      dict*, with ``expectation.serialized_value.value`` (JSON string)
+      or ``expectation.value`` (decoded) or top-level ``value``.
+    - **MLflow path** (``parse_trace_mlflow``) passes the
+      *already-decoded* mapping, because ``_extract_assessments``
+      peeled the ``expectation`` envelope upstream. The whole input is
+      then the ``{enum_id: weight}`` dict itself.
+
+    We try the SKKB candidate slots first; if none yield a mapping,
+    fall back to treating the input AS the decoded mapping — but only
+    when its values look numeric (so we don't mis-coerce a stray
+    assessment dict that happens to lack the SKKB-shaped keys).
+    """
     expectation = assessment.get("expectation") or {}
     candidates: list[Any] = []
     if isinstance(expectation, Mapping):
@@ -664,6 +681,22 @@ def _extract_expected_enums_weights(
         weights = _coerce_mapping_payload(candidate)
         if weights:
             return json.dumps(weights, ensure_ascii=False), weights
+
+    # MLflow path: ``assessment`` is itself the decoded
+    # ``{enum_id: weight}`` mapping. Require numeric leaf values so a
+    # raw assessment dict that fell through above (nested ``expectation``
+    # / ``feedback`` etc.) doesn't get mis-parsed as the weights.
+    if (
+        isinstance(assessment, Mapping)
+        and assessment
+        and all(
+            isinstance(v, (int, float)) and not isinstance(v, bool)
+            for v in assessment.values()
+        )
+    ):
+        weights = dict(assessment)
+        return json.dumps(weights, ensure_ascii=False), weights
+
     return "{}", {}
 
 
@@ -1824,29 +1857,166 @@ def _extract_model(spans: list[dict[str, Any]]) -> str:
 
 
 # ── Prompt hashes (SKKB flavor) ────────────────────────────────────────
+#
+# TODO(peter-pr): The LangGraph-orchestrator branch in
+# `_get_agent_chat_system_prompt` is a compensation patch for the same
+# orchestrator regression that broke `agent_answer` emission (see
+# project memory `project_orchestrator_agent_answer_broken.md`, PR #388).
+# Once Peter's upstream PR lands and restores the prior span layout —
+# named `main_agent` / `daily_banking_agent` spans, ChatDatabricks
+# children of those, and `mlflow.spanInputs` shape
+# `[[{role, content}, ...]]` — the LangGraph fallback path (and the
+# dict-shape branch of `_chat_databricks_system_message`) becomes dead
+# code and should be removed in favour of the original legacy-only
+# implementation. Re-run the SKKB import smoke test on a post-fix trace
+# to confirm the legacy path alone produces non-empty hashes before
+# stripping the workaround.
+
+# Spans whose ChatDatabricks descendant is a reranker / parser call, not
+# an agent system prompt. Excluded from the LangGraph-format ancestry
+# scan in `_get_agent_chat_system_prompt`.
+_NON_AGENT_CHAT_ANCESTORS = frozenset({
+    "knowledge_rerank", "rerank", "RunnableSequence",
+})
+
+
+def _chat_databricks_system_message(span: Mapping[str, Any]) -> str:
+    """Return the first non-empty system-message content from a
+    ChatDatabricks span's ``mlflow.spanInputs``, or ``""``.
+
+    Handles two trace formats seen in this codebase:
+
+    * Legacy: ``[[{role, content}, ...]]`` — pre-LangGraph orchestrator
+      emitted spanInputs as a single-element list wrapping the message
+      list. The original implementation only accepted this shape.
+    * LangGraph orchestrator (current prod): ``{"messages": [...]}`` —
+      same message dicts, wrapped under a ``messages`` key.
+
+    Both shapes carry the same role/content message dicts, so once we
+    locate the message list the inner loop is identical.
+    """
+    span_inputs = _parse_attr_json(span.get("attributes") or {}, "mlflow.spanInputs")
+    messages: list[Any] | None = None
+    if isinstance(span_inputs, dict):
+        m = span_inputs.get("messages")
+        if isinstance(m, list):
+            messages = m
+    elif isinstance(span_inputs, list) and span_inputs:
+        if isinstance(span_inputs[0], list):
+            messages = span_inputs[0]
+        elif isinstance(span_inputs[0], dict):
+            # Defensive: a bare list of message dicts. Not observed in
+            # the wild but cheap to support and avoids a silent zero.
+            messages = span_inputs
+    if not messages:
+        return ""
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") == "system" or message.get("type") == "system":
+            content = message.get("content", "")
+            if isinstance(content, str) and content.strip():
+                return content
+    return ""
+
+
+def _ancestor_names(
+    span: Mapping[str, Any],
+    by_id: Mapping[str, Mapping[str, Any]],
+) -> list[str]:
+    """Walk ``parent_span_id`` links from ``span`` up to the root, returning
+    the chain of ancestor names (immediate parent first). Stops on cycle
+    or missing parent — both are defensive; neither should occur in
+    well-formed MLflow traces."""
+    chain: list[str] = []
+    seen: set[str] = set()
+    cur = span
+    while True:
+        psid = _to_str(cur.get("parent_span_id"))
+        if not psid or psid in seen:
+            break
+        seen.add(psid)
+        parent = by_id.get(psid)
+        if parent is None:
+            break
+        chain.append(_to_str(parent.get("name")))
+        cur = parent
+    return chain
+
 
 def _get_agent_chat_system_prompt(
     spans: list[dict[str, Any]],
     children: dict[str, list[dict[str, Any]]],
     agent_name: str,
 ) -> str:
+    """Return the system prompt for ``agent_name`` from a trace's spans.
+
+    Supports two orchestrator shapes — auto-detected, no flag needed:
+
+    1. **Legacy** — a span literally named ``agent_name`` exists. Walk
+       its descendants (via the pre-built ``children`` map, keyed on
+       ``parent_span_id``) and return the first ChatDatabricks's system
+       message. This is what the test fixtures and pre-LangGraph
+       production traces emit.
+
+    2. **LangGraph orchestrator** (current prod) — agents are LangGraph
+       subgraphs, not named spans, so the lookup above returns ``None``.
+       In that case identify the agent by walking each ChatDatabricks's
+       ancestor chain:
+
+       * ``main_agent``         → ChatDatabricks whose ancestors contain
+         NO ``transfer-to-*`` span (the supervisor's own LLM calls,
+         including the post-handoff "final answer" call).
+       * sub-agent (e.g.        → ChatDatabricks whose ancestors
+         ``daily_banking_agent``) contain ``transfer-to-{agent_name}``.
+
+       Reranker / parser ChatDatabricks calls (under ``knowledge_rerank``
+       / ``rerank`` / ``RunnableSequence``) are excluded from both
+       classifications — they aren't an agent prompt.
+
+    The first matching system prompt wins. In observed traces the
+    supervisor's multiple ChatDatabricks calls carry identical system
+    prompts, so "first match" matches "all matches".
+    """
+    # ── 1. Legacy format ────────────────────────────────────────────────
     agent = next((span for span in spans if span.get("name") == agent_name), None)
-    if agent is None:
+    if agent is not None:
+        stack = [agent]
+        while stack:
+            current = stack.pop()
+            if current.get("name") == "ChatDatabricks":
+                content = _chat_databricks_system_message(current)
+                if content:
+                    return content
+            stack.extend(children.get(_to_str(current.get("span_id")), []))
         return ""
-    stack = [agent]
-    while stack:
-        current = stack.pop()
-        if current.get("name") == "ChatDatabricks":
-            span_inputs = _parse_attr_json(current.get("attributes") or {}, "mlflow.spanInputs")
-            if isinstance(span_inputs, list) and span_inputs and isinstance(span_inputs[0], list):
-                for message in span_inputs[0]:
-                    if not isinstance(message, dict):
-                        continue
-                    if message.get("role") == "system" or message.get("type") == "system":
-                        content = message.get("content", "")
-                        if isinstance(content, str) and content.strip():
-                            return content
-        stack.extend(children.get(_to_str(current.get("span_id")), []))
+
+    # ── 2. LangGraph orchestrator format ────────────────────────────────
+    by_id: dict[str, dict[str, Any]] = {
+        _to_str(s.get("span_id")): s for s in spans if s.get("span_id")
+    }
+    transfer_marker = f"transfer-to-{agent_name}"
+    want_supervisor = (agent_name == "main_agent")
+
+    for span in spans:
+        if span.get("name") != "ChatDatabricks":
+            continue
+        ancestors = _ancestor_names(span, by_id)
+        if any(a in _NON_AGENT_CHAT_ANCESTORS for a in ancestors):
+            continue
+        has_any_transfer = any(a.startswith("transfer-to-") for a in ancestors)
+        if want_supervisor:
+            # Supervisor calls: top-level under LangGraph ← eval_item, with
+            # no `transfer-to-*` between the ChatDatabricks and the root.
+            if has_any_transfer:
+                continue
+        else:
+            # Sub-agent: ancestry must include the specific transfer marker.
+            if transfer_marker not in ancestors:
+                continue
+        content = _chat_databricks_system_message(span)
+        if content:
+            return content
     return ""
 
 
