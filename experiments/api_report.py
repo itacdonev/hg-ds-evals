@@ -260,6 +260,71 @@ def enrich(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def load_judge_lookup(path: Path) -> dict[str, dict[str, Any]]:
+    """Read an optional LLM-judge checkpoint CSV (produced by
+    experiments/api/notebooks/api_001_baseline_local.ipynb) and return a
+    test_case_id → {judge fields} lookup.
+
+    Only the columns the report consumes are extracted; missing columns
+    are tolerated so the function works on partial / older checkpoints.
+
+    Returning an empty dict means the file was loaded but no usable rows
+    were found — the caller can treat that the same as "no judge file
+    supplied".
+    """
+    df = pd.read_csv(path)
+    score_raw = pd.to_numeric(
+        df.get("language_compliance_score", pd.Series(dtype="float64")),
+        errors="coerce",
+    )
+    lookup: dict[str, dict[str, Any]] = {}
+    for idx, row in df.iterrows():
+        tcid = _safe_str(row.get("test_case_id"))
+        if not tcid:
+            continue
+        sv = score_raw.iat[idx]
+        score: int | None
+        if pd.isna(sv):
+            score = None
+        else:
+            score = int(sv)
+        lookup[tcid] = {
+            "language_compliance_score": score,
+            "user_query_detected_language": _safe_str(row.get("user_query_detected_language")),
+            "actual_response_detected_language": _safe_str(row.get("actual_response_detected_language")),
+            "language_mismatch_description": _safe_str(row.get("language_mismatch_description")),
+            "language_compliance_reasoning": _safe_str(row.get("language_compliance_reasoning")),
+            "language_overall_explanation": _safe_str(row.get("overall_explanation")),
+        }
+    return lookup
+
+
+def attach_judge_columns(df: pd.DataFrame, lookup: dict[str, dict[str, Any]]) -> pd.DataFrame:
+    """Add the LLM-judge columns onto the main scorer dataframe, joined
+    by ``test_case_id``. Rows without a judge entry receive NaN/empty
+    values; that's how downstream code distinguishes "judge ran for this
+    case" from "judge not run / not loaded".
+    """
+    out = df.copy()
+    tcid_series = out["test_case_id"].apply(_safe_str)
+    fields = (
+        "language_compliance_score",
+        "user_query_detected_language",
+        "actual_response_detected_language",
+        "language_mismatch_description",
+        "language_compliance_reasoning",
+        "language_overall_explanation",
+    )
+    for field in fields:
+        out[field] = tcid_series.map(
+            lambda tcid, _f=field: lookup.get(tcid, {}).get(_f)
+        )
+    out["language_compliance_score"] = pd.to_numeric(
+        out["language_compliance_score"], errors="coerce"
+    )
+    return out
+
+
 def load_baseline(path: Path) -> dict[str, dict[str, Any]]:
     """Load a previously-scored enriched-traces CSV and reduce it to a
     per-test-case lookup of strict-pass / issue-bucket.
@@ -444,6 +509,27 @@ def case_payload(df: pd.DataFrame, *,
         fixed = (baseline is not None) and prev_known and (not prev_pass) and strict_pass_now
         new_case = (baseline is not None) and (not prev_known)
 
+        # Optional LLM language-judge fields. These columns are only
+        # present when attach_judge_columns ran (i.e. --judge supplied).
+        # `language_judge` distinguishes "judge ran for this case" from
+        # "judge not loaded / not run"; the UI hides the section when
+        # the bool is False.
+        lc_raw = row.get("language_compliance_score")
+        try:
+            lc_num = float(lc_raw) if lc_raw is not None else None
+            if lc_num is not None and math.isnan(lc_num):
+                lc_num = None
+        except (TypeError, ValueError):
+            lc_num = None
+        if lc_num is None:
+            language_judge = False
+            language_compliance_score: int | None = None
+            language_fail = False
+        else:
+            language_judge = True
+            language_compliance_score = int(lc_num)
+            language_fail = language_compliance_score != 2
+
         cases.append(
             {
                 "id": _safe_str(row.get("test_case_id")),
@@ -523,6 +609,17 @@ def case_payload(df: pd.DataFrame, *,
                 "persistent_failure": bool(persistent_failure),
                 "fixed": bool(fixed),
                 "new_case": bool(new_case),
+                # LLM language-judge per-case payload. All keys are
+                # always present so the JS can branch on
+                # `language_judge` without optional-chaining.
+                "language_judge": language_judge,
+                "language_fail": bool(language_fail),
+                "language_compliance_score": language_compliance_score,
+                "user_query_lang": _safe_str(row.get("user_query_detected_language")),
+                "actual_response_lang": _safe_str(row.get("actual_response_detected_language")),
+                "language_mismatch_description": _safe_str(row.get("language_mismatch_description")),
+                "language_compliance_reasoning": _safe_str(row.get("language_compliance_reasoning")),
+                "language_overall_explanation": _safe_str(row.get("language_overall_explanation")),
             }
         )
     return cases
@@ -605,6 +702,19 @@ def compute_metrics(df: pd.DataFrame, *,
             n_new=n_new,
             n_comparable=n_comparable,
         )
+
+    # Optional LLM-language-judge integration. The column only exists
+    # when ``--judge`` was supplied AND attach_judge_columns ran above
+    # render_html. Absent column → loaded=False → summary card hidden.
+    if "language_compliance_score" in df.columns:
+        lc = pd.to_numeric(df["language_compliance_score"], errors="coerce")
+        scored_mask = lc.notna()
+        fail_mask = scored_mask & (lc != 2)
+        out["language_judge_loaded"] = True
+        out["language_scored"] = int(scored_mask.sum())
+        out["language_fail"] = int(fail_mask.sum())
+    else:
+        out["language_judge_loaded"] = False
     return out
 
 
@@ -665,14 +775,17 @@ def _bar(width_pct: float, color: str = "#1d69ec") -> str:
 
 def _render_headline_card(card: dict[str, Any]) -> str:
     """Render one headline-row card. Supports a clickable variant with
-    a ``filter_link`` + ``tone`` ("good" / "bad") for baseline-comparison
-    cards."""
+    a ``filter_link`` + ``tone`` ("good" / "bad"). The filter attribute
+    defaults to ``data-compare-filter`` (used by baseline-comparison
+    cards); callers can override with ``filter_attr`` to target a
+    different click handler (e.g. ``data-language-filter``)."""
     tip = _info_icon(card["tip"]) if card.get("tip") else ""
     if card.get("filter_link"):
         tone_cls = f" hc-{card.get('tone', '')}" if card.get("tone") else ""
+        attr = card.get("filter_attr", "data-compare-filter")
         return (
             f"<a href='#' class='headline-card hc-clickable{tone_cls}' "
-            f"data-compare-filter='{_h(card['filter_link'])}'>"
+            f"{attr}='{_h(card['filter_link'])}'>"
             f"<div class='hc-label'>{_h(card['label'])} {tip}</div>"
             f"<div class='hc-value'>{card['value']}</div>"
             "</a>"
@@ -727,68 +840,97 @@ def _summary_cards(metrics: dict[str, Any]) -> str:
 
 
 def _baseline_compare_cards(metrics: dict[str, Any]) -> str:
-    """Second headline row — Improvements / Regressions / Persistent fail.
+    """Second headline row — diagnostic / comparison cards.
 
-    Rendered only when a baseline run was supplied via ``--baseline``;
-    returns an empty string otherwise so the template can drop the whole
-    row when comparison isn't available.
+    Composed of two optional groups, both omitted unless their data
+    source was supplied at CLI invocation time:
 
-    Tones are fixed (improvements = green, regressions / persistent
-    fail = red) rather than adaptive — the colour is a category cue,
-    not a verdict on the count.
+      1. Improvements / Regressions / Persistent fail — rendered when
+         ``--baseline`` was supplied. Tones are fixed (improvements =
+         green, regressions / persistent fail = red); the colour is a
+         category cue, not a verdict on the count.
+      2. Language mismatch — rendered when ``--judge`` was supplied,
+         appended last. Clickable: filters the Test Cases tab to
+         language_compliance_score != 2.
+
+    Returns the empty string when neither source is loaded, so the
+    template drops the whole second row in that case.
     """
-    if not metrics.get("baseline_loaded"):
-        return ""
+    cards: list[dict[str, Any]] = []
 
-    n_reg = int(metrics.get("n_regression", 0))
-    n_persistent = int(metrics.get("n_persistent", 0))
-    n_fixed = int(metrics.get("n_fixed", 0))
-    n_new = int(metrics.get("n_new", 0))
-    n_comp = int(metrics.get("n_comparable", 0))
-    summary_line = (
-        f"{n_reg} regression · {n_persistent} persistent fail · "
-        f"{n_fixed} fixed · {n_new} new · {n_comp} comparable."
-    )
-    cards: list[dict[str, Any]] = [
-        {
-            "label": "Improvements",
-            "value": str(n_fixed),
-            "tip": (
-                "Cases that failed in the baseline run but pass in this run "
-                "(strict pass = routing + tool_usage + tool_parameter when "
-                "scored).\n\n"
-                f"{summary_line}\n"
-                "Click the card to filter the Test Cases tab to fixed cases."
-            ),
-            "filter_link": "fixed",
-            "tone": "good",
-        },
-        {
-            "label": "Regressions",
-            "value": str(n_reg),
-            "tip": (
-                "Cases that passed in the baseline run but fail in this "
-                "run (strict pass = routing + tool_usage + tool_parameter "
-                "when scored).\n\n"
-                f"{summary_line}\n"
-                "Click the card to filter the Test Cases tab to regressions."
-            ),
-            "filter_link": "regression",
-            "tone": "bad",
-        },
-        {
-            "label": "Persistent fail",
-            "value": str(n_persistent),
-            "tip": (
-                "Cases that failed in BOTH runs — strict pass missed in "
-                "the baseline AND in this run.\n\n"
-                f"{summary_line}\n"
-                "Click the card to filter the Test Cases tab to persistent fails."
-            ),
-            "filter_link": "persistent_failure",
-            "tone": "bad",
-        },
-    ]
+    if metrics.get("baseline_loaded"):
+        n_reg = int(metrics.get("n_regression", 0))
+        n_persistent = int(metrics.get("n_persistent", 0))
+        n_fixed = int(metrics.get("n_fixed", 0))
+        n_new = int(metrics.get("n_new", 0))
+        n_comp = int(metrics.get("n_comparable", 0))
+        summary_line = (
+            f"{n_reg} regression · {n_persistent} persistent fail · "
+            f"{n_fixed} fixed · {n_new} new · {n_comp} comparable."
+        )
+        cards.extend([
+            {
+                "label": "Improvements",
+                "value": str(n_fixed),
+                "tip": (
+                    "Cases that failed in the baseline run but pass in this run "
+                    "(strict pass = routing + tool_usage + tool_parameter when "
+                    "scored).\n\n"
+                    f"{summary_line}\n"
+                    "Click the card to filter the Test Cases tab to fixed cases."
+                ),
+                "filter_link": "fixed",
+                "tone": "good",
+            },
+            {
+                "label": "Regressions",
+                "value": str(n_reg),
+                "tip": (
+                    "Cases that passed in the baseline run but fail in this "
+                    "run (strict pass = routing + tool_usage + tool_parameter "
+                    "when scored).\n\n"
+                    f"{summary_line}\n"
+                    "Click the card to filter the Test Cases tab to regressions."
+                ),
+                "filter_link": "regression",
+                "tone": "bad",
+            },
+            {
+                "label": "Persistent fail",
+                "value": str(n_persistent),
+                "tip": (
+                    "Cases that failed in BOTH runs — strict pass missed in "
+                    "the baseline AND in this run.\n\n"
+                    f"{summary_line}\n"
+                    "Click the card to filter the Test Cases tab to persistent fails."
+                ),
+                "filter_link": "persistent_failure",
+                "tone": "bad",
+            },
+        ])
+
+    if metrics.get("language_judge_loaded"):
+        n_fail = int(metrics.get("language_fail", 0))
+        n_scored = int(metrics.get("language_scored", 0))
+        cards.append(
+            {
+                "label": "Language mismatch",
+                "value": str(n_fail),
+                "tip": (
+                    "LLM-judge count of cases where "
+                    "language_compliance_score != 2 — the agent answered "
+                    "in a different language than the user wrote in (or "
+                    "exhibited substantial mixing / Czech↔Slovak drift).\n\n"
+                    f"{n_fail} / {n_scored} cases scored by the judge.\n"
+                    "Click the card to filter the Test Cases tab to "
+                    "language mismatches."
+                ),
+                "filter_link": "fail",
+                "filter_attr": "data-language-filter",
+                "tone": "bad" if n_fail > 0 else "good",
+            }
+        )
+
     return "".join(_render_headline_card(c) for c in cards)
 
 
@@ -1969,6 +2111,10 @@ const activeFilters = {
   // provided. Values: "regression", "persistent_failure", "fixed",
   // "new_case". Empty Set = no comparison filter.
   compare: new Set(),
+  // Single-state boolean. True only when the user clicked the
+  // "Language mismatch" summary card. Filters the case list to
+  // language_compliance_score != 2 (judge-scored cases only).
+  language_fail: false,
   param_min: null,
   param_max: null,
 };
@@ -2116,6 +2262,7 @@ function matchesFilters(c) {
     if (activeFilters.param_min != null && v < activeFilters.param_min) return false;
     if (activeFilters.param_max != null && v > activeFilters.param_max) return false;
   }
+  if (activeFilters.language_fail && !c.language_fail) return false;
   return true;
 }
 
@@ -2333,6 +2480,9 @@ function updateActiveFilterBanner() {
     const b = activeFilters.param_max == null ? "" : activeFilters.param_max;
     msgs.push(`tool_parameter ∈ [<strong>${a}</strong>, <strong>${b}</strong>]`);
   }
+  if (activeFilters.language_fail) {
+    msgs.push(`language compliance = <strong>fail</strong>`);
+  }
   if (msgs.length) {
     txt.innerHTML = "Filtered by " + msgs.join(" · ");
     el.classList.add("visible");
@@ -2436,6 +2586,7 @@ function clearAllFilters() {
   activeFilters.personas.clear();
   activeFilters.tools.clear();
   if (activeFilters.compare) activeFilters.compare.clear();
+  activeFilters.language_fail = false;
   activeFilters.param_min = null;
   activeFilters.param_max = null;
   ["param-min", "param-max"].forEach(id => {
@@ -2789,8 +2940,35 @@ function selectCase(id) {
       </div>
     </div>
 
+    ${languageJudgeHtml(c)}
     ${enumSectionHtml(c)}
   `;
+}
+
+// LLM language-judge section. Rendered only when the judge ran for
+// this case (c.language_judge=true). Empty string when --judge wasn't
+// supplied or the case is missing from the judge checkpoint.
+function languageJudgeHtml(c) {
+  if (!c.language_judge) return "";
+  const pass = c.language_compliance_score === 2;
+  const badgeCls = pass ? "badge-good" : "badge-bad";
+  const badgeText = pass
+    ? `pass (score 2)`
+    : `fail (score ${c.language_compliance_score})`;
+  const mismatch = c.language_mismatch_description || "";
+  const reasoning = c.language_compliance_reasoning || "";
+  const overall = c.language_overall_explanation || "";
+  return `
+    <div class="detail-section bordered">
+      <h3>LLM language judge <span class="badge ${badgeCls}">${esc(badgeText)}</span></h3>
+      <dl class="kv">
+        <dt>User query lang</dt><dd><code>${esc(c.user_query_lang || "–")}</code></dd>
+        <dt>Response lang</dt><dd><code>${esc(c.actual_response_lang || "–")}</code></dd>
+        ${mismatch ? `<dt>Mismatch</dt><dd>${esc(mismatch)}</dd>` : ""}
+        ${reasoning ? `<dt>Reasoning</dt><dd>${esc(reasoning)}</dd>` : ""}
+        ${overall ? `<dt>Overall</dt><dd>${esc(overall)}</dd>` : ""}
+      </dl>
+    </div>`;
 }
 
 // ── Pretty tool-call rendering ──────────────────────────────────────────
@@ -3078,6 +3256,18 @@ document.addEventListener("click", e => {
     if (v) {
       clearAllFilters();
       activeFilters.compare.add(v);
+      document.querySelector('[data-target="tab-cases"]').click();
+      renderList();
+    }
+    return;
+  }
+  const languageA = e.target.closest && e.target.closest("[data-language-filter]");
+  if (languageA) {
+    e.preventDefault();
+    const v = languageA.dataset.languageFilter;
+    if (v === "fail") {
+      clearAllFilters();
+      activeFilters.language_fail = true;
       document.querySelector('[data-target="tab-cases"]').click();
       renderList();
     }
@@ -3405,6 +3595,15 @@ def main() -> None:
                         help="Path to the prompt sidecar JSON (or its directory). "
                              "If omitted, the report looks for "
                              "prompt_{source_run_id}.json next to the input CSV.")
+    parser.add_argument("--judge", type=Path, default=None,
+                        help="Optional LLM-judge checkpoint CSV produced by "
+                             "experiments/api/notebooks/api_001_baseline_local.ipynb. "
+                             "When set, the report adds a 'Language mismatch' "
+                             "card on the Summary tab (clickable → filters Test "
+                             "Cases to language_compliance_score != 2) and a "
+                             "Language judge section in each case detail. "
+                             "Joined to the main scorer CSV by test_case_id; "
+                             "missing rows have the judge section hidden.")
     args = parser.parse_args()
 
     input_path = args.input.expanduser().resolve()
@@ -3423,6 +3622,19 @@ def main() -> None:
 
     df = pd.read_csv(input_path)
     df = enrich(df)
+
+    # Optional LLM language-judge integration. When --judge is omitted
+    # the report is byte-identical to before; when provided, judge
+    # columns are joined onto df by test_case_id so compute_metrics /
+    # case_payload pick them up naturally.
+    if args.judge is not None:
+        judge_path = args.judge.expanduser().resolve()
+        if not judge_path.exists():
+            raise FileNotFoundError(f"Judge CSV does not exist: {judge_path}")
+        judge_lookup = load_judge_lookup(judge_path)
+        print(f"[judge] loaded {len(judge_lookup)} cases from {judge_path.name}")
+        df = attach_judge_columns(df, judge_lookup)
+
     html_text = render_html(df, input_path=input_path, output_path=output_path,
                             baseline=baseline_lookup, baseline_path=baseline_path,
                             prompts_path=args.prompts)

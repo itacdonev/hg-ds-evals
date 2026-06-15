@@ -66,10 +66,10 @@ model:
 dataset:
   input_catalog: "uat_aut_chat00_catalog"
   input_schema: "evals_offline_db"
-  input_dataset: "dts_evals_skkb_exp_001_c9aab3865c0a401ba437192a5d7414e8"
-  mlflow_run_id: "c9aab3865c0a401ba437192a5d7414e8"
+  input_dataset: "dts_evals_skkb_exp_001_a40e59ca53e74482a8684277a4c808ef"
+  mlflow_run_id: "a40e59ca53e74482a8684277a4c808ef"
   mlflow_experiment_id: "2374936353493891"
-  mlflow_run_timestamp: "May 22, 2026, 10:32 PM"
+  mlflow_run_timestamp: "May 26, 2026, 03:25 PM"
   test_num_rows: null
   id_columns:
     - test_case_id

@@ -87,6 +87,63 @@ def _span(
     }
 
 
+def test_build_dataframe_accepts_pandas_csv_python_literals() -> None:
+    assessments = [
+        {
+            "assessment_name": "eval_item_id",
+            "last_update_time": "2026-01-01T00:00:00Z",
+            "expectation": {"value": "smoke-001"},
+        },
+        {
+            "assessment_name": "expected_agent",
+            "last_update_time": "2026-01-01T00:00:00Z",
+            "expectation": {"value": "daily_banking_agent"},
+        },
+        {
+            "assessment_name": "expected_tool_calls",
+            "last_update_time": "2026-01-01T00:00:00Z",
+            "expectation": {
+                "value": [
+                    {
+                        "tool": "analyze_transactions",
+                        "parameters": {"group_by": "group_none"},
+                    }
+                ]
+            },
+        },
+        {
+            "assessment_name": "scorers",
+            "last_update_time": "2026-01-01T00:00:00Z",
+            "expectation": {"value": ["agent_routing", "tool_input_parameters"]},
+        },
+    ]
+    traces_df = pd.DataFrame(
+        [
+            {
+                "trace_id": "tr-cache-roundtrip",
+                "trace_metadata": repr(
+                    {"mlflow.traceInputs": json.dumps({"messages": [["human", "Hi"]]})}
+                ),
+                "tags": repr({}),
+                "assessments": repr(assessments),
+                "spans": repr([]),
+            }
+        ]
+    )
+
+    result = build_dataframe_from_mlflow_traces(traces_df)
+
+    assert result.parse_errors == []
+    row = result.dataframe.iloc[0]
+    assert row["test_case_id"] == "smoke-001"
+    assert row["expected_agent"] == "daily_banking_agent"
+    assert row["expected_tool_calls"] == [
+        {"tool": "analyze_transactions", "parameters": {"group_by": "group_none"}}
+    ]
+    assert row["scorers_to_run"] == ["agent_routing", "tool_parameter"]
+    assert row["assessments_raw"] == assessments
+
+
 def test_build_skkb_dataframe_uses_test_case_id_from_assessment() -> None:
     traces_df = pd.DataFrame(
         [

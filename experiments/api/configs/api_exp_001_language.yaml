@@ -52,7 +52,7 @@ experiment:
 model:
   model_deployment_name: "gpt-5-1"
   api_provider: "databricks_async"
-  databricks_endpoint_url: "https://adb-3174992876438447.7.azuredatabricks.net/serving-endpoints/gpt-5-1/invocations"
+  databricks_endpoint_url: "https://adb-7405614616397813.13.azuredatabricks.net/serving-endpoints/gpt-5-1/invocations"
   temperature: null
   max_output_tokens: 4000
   reasoning_effort: "medium"
@@ -61,15 +61,13 @@ model:
 
 
 # ── Dataset Configuration ────────────────────────────────────
-# Source table produced by experiments/api/notebooks/import_traces_local.ipynb
-# with RUN_DATE = "hajek_prompt" (RUN_ID = 76b28353ceb2474b8aad150d1ce7313f).
 dataset:
-  mlflow_run_id: "76b28353ceb2474b8aad150d1ce7313f"
-  mlflow_experiment_id: "471458066277040"
-  mlflow_run_name: "offline/smoke/pr12-kb-smoke/infer (hajek_prompt)"
-  input_catalog: "prod_aut_chat00_lab_catalog"
-  input_schema: "private_uc0115_aix_db"
-  input_dataset: "dts_eval_ts100_exp_001_76b28353ceb2474b8aad150d1ce7313f"
+  mlflow_run_id: "8502871b6f55495a8593f3bbeab44fe5"
+  mlflow_experiment_id: "2374936353493891"
+  mlflow_run_name: "offline/smoke/9021779629/smoke_100_tool_calls_new.with_judge.sk/infer"
+  input_catalog: "uat_aut_chat00_catalog"
+  input_schema: "evals_offline_db"
+  input_dataset: "dts_eval_ts100_exp_001_8502871b6f55495a8593f3bbeab44fe5"
   test_num_rows: null
   id_columns:
     - test_case_id

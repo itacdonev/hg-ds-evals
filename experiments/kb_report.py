@@ -2159,19 +2159,62 @@ _PROMPT_HASH_COLS = (
 def _load_prompt_sidecar(prompts_path: Path | None,
                           checkpoint_path: Path | None,
                           run_id: str) -> dict | None:
-    """Find ``prompt_{run_id}.json``: explicit flag → next to checkpoint."""
-    candidate: Path | None = None
+    """Find ``prompt_{run_id}.json`` for the Prompts tab.
+
+    Search order, first hit wins:
+
+      1. ``--prompts`` CLI flag (explicit override). When a directory,
+         appended with ``prompt_{run_id}.json``; when a file, used as-is.
+      2. Next to the checkpoint CSV. This is where
+         :mod:`backfill_prompt_hashes` writes the sidecar.
+      3. Walking up from the checkpoint directory, looking for a sibling
+         ``input/`` containing ``prompt_{run_id}.json``. This is where the
+         SKKB / CZKB import notebook writes it (next to the source traces
+         pickle, NOT next to the checkpoint — the eval pipeline produces
+         checkpoints in a different directory, so colocation isn't
+         possible at write time).
+
+    Returns ``None`` when run_id is empty, when no candidate exists, or
+    when the file can't be parsed as JSON.
+    """
     if prompts_path is not None:
-        if prompts_path.is_dir():
-            candidate = prompts_path / f"prompt_{run_id}.json" if run_id else None
-        else:
-            candidate = prompts_path
-    elif checkpoint_path is not None and run_id:
-        candidate = checkpoint_path.parent / f"prompt_{run_id}.json"
-    if candidate is None or not candidate.exists():
+        candidate = (prompts_path / f"prompt_{run_id}.json"
+                     if (prompts_path.is_dir() and run_id) else prompts_path)
+        return _read_sidecar_json(candidate)
+    if not run_id or checkpoint_path is None:
+        return None
+    # Resolve to absolute up front. A relative checkpoint path (the common
+    # case when running from a notebook directory) bottoms out at Path(".")
+    # after 2–3 parent-traversals; without resolve() the upward walk below
+    # never reaches the `experiments/<lang>kb/input/` level where the
+    # import notebook writes the sidecar.
+    ckpt_abs = checkpoint_path.expanduser().resolve()
+    next_to_ckpt = ckpt_abs.parent / f"prompt_{run_id}.json"
+    payload = _read_sidecar_json(next_to_ckpt)
+    if payload is not None:
+        return payload
+    # Walk upward looking for a sibling `input/` dir with the sidecar. Bound
+    # the walk so a misconfigured checkpoint path can't traverse the whole
+    # filesystem; 6 levels covers the deepest layout we ship today
+    # (experiments/<lang>kb/notebooks/checkpoints/<subdir>/file.csv).
+    directory = ckpt_abs.parent
+    for _ in range(6):
+        candidate = directory / "input" / f"prompt_{run_id}.json"
+        payload = _read_sidecar_json(candidate)
+        if payload is not None:
+            return payload
+        parent = directory.parent
+        if parent == directory:
+            break
+        directory = parent
+    return None
+
+
+def _read_sidecar_json(path: Path) -> dict | None:
+    if not path.exists():
         return None
     try:
-        return json.loads(candidate.read_text(encoding="utf-8"))
+        return json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return None
 
@@ -2308,6 +2351,39 @@ def _prompts_tab(sidecar: dict | None, run_id: str) -> str:
         f"{tool_section}"
         "</div>"
     )
+
+
+def _mlflow_run_url(host: str, experiment_id: str, run_id: str) -> str:
+    """Build a Databricks MLflow run URL from the components on hand.
+
+    Pattern:
+        {host}/ml/experiments/{experiment_id}/runs/{run_id}?o={workspace_id}
+
+    The workspace ID is the digits in the ``adb-{ws_id}.{shard}`` portion
+    of the host — Databricks needs ``?o=<ws_id>`` for the URL to resolve
+    correctly when the user is signed into multiple workspaces. Returns
+    "" when any of host/experiment_id/run_id is missing, so call sites
+    can fall back to plain ``<code>`` text.
+    """
+    if not host or not experiment_id or not run_id:
+        return ""
+    m = re.match(r"https://adb-(\d+)\.\d+\.azuredatabricks\.net", host)
+    if m is None:
+        return ""
+    ws_id = m.group(1)
+    return (f"{host}/ml/experiments/{experiment_id}/runs/{run_id}"
+            f"?o={ws_id}")
+
+
+def _mlflow_experiment_url(host: str, experiment_id: str) -> str:
+    """Companion to :func:`_mlflow_run_url`: link to all runs in an experiment."""
+    if not host or not experiment_id:
+        return ""
+    m = re.match(r"https://adb-(\d+)\.\d+\.azuredatabricks\.net", host)
+    if m is None:
+        return ""
+    ws_id = m.group(1)
+    return f"{host}/ml/experiments/{experiment_id}?o={ws_id}"
 
 
 def _ids_filter_link(ids: list[str], label: str, *, classes: str = "judge-eval-link",
@@ -2887,6 +2963,113 @@ def _inline_delta_html(baseline_val, current_val, fmt: str, good_dir: str,
         f"{arrow} {delta_str}"
         "</div>"
     )
+
+
+def _baseline_compare_counts(df: pd.DataFrame,
+                              baseline: dict | None) -> dict[str, int]:
+    """Count per-case baseline comparison flags across df.
+
+    Mirrors :func:`_baseline_compare_fields` but aggregates over the whole
+    frame in one pass so the Summary tab can show Improvements / Regressions
+    / Persistent-fail headline counts without re-iterating the case payload.
+
+    Returned keys: ``n_fixed``, ``n_regression``, ``n_persistent``,
+    ``n_new``, ``n_comparable`` (= sum of fixed + regression + persistent —
+    cases where both runs had a definite pass verdict).
+    """
+    empty = {"n_fixed": 0, "n_regression": 0, "n_persistent": 0,
+              "n_new": 0, "n_comparable": 0}
+    if not baseline or not isinstance(baseline.get("cases"), dict):
+        return empty
+    lookup: dict = baseline["cases"]
+    if "test_case_id" not in df.columns or "pass" not in df.columns:
+        return empty
+    n_fixed = n_reg = n_persistent = n_new = 0
+    for _, row in df.iterrows():
+        tcid = row.get("test_case_id")
+        if not isinstance(tcid, str) or not tcid:
+            continue
+        prev = lookup.get(tcid)
+        now_pass_raw = row.get("pass")
+        now_pass = bool(now_pass_raw) if pd.notna(now_pass_raw) else None
+        if prev is None:
+            n_new += 1
+            continue
+        prev_pass = prev.get("judge_pass")
+        if prev_pass is None or now_pass is None:
+            continue
+        if prev_pass and not now_pass:
+            n_reg += 1
+        elif (not prev_pass) and now_pass:
+            n_fixed += 1
+        elif (not prev_pass) and (not now_pass):
+            n_persistent += 1
+    return {
+        "n_fixed":       n_fixed,
+        "n_regression":  n_reg,
+        "n_persistent":  n_persistent,
+        "n_new":         n_new,
+        "n_comparable":  n_fixed + n_reg + n_persistent,
+    }
+
+
+def _baseline_compare_cards_html(counts: dict[str, int],
+                                   baseline_label: str) -> str:
+    """Headline-row cards (Improvements / Regressions / Persistent fail).
+
+    Each card is a clickable anchor carrying ``data-compare-filter`` —
+    the global click delegator routes it into ``activeFilters.compare``
+    and switches to the Test Cases tab. Returns "" when there is no
+    baseline (so the row is dropped from the Summary template).
+    """
+    if not counts:
+        return ""
+    n_fixed = int(counts.get("n_fixed", 0))
+    n_reg = int(counts.get("n_regression", 0))
+    n_persistent = int(counts.get("n_persistent", 0))
+    n_new = int(counts.get("n_new", 0))
+    n_comp = int(counts.get("n_comparable", 0))
+    summary_line = (
+        f"{n_reg} regression · {n_persistent} persistent fail · "
+        f"{n_fixed} fixed · {n_new} new · {n_comp} comparable."
+    )
+    baseline_ref = f" <code>{_h(baseline_label)}</code>" if baseline_label else ""
+    cards: list[tuple[str, int, str, str]] = [
+        ("Improvements", n_fixed, "fixed", "good"),
+        ("Regressions", n_reg, "regression", "bad"),
+        ("Persistent fail", n_persistent, "persistent_failure", "bad"),
+    ]
+    tips = {
+        "fixed":
+            "Cases that failed in the baseline run but pass in this run "
+            "(judge pass = weighted_avg ≥ threshold AND no critical scorer "
+            "at 0).",
+        "regression":
+            "Cases that passed in the baseline run but fail in this run.",
+        "persistent_failure":
+            "Cases that failed in BOTH runs — judge pass missed in the "
+            "baseline AND in this run.",
+    }
+    pieces: list[str] = []
+    for label, value, fkey, tone in cards:
+        tip = (
+            f"{tips[fkey]}\n\n"
+            f"vs baseline{baseline_ref}\n"
+            f"{summary_line}\n"
+            f"Click the card to filter the Test Cases tab."
+        )
+        pieces.append(
+            f"<a href='#' class='headline-card hc-clickable hc-{tone}' "
+            f"data-compare-filter='{fkey}'>"
+            f"<div class='hc-label'>{_h(label)} {_info_icon(tip)}</div>"
+            f"<div class='hc-value'>{value}</div>"
+            "</a>"
+        )
+    title = (
+        f"<div class='top-failure-title'>Vs. baseline{baseline_ref} "
+        f"{_info_icon(summary_line)}</div>"
+    )
+    return title + f"<div class='headline-row headline-row-3'>{''.join(pieces)}</div>"
 
 
 def _top_failures_html(top: list[dict], n_fail_clean: int,
@@ -4222,6 +4405,11 @@ code { font-family: monospace; font-size: 12px; background: #e7effd; padding: 1p
                                      border-top: 1px solid rgba(255,255,255,.18); }
 .header-meta-grid .header-aux { color: rgba(255,255,255,.7); font-weight: 400; }
 .header-meta-grid code { word-break: break-all; }
+/* MLflow run / experiment hyperlinks in the header. Underline-on-hover so
+   they read as clickable without competing visually with the page title. */
+.mlflow-link { color: inherit; text-decoration: none; border-bottom: 1px dotted rgba(255,255,255,.55); }
+.mlflow-link:hover { border-bottom-color: rgba(255,255,255,.95); }
+.mlflow-link code { color: inherit; }
 @media (max-width: 720px) {
   .header-meta-grid { grid-template-columns: minmax(0, 1fr); }
 }
@@ -5029,6 +5217,27 @@ hr.enum-divider { border: none; border-top: 1px solid #c8d3e1;
                             letter-spacing: -0.02em; }
 .headline-card .hc-detail { font-size: 12px; color: #5c7999; margin-top: auto;
                               padding-top: 8px; }
+/* Clickable card variant — used by the baseline-compare cards
+   (Improvements / Regressions / Persistent fail). Tones encode the
+   category, not the value: improvements green, regressions / persistent
+   red. */
+a.headline-card.hc-clickable { text-decoration: none; cursor: pointer;
+                                transition: box-shadow 0.12s ease,
+                                            transform 0.12s ease; }
+a.headline-card.hc-clickable:hover { box-shadow: 0 4px 12px rgba(10,40,92,.12);
+                                       transform: translateY(-1px); }
+a.headline-card.hc-bad  { border-left: 3px solid #cf2a1e; }
+a.headline-card.hc-bad  .hc-value { color: #cf2a1e; }
+a.headline-card.hc-good { border-left: 3px solid #057f19; }
+a.headline-card.hc-good .hc-value { color: #057f19; }
+/* Sidebar Vs. baseline chip tones — same green/red language as the cards
+   so the eye links the sidebar selection to the headline category. */
+.chip-cmp-bad  { background: #fde5e3; color: #8b1a10; border: 1px solid #f3d6d2; }
+.chip-cmp-bad:hover  { background: #fbd0cc; }
+.chip-cmp-bad.active { background: #cf2a1e; color: #fff; border-color: #cf2a1e; }
+.chip-cmp-good { background: #dff5ea; color: #036c4d; border: 1px solid #c5e8d5; }
+.chip-cmp-good:hover  { background: #c5e8d5; }
+.chip-cmp-good.active { background: #057f19; color: #fff; border-color: #057f19; }
 /* Inline Δ chip rendered under a card's main value (Pass rate, KB
    Recall, Rel2 mean, and each Top-issue card). The arrow encodes the
    numeric direction of change vs the baseline; the colour encodes
@@ -5785,7 +5994,12 @@ const activeFilters = { rc: null, flag: null, rel2_min: null, rel2_max: null,
                           lat_min: null, lat_max: null,
                           dim_pairs: [], missed_enum: null,
                           case_id_set: null, case_id_label: null,
-                          failure_modes: new Set() };
+                          failure_modes: new Set(),
+                          // Baseline-comparison multi-select. Values are the
+                          // per-case flag keys: "regression", "persistent_failure",
+                          // "fixed", "new_case". OR within the group (any selected
+                          // flag matching the case keeps it).
+                          compare: new Set() };
 
 function esc(s) {
   if (s == null) return "";
@@ -5874,6 +6088,16 @@ function matchesFilters(c) {
     if (!inPool.includes(target) && !notPool.includes(target)) return false;
   }
   if (activeFilters.case_id_set && !activeFilters.case_id_set.has(String(c.id))) return false;
+  if (activeFilters.compare && activeFilters.compare.size) {
+    // OR within the group: case matches if any selected baseline flag is
+    // true on it. Flags are mutually exclusive per case (regression /
+    // persistent_failure / fixed / new_case) so OR is what we want.
+    let hit = false;
+    for (const v of activeFilters.compare) {
+      if (c[v]) { hit = true; break; }
+    }
+    if (!hit) return false;
+  }
   if (activeFilters.failure_modes && activeFilters.failure_modes.size) {
     const all = Array.isArray(c.failure_modes_all) ? c.failure_modes_all : [];
     let hit = false;
@@ -5996,6 +6220,8 @@ function syncChipStates() {
     const value = btn.dataset.value;
     if (group === "failure_modes") {
       btn.classList.toggle("active", activeFilters.failure_modes.has(value));
+    } else if (group === "compare") {
+      btn.classList.toggle("active", activeFilters.compare.has(value));
     } else {
       btn.classList.toggle("active", activeFilters[group] === value);
     }
@@ -6013,6 +6239,14 @@ function bindChips() {
           activeFilters.failure_modes.delete(value);
         } else {
           activeFilters.failure_modes.add(value);
+        }
+      } else if (group === "compare") {
+        // Multi-select baseline-comparison group (Regression / Persistent /
+        // Fixed / New). OR-combined inside matchesFilters.
+        if (activeFilters.compare.has(value)) {
+          activeFilters.compare.delete(value);
+        } else {
+          activeFilters.compare.add(value);
         }
       } else {
         // Single-select: clicking the active chip deselects it.
@@ -6033,6 +6267,7 @@ function bindChips() {
     activeFilters.case_id_set = null;
     activeFilters.case_id_label = null;
     activeFilters.failure_modes.clear();
+    activeFilters.compare.clear();
     ["rel2-min","rel2-max","wavg-min","wavg-max","lat-min","lat-max"].forEach(id => {
       const el = document.getElementById(id); if (el) el.value = "";
     });
@@ -6713,6 +6948,33 @@ function bindTableFilters() {
 // Event delegation so anchors rendered inside filterable tables (which may be
 // missed by direct querySelectorAll if table bodies are rebuilt) always work.
 document.addEventListener("click", e => {
+  // Headline-card click on the Summary tab — wires the Improvements /
+  // Regressions / Persistent fail cards into the Test Cases compare filter.
+  const compareA = e.target.closest && e.target.closest("[data-compare-filter]");
+  if (compareA) {
+    e.preventDefault();
+    const v = compareA.dataset.compareFilter;
+    if (v) {
+      activeFilters.rc = null; activeFilters.flag = null;
+      activeFilters.rel2_min = null; activeFilters.rel2_max = null;
+      activeFilters.wavg_min = null; activeFilters.wavg_max = null;
+      activeFilters.lat_min = null; activeFilters.lat_max = null;
+      activeFilters.dim_pairs = [];
+      activeFilters.missed_enum = null;
+      activeFilters.case_id_set = null;
+      activeFilters.case_id_label = null;
+      activeFilters.failure_modes.clear();
+      activeFilters.compare.clear();
+      activeFilters.compare.add(v);
+      ["rel2-min","rel2-max","wavg-min","wavg-max","lat-min","lat-max"].forEach(id => {
+        const el = document.getElementById(id); if (el) el.value = "";
+      });
+      syncChipStates();
+      document.querySelector('[data-target="tab-cases"]').click();
+      renderList();
+    }
+    return;
+  }
   const caseA = e.target.closest && e.target.closest("a.case-link");
   if (caseA) {
     e.preventDefault();
@@ -7743,6 +8005,7 @@ def render_html(df: pd.DataFrame, *, df_all: pd.DataFrame | None = None,
                 mlflow_run_id: str = "",
                 mlflow_experiment_id: str = "",
                 mlflow_run_timestamp: str = "",
+                databricks_host: str = "",
                 include_latency: bool = False,
                 checkpoint_path: Path | None = None,
                 prompts_path: Path | None = None,
@@ -7862,6 +8125,39 @@ def render_html(df: pd.DataFrame, *, df_all: pd.DataFrame | None = None,
         '<button class="chip" data-group="flag" data-value="pass">Pass</button>'
         '<button class="chip" data-group="flag" data-value="fail">Fail</button>'
     )
+    # ── Baseline-compare surfaces (Summary cards + sidebar filter chips) ────
+    # Both only render when --baseline was supplied; otherwise both helpers
+    # return "" so the template drops them.
+    compare_counts = _baseline_compare_counts(df_all, baseline) if baseline else {}
+    baseline_compare_cards_html = (
+        _baseline_compare_cards_html(compare_counts,
+                                       (baseline or {}).get("label", ""))
+        if baseline else ""
+    )
+    if baseline:
+        compare_chips_html = (
+            '<button class="chip chip-cmp-bad" data-group="compare" data-value="regression" '
+            'title="Cases that passed in the baseline run but fail in this run">Regression</button>'
+            '<button class="chip chip-cmp-bad" data-group="compare" data-value="persistent_failure" '
+            'title="Cases that failed in BOTH runs">Persistent fail</button>'
+            '<button class="chip chip-cmp-good" data-group="compare" data-value="fixed" '
+            'title="Cases that failed in the baseline run but pass in this run">Fixed</button>'
+            '<button class="chip" data-group="compare" data-value="new_case" '
+            'title="Cases with no entry in the baseline run">New</button>'
+        )
+        compare_filter_group_html = (
+            '<div class="filter-group foldable-filter">'
+            '<details class="dim-matrix-details" open>'
+            '<summary class="dim-matrix-summary">'
+            '<span class="filter-label">Vs. baseline</span>'
+            '</summary>'
+            f'<div class="foldable-filter-body">{compare_chips_html}</div>'
+            '</details>'
+            '</div>'
+        )
+    else:
+        compare_filter_group_html = ""
+
     flag_chips = (
         '<button class="chip" data-group="flag" data-value="kb_scope">KB-scope</button>'
         '<button class="chip" data-group="flag" data-value="dba_no_tools">DBA no tools</button>'
@@ -7941,6 +8237,45 @@ def render_html(df: pd.DataFrame, *, df_all: pd.DataFrame | None = None,
     # configured for the run (CSAS_BENCHMARK_REL2 is None — set by
     # --no-benchmark or absent from the per-lang BENCHMARKS dict), the
     # cell shows "–" with no green tint and the tooltip explains why.
+    # ── MLflow run / experiment hyperlinks in the header ──────────────
+    # Build the Databricks URLs when the YAML carries enough info
+    # (databricks_host extracted from model.databricks_endpoint_url +
+    # mlflow_experiment_id + mlflow_run_id). Otherwise fall back to the
+    # original plain-<code> rendering so non-Databricks runs still look
+    # right. Links open in a new tab so the report stays open.
+    _mlflow_run_link = _mlflow_run_url(databricks_host, mlflow_experiment_id, mlflow_run_id)
+    _mlflow_exp_link = _mlflow_experiment_url(databricks_host, mlflow_experiment_id)
+    if mlflow_experiment_id:
+        if _mlflow_exp_link:
+            mlflow_experiment_header_html = (
+                f"<span>MLflow experiment: "
+                f"<a class='mlflow-link' href='{_h(_mlflow_exp_link)}' "
+                f"target='_blank' rel='noopener' "
+                f"title='Open MLflow experiment in Databricks'>"
+                f"<code>{_h(mlflow_experiment_id)}</code></a></span>"
+            )
+        else:
+            mlflow_experiment_header_html = (
+                f"<span>MLflow experiment: <code>{_h(mlflow_experiment_id)}</code></span>"
+            )
+    else:
+        mlflow_experiment_header_html = "<span>MLflow experiment: <code>—</code></span>"
+    if mlflow_run_id:
+        if _mlflow_run_link:
+            mlflow_run_header_html = (
+                f"<span>MLflow run: "
+                f"<a class='mlflow-link' href='{_h(_mlflow_run_link)}' "
+                f"target='_blank' rel='noopener' "
+                f"title='Open MLflow run in Databricks'>"
+                f"<code>{_h(mlflow_run_id)}</code></a></span>"
+            )
+        else:
+            mlflow_run_header_html = (
+                f"<span>MLflow run: <code>{_h(mlflow_run_id)}</code></span>"
+            )
+    else:
+        mlflow_run_header_html = "<span>MLflow run: <code>—</code></span>"
+
     _rel2_mean_val = summary_metrics.get("rel2_mean")
     _rel2_beats_csas = (
         CSAS_BENCHMARK_REL2 is not None
@@ -8200,8 +8535,8 @@ def render_html(df: pd.DataFrame, *, df_all: pd.DataFrame | None = None,
     <div class="header-meta header-meta-grid">
       <div class="header-col">
         <span>Run time: <strong>{_h(mlflow_run_timestamp) if mlflow_run_timestamp else '—'}</strong></span>
-        {f'<span>MLflow experiment: <code>{_h(mlflow_experiment_id)}</code></span>' if mlflow_experiment_id else '<span>MLflow experiment: <code>—</code></span>'}
-        {f'<span>MLflow run: <code>{_h(mlflow_run_id)}</code></span>' if mlflow_run_id else '<span>MLflow run: <code>—</code></span>'}
+        {mlflow_experiment_header_html}
+        {mlflow_run_header_html}
       </div>
       <div class="header-col">
         <span>KB version: <code>{_h(kb_version_label)}</code></span>
@@ -8310,6 +8645,8 @@ def render_html(df: pd.DataFrame, *, df_all: pd.DataFrame | None = None,
       </div>
     </div>
 
+    {baseline_compare_cards_html}
+
     {_top_failures_html(summary_metrics['top_failures_clean'], summary_metrics['n_fail_clean'], baseline=baseline)}
 
     <div class="card foldable collapsed">
@@ -8400,6 +8737,7 @@ def render_html(df: pd.DataFrame, *, df_all: pd.DataFrame | None = None,
               <div class="foldable-filter-body">{flag_chips}</div>
             </details>
           </div>
+          {compare_filter_group_html}
           <div class="filter-group">
             <span class="filter-label">Rel2</span>
             <div class="rel2-range">
@@ -8774,7 +9112,13 @@ def _detect_experiment_meta(yaml_name: str) -> dict:
     """
     out = {"name": yaml_name, "judge_model": "unknown", "reasoning_effort": "unknown",
            "mlflow_run_id": "", "mlflow_experiment_id": "",
-           "mlflow_run_timestamp": ""}
+           "mlflow_run_timestamp": "",
+           # Extracted from `model.databricks_endpoint_url` below — the
+           # workspace host part of `https://adb-{ws_id}.{shard}.azuredatabricks.net`.
+           # Empty when the YAML uses a non-Databricks api_provider or omits
+           # the endpoint URL, in which case the header links fall back to
+           # plain `<code>` text.
+           "databricks_host": ""}
     cfg = _resolve_yaml_path(yaml_name)
     if cfg is None:
         return out
@@ -8810,6 +9154,17 @@ def _detect_experiment_meta(yaml_name: str) -> dict:
                        model_block, re.MULTILINE)
         if m:
             out["reasoning_effort"] = m.group(1).strip()
+        # Pull the workspace host out of databricks_endpoint_url so the
+        # header can hyperlink MLflow IDs. We assume the MLflow experiment
+        # lives on the same workspace as the serving endpoint — true for
+        # every SKKB/CZKB run we've shipped. Add a dedicated `mlflow_host`
+        # field to the YAML if that ever stops holding.
+        m = re.search(
+            r'^\s+databricks_endpoint_url\s*:\s*"?(https://adb-\d+\.\d+\.azuredatabricks\.net)',
+            model_block, re.MULTILINE,
+        )
+        if m:
+            out["databricks_host"] = m.group(1).strip()
 
     dataset_block = _block("dataset")
     if dataset_block:
@@ -9010,6 +9365,7 @@ def main():
         mlflow_run_id=meta["mlflow_run_id"],
         mlflow_experiment_id=meta["mlflow_experiment_id"],
         mlflow_run_timestamp=meta["mlflow_run_timestamp"],
+        databricks_host=meta.get("databricks_host", ""),
         include_latency=args.include_latency,
         checkpoint_path=ckpt,
         prompts_path=args.prompts,

@@ -1,0 +1,9 @@
+[mcp_servers.mlflow]
+command = "/Users/SG7CB/Developer/hg-ds-evals/.venv/bin/mlflow"
+args = ["mcp", "run"]
+startup_timeout_sec = 20
+tool_timeout_sec = 120
+
+[mcp_servers.mlflow.env]
+MLFLOW_TRACKING_URI = "databricks://adb-uat"
+DATABRICKS_CONFIG_PROFILE = "adb-uat"

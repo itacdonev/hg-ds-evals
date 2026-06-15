@@ -27,6 +27,7 @@ empty rather than as a wrong guess.
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import re
@@ -199,29 +200,13 @@ def _to_plain_data(value: Any) -> Any:
 
 
 def _coerce_mapping(value: Any) -> dict[str, Any]:
-    value = _to_plain_data(value)
-    if isinstance(value, Mapping):
-        return dict(value)
-    if isinstance(value, str) and value.strip():
-        try:
-            loaded = json.loads(value)
-        except json.JSONDecodeError:
-            return {}
-        return dict(loaded) if isinstance(loaded, Mapping) else {}
-    return {}
+    parsed = _parse_json_like_payload(_to_plain_data(value))
+    return dict(parsed) if isinstance(parsed, Mapping) else {}
 
 
 def _coerce_list(value: Any) -> list[Any]:
-    value = _to_plain_data(value)
-    if isinstance(value, list):
-        return value
-    if isinstance(value, str) and value.strip():
-        try:
-            loaded = json.loads(value)
-        except json.JSONDecodeError:
-            return []
-        return loaded if isinstance(loaded, list) else []
-    return []
+    parsed = _parse_json_like_payload(_to_plain_data(value))
+    return parsed if isinstance(parsed, list) else []
 
 
 def _decode_json(value: Any) -> Any:
@@ -254,7 +239,10 @@ def _parse_json_like_payload(value: Any) -> Any:
         try:
             return json.loads(value)
         except json.JSONDecodeError:
-            return None
+            try:
+                return ast.literal_eval(value)
+            except (SyntaxError, ValueError):
+                return None
     return None
 
 
