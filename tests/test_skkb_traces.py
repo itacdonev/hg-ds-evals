@@ -8,6 +8,7 @@ from hg_ds_evals.preprocessing.skkb_traces import build_skkb_dataframe_from_mlfl
 from hg_ds_evals.preprocessing.traces import (
     build_dataframe_from_mlflow_traces,
     collect_run_prompts,
+    extract_agent_and_tool_calls,
     extract_agent_system_prompts,
     hash_tool_descriptions,
     write_prompt_sidecar,
@@ -963,6 +964,52 @@ def test_parse_trace_mlflow_emits_prompt_and_tool_hashes() -> None:
     assert row["daily_banking_agent_prompt_hash"] == _EMPTY_PROMPT_HASH
     assert row["tool_descriptions_hash"] == hash_tool_descriptions(tools)
     assert row["source_run_id"] == "run-xyz"
+
+
+def test_parse_trace_mlflow_ignores_parser_tool_spans_by_default() -> None:
+    """`agent_tool_call` is a parser span, not a real tool invocation, so
+    it must not land in `actual_tool_calls` — otherwise the tool_usage /
+    tool_parameter scorers see an unexpected (hallucinated) call and fail
+    the row. `ignore_tool_span_names=[]` opts every TOOL span back in."""
+    spans = [
+        _span(
+            "knowledge_search", span_id="t1", span_type="TOOL",
+            inputs={"query": "rates"}, outputs={"content": "ok"},
+        ),
+        _span(
+            "agent_tool_call", span_id="t2", span_type="TOOL",
+            inputs={"parsed": True}, outputs={"content": "parsed"},
+        ),
+    ]
+    traces_df = pd.DataFrame([_mlflow_trace_row(trace_id="tr-parser-span", spans=spans)])
+
+    default_row = build_dataframe_from_mlflow_traces(traces_df).dataframe.iloc[0]
+    assert [c["tool"] for c in default_row["actual_tool_calls"]] == ["knowledge_search"]
+
+    kept_row = build_dataframe_from_mlflow_traces(
+        traces_df, ignore_tool_span_names=[]
+    ).dataframe.iloc[0]
+    assert [c["tool"] for c in kept_row["actual_tool_calls"]] == [
+        "knowledge_search",
+        "agent_tool_call",
+    ]
+
+
+def test_extract_agent_and_tool_calls_respects_ignore_list() -> None:
+    """SKKB flavor (drives query_scope): the ignored parser span is kept
+    out of tools_called by default and re-included when filtering is off."""
+    spans = [
+        _span("knowledge_search", span_id="t1", span_type="TOOL", inputs={"q": "x"}),
+        _span("agent_tool_call", span_id="t2", span_type="TOOL", inputs={"parsed": 1}),
+    ]
+    default_names = {t["name"] for t in extract_agent_and_tool_calls(spans)["tools_called"]}
+    assert default_names == {"knowledge_search"}
+
+    kept_names = {
+        t["name"]
+        for t in extract_agent_and_tool_calls(spans, ignore_tool_span_names=[])["tools_called"]
+    }
+    assert kept_names == {"knowledge_search", "agent_tool_call"}
 
 
 # ── Sidecar writer ──────────────────────────────────────────────────────

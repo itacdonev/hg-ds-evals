@@ -78,6 +78,34 @@ _AGENT = "AGENT"
 # TOOL span's output payload.
 _TRANSFER_TOOL_PREFIX = "transfer-to-"
 
+# Some orchestrator builds emit TOOL-type spans that are not real agent
+# tool invocations but instrumentation / parsing wrappers — e.g.
+# ``agent_tool_call``, a span that merely parses the LLM's tool-call
+# output. Counting one as an ``actual_tool_calls`` entry makes the
+# ``tool_usage`` / ``tool_parameter`` scorers see an unexpected
+# ("hallucinated") call and fail the row, and also shifts ``query_scope``.
+# We drop them by exact span name — same intent as ``_TRANSFER_TOOL_PREFIX``
+# above but matched by name. Callers override via ``ignore_tool_span_names``
+# on the extractors and the public builders; pass an empty iterable to turn
+# filtering off entirely. (Both spellings are listed defensively — observed
+# traces emit the singular ``agent_tool_call``.)
+DEFAULT_IGNORED_TOOL_SPAN_NAMES = frozenset({"agent_tool_call", "agent_tool_calls"})
+
+
+def _coerce_ignored_tool_span_names(
+    value: Iterable[str] | None,
+) -> frozenset[str]:
+    """Normalize the *ignore tool spans* argument.
+
+    ``None`` ⇒ :data:`DEFAULT_IGNORED_TOOL_SPAN_NAMES`. Any other iterable
+    *replaces* the default — pass ``[*DEFAULT_IGNORED_TOOL_SPAN_NAMES,
+    "other_span"]`` to extend it, or ``[]`` to disable filtering.
+    """
+    if value is None:
+        return DEFAULT_IGNORED_TOOL_SPAN_NAMES
+    return frozenset(name for name in (_to_str(v) for v in value) if name)
+
+
 # Trace-level keys carrying a native test-case id.
 TRACE_TEST_CASE_KEYS = (
     "eval.test_case_id",   # NEW orchestrator (trace_schema v3 / GCAI-3581)
@@ -1034,7 +1062,10 @@ def _classify_architecture(agents_path: list[str]) -> str:
     return "none"
 
 
-def extract_agent_and_tool_calls(spans: list[dict[str, Any]]) -> dict[str, Any]:
+def extract_agent_and_tool_calls(
+    spans: list[dict[str, Any]],
+    ignore_tool_span_names: Iterable[str] | None = None,
+) -> dict[str, Any]:
     """Collect every ``langgraph_node`` and every TOOL span (SKKB flavor).
 
     Handles both orchestrator contracts:
@@ -1053,6 +1084,7 @@ def extract_agent_and_tool_calls(spans: list[dict[str, Any]]) -> dict[str, Any]:
       the eval scorer's perspective it is an agent invocation, not a
       tool call.
     """
+    ignored = _coerce_ignored_tool_span_names(ignore_tool_span_names)
     agents_seen: list[str] = []
     seen_set: set[str] = set()
     tools: list[dict[str, Any]] = []
@@ -1071,6 +1103,8 @@ def extract_agent_and_tool_calls(spans: list[dict[str, Any]]) -> dict[str, Any]:
                 if slug and slug not in seen_set:
                     seen_set.add(slug)
                     agents_seen.append(slug)
+                continue
+            if _to_str(span.get("name")) in ignored:
                 continue
             tools.append({
                 "name": span.get("name"),
@@ -1721,7 +1755,10 @@ def _select_final_knowledge_search_run(runs: list[dict[str, Any]]) -> dict[str, 
 
 # ── Eval flavor: tool calls + tool registry + model ────────────────────
 
-def _extract_actual_tool_calls(spans: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _extract_actual_tool_calls(
+    spans: list[dict[str, Any]],
+    ignore_tool_span_names: Iterable[str] | None = None,
+) -> list[dict[str, Any]]:
     """Extract every TOOL span as a scorer-ready dict (eval flavor).
 
     Each emitted dict carries the args under both ``arguments`` and
@@ -1733,13 +1770,21 @@ def _extract_actual_tool_calls(spans: list[dict[str, Any]]) -> list[dict[str, An
     delegate marker) — those are surfaced via ``actual_agents_path``
     instead. From the eval-scoring contract's perspective a sub-agent
     invocation is not a tool call.
+
+    Also skips TOOL spans whose name is in ``ignore_tool_span_names``
+    (default :data:`DEFAULT_IGNORED_TOOL_SPAN_NAMES`, e.g.
+    ``agent_tool_calls``) — parser/instrumentation spans that would
+    otherwise score as hallucinated tool calls.
     """
+    ignored = _coerce_ignored_tool_span_names(ignore_tool_span_names)
     calls: list[dict[str, Any]] = []
     step = 0
     for span in spans:
         if _span_type(span) != _TOOL:
             continue
         if _is_subagent_transfer_tool(span):
+            continue
+        if _to_str(span.get("name")) in ignored:
             continue
         step += 1
         attrs = span.get("attributes") or {}
@@ -2185,7 +2230,11 @@ def reapply_query_scope(df: pd.DataFrame) -> pd.DataFrame:
 
 # ── Per-trace builders ─────────────────────────────────────────────────
 
-def parse_trace_skkb(test_case_id: str, trace: dict[str, Any]) -> dict[str, Any]:
+def parse_trace_skkb(
+    test_case_id: str,
+    trace: dict[str, Any],
+    ignore_tool_span_names: Iterable[str] | None = None,
+) -> dict[str, Any]:
     """Build one SKKB/CZKB record from a normalized trace.
 
     ``agent_response`` comes strictly from the ``agent_answer`` span —
@@ -2253,7 +2302,7 @@ def parse_trace_skkb(test_case_id: str, trace: dict[str, Any]) -> dict[str, Any]
     tool_descriptions_hash = hash_tool_descriptions(tool_descriptions)
     trace_metadata_map = _coerce_mapping(info.get("trace_metadata"))
     source_run_id = _to_str(trace_metadata_map.get("mlflow.sourceRun"))
-    calls = extract_agent_and_tool_calls(spans)
+    calls = extract_agent_and_tool_calls(spans, ignore_tool_span_names)
     query_scope = classify_query_scope(calls["agents_called"], calls["tools_called"])
     trace_invariant_violations = check_trace_invariants(
         calls["agents_called"], calls["tools_called"], query_scope,
@@ -2399,6 +2448,7 @@ def parse_trace_skkb(test_case_id: str, trace: dict[str, Any]) -> dict[str, Any]
 
 def parse_trace_mlflow(
     trace: Mapping[str, Any],
+    ignore_tool_span_names: Iterable[str] | None = None,
 ) -> tuple[dict[str, Any], dict[str, dict[str, str]]]:
     """Build one eval-scoring record from a normalized trace.
 
@@ -2449,7 +2499,7 @@ def parse_trace_mlflow(
     expected_enums = sorted(expected_enums_weights.keys())
 
     actual_agents_path, actual_agent = _extract_actual_agent_path(spans)
-    actual_tool_calls = _extract_actual_tool_calls(spans)
+    actual_tool_calls = _extract_actual_tool_calls(spans, ignore_tool_span_names)
     actual_response = extract_agent_answer_span(spans)
 
     available_tools, tool_descriptions, registry_by_node = _extract_tool_registry(spans)
@@ -2515,8 +2565,14 @@ parse_trace = parse_trace_skkb
 
 def build_skkb_dataframe_from_mlflow_search_traces(
     traces_df: pd.DataFrame,
+    ignore_tool_span_names: Iterable[str] | None = None,
 ) -> SKKBParseResult:
-    """Build the SKKB/CZKB flat table from ``mlflow.search_traces`` pandas output."""
+    """Build the SKKB/CZKB flat table from ``mlflow.search_traces`` pandas output.
+
+    ``ignore_tool_span_names`` drops the named TOOL spans before
+    ``query_scope`` classification (default
+    :data:`DEFAULT_IGNORED_TOOL_SPAN_NAMES`).
+    """
     records: list[dict[str, Any]] = []
     parse_errors: list[tuple[str, str]] = []
     unmapped_trace_ids: list[str] = []
@@ -2528,7 +2584,9 @@ def build_skkb_dataframe_from_mlflow_search_traces(
             test_case_id = resolve_test_case_id(canonical)
             if test_case_id == trace_id:
                 unmapped_trace_ids.append(trace_id)
-            records.append(parse_trace_skkb(test_case_id, canonical))
+            records.append(
+                parse_trace_skkb(test_case_id, canonical, ignore_tool_span_names)
+            )
         except Exception as exc:
             parse_errors.append((trace_id, repr(exc)))
 
@@ -2539,11 +2597,19 @@ def build_skkb_dataframe_from_mlflow_search_traces(
     )
 
 
-def build_dataframe_from_mlflow_traces(traces_df: pd.DataFrame) -> MlflowParseResult:
+def build_dataframe_from_mlflow_traces(
+    traces_df: pd.DataFrame,
+    ignore_tool_span_names: Iterable[str] | None = None,
+) -> MlflowParseResult:
     """Build the canonical eval-scoring DataFrame.
 
     Accepts either the JSONL ``info``/``data`` shape or the live
     ``mlflow.search_traces`` flat shape.
+
+    ``ignore_tool_span_names`` drops the named TOOL spans from
+    ``actual_tool_calls`` before the deterministic scorers see them
+    (default :data:`DEFAULT_IGNORED_TOOL_SPAN_NAMES`, e.g.
+    ``agent_tool_calls``). Pass ``[]`` to score every TOOL span.
     """
     records: list[dict[str, Any]] = []
     parse_errors: list[ParseError] = []
@@ -2559,7 +2625,7 @@ def build_dataframe_from_mlflow_traces(traces_df: pd.DataFrame) -> MlflowParseRe
         trace_id = _to_str(trace_id_raw)
         try:
             canonical = normalize_mlflow_trace_row(raw_row)
-            record, registry_by_node = parse_trace_mlflow(canonical)
+            record, registry_by_node = parse_trace_mlflow(canonical, ignore_tool_span_names)
             if record.get("test_case_id") in (trace_id, "", None):
                 untagged.append(trace_id)
             records.append(record)

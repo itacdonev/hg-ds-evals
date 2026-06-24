@@ -45,7 +45,7 @@ def display_prompt(
     displayHTML(f"""
     <div style="background-color: {background_color}; padding: 20px; border-radius: 5px; border: 1px solid #ddd; max-height: {max_height}px; overflow-y: auto;">
         <h3 style="margin-top: 0; color: #333;">{title}</h3>
-        <pre style="white-space: pre-wrap; word-wrap: break-word; font-family: 'Courier New', monospace; font-size: {font_size}px; margin: 0;">
+        <pre style="white-space: pre-wrap; word-wrap: break-word; font-family: 'Courier New', monospace; font-size: {font_size}px; margin: 0; color: #000;">
 {prompt}
         </pre>
     </div>

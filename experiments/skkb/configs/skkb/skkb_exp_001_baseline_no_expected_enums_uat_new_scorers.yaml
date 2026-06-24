@@ -1,0 +1,796 @@
+# ─────────────────────────────────────────────────────────────
+# _new_scorers_skkb_exp_001_baseline_no_expected_enums_uat
+# ─────────────────────────────────────────────────────────────
+# Diagnostic LLM-as-a-judge evaluation of the SK (Slovak)
+# Knowledge-Base for Hey George.
+#
+# GOAL: identify what to improve on each stage of the pipeline —
+#   (a) the user query itself (ambiguous / clear),
+#   (b) retrieval/pruning quality (did the right ENUMs enter the post-prune candidate pool?),
+#   (c) reranker quality (did it pick the right ENUMs from the pool?),
+#   (d) retrieved/reranked KB content quality (is the available content deep enough?),
+#   (e) post-prune candidate-pool KB coverage (is enough relevant KB content available to select?),
+#   (f) final-answer quality (does agent_response match expected_response?),
+#   (g) language compliance (Slovak expected, Czech output is a bug).
+#
+#
+# Data prep: hg-ds-evals/experiments/skkb/notebooks/skkb_001_import_traces.ipynb
+# Input source: direct MLflow search_traces output.
+# ─────────────────────────────────────────────────────────────
+
+
+# ── Experiment Metadata ───────────────────────────────────────
+experiment:
+  name: "skkb_exp_001_baseline_no_expected_enums_uat_new_scorers"
+  persona: >
+    You are an expert evaluator assessing the end-to-end quality of a Slovak
+    retail-banking knowledge-base (KB) chatbot ('Hey George'), with the
+    goal of pinpointing concrete improvements for the bot/agent team, the
+    retrieval/reranker team, and the KB content team.
+  task: >
+    Diagnostic evaluation of ENUM selection quality, selected KB context,
+    best available post-prune candidate context adequacy, final-answer quality, and
+    language compliance.
+  description: >
+    Evaluate Slovak KB chatbot trace. Diagnose whether failures come from
+    retrieval, reranking/ENUM selection, selected KB context, retrieved/reranked
+    KB content quality, answer generation, language compliance, or test-case
+    quality. Use the provided Slovak inputs as evidence, but return all judge
+    reasoning and output fields in English only.
+
+  version: "1.0.0"
+  author: "Ita Ćirović Donev"
+  created_date: "2026-04-17"
+  tags:
+    - "baseline"
+    - "skkb"
+    - "kb-eval"
+    - "diagnostic"
+    - "uat"
+
+
+# ── Model Configuration ──────────────────────────────────────
+model:
+  model_deployment_name: "gpt-5-1"
+  api_provider: "databricks_async"
+  databricks_endpoint_url: "https://adb-7405614616397813.13.azuredatabricks.net/serving-endpoints/gpt-5-1/invocations"
+  temperature: null
+  max_output_tokens: 16000
+  reasoning_effort: "high"
+  max_concurrent_calls: 5
+  tpm_limit: 1_000_000
+
+
+# ── Dataset Configuration ────────────────────────────────────
+# Source table produced by skkb_001_import_traces.ipynb.
+dataset:
+  input_catalog: "uat_aut_chat00_catalog"
+  input_schema: "evals_offline_db"
+  input_dataset: "dts_evals_skkb_exp_001_003c668c41ba4319bf80e75399b99b35"
+  mlflow_run_id: "003c668c41ba4319bf80e75399b99b35"
+  mlflow_experiment_id: "2374936353493891"
+  mlflow_run_timestamp: "Jun 20, 2026, 08:08 PM"
+  test_num_rows: null
+  id_columns:
+    - test_case_id
+  eval_columns:
+    - test_case_id
+    - user_query
+    - pre_prune_enum_ids
+    - post_prune_candidates_text
+    - post_prune_enum_ids
+    - reranked_enum_ids
+    - reranked_kb_context
+    - expected_response
+    - agent_response
+  passthrough_columns:
+    - test_case_id
+    - trace_id
+    - user_query
+    - reranked_kb_context
+    - reranked_enum_ids
+    - raw_vector_db_retrieved_enum_ids
+    - raw_vector_db_retrieved_enum_count
+    - raw_vector_db_query_count
+    - raw_vector_db_retrieved_count_by_query
+    - raw_vector_db_query_limits
+    - pre_prune_candidates_text
+    - pre_prune_enum_ids
+    - pre_prune_enum_count
+    - post_prune_candidates_text
+    - post_prune_enum_ids
+    - post_prune_enum_count
+    - expected_response
+    - expected_enums
+    - expected_enums_weights
+    - agent_response
+    - expert_score
+    - expert_rationale
+    - enum_relevance_score
+    - execution_duration_ms
+    - request_time
+    - reranker_system_prompt
+    - reranker_user_prompt
+    - reranker_model
+    - reranker_token_usage
+    - reranker_raw_selected_ids
+    - reranker_valid_selected_ids
+    - reranker_invalid_selected_ids
+    - reranker_unselected_context_ids
+    - reranker_selection_status
+    - reranker_selection_violations
+    - main_agent_prompt_hash
+    - daily_banking_agent_prompt_hash
+    - agents_called
+    - tools_called
+    - query_scope
+    - reranker_selected_empty
+    - trace_invariant_violations
+    - kb_version
+    - user_query_en
+    - expected_response_en
+    - agent_response_en
+    - categories_list
+    - reranked_enums_kb_sk
+    - reranked_enums_kb_en
+    - post_prune_candidates_kb_sk
+    - post_prune_candidates_kb_en
+
+
+# ── Paths ─────────────────────────────────────────────────────
+paths:
+  checkpoint_dir: "checkpoints/uat"
+  system_template_path: "../configs/skkb/system.md.j2"
+  user_template_path: "../configs/skkb/user.md.j2"
+
+
+# ── Rubric Configuration ─────────────────────────────────────
+rubric:
+  base: null
+  pass_threshold: 1.4
+
+  critical_evaluation_rules: |
+    OUTPUT CONTRACT:
+      - Return ONLY valid JSON.
+      - All JSON string values MUST be written in English only.
+      - Slovak/Czech text is input evidence only. Translate relevant
+        Slovak/Czech facts into English before writing output.
+      - Do not copy raw Slovak/Czech phrases into output fields.
+
+    Evidence rules:
+      - Use `post_prune_candidates_text` as the post-prune candidate pool
+        available to the reranker. You do not see the full SKKB.
+      - Use `reranked_enum_ids` and `reranked_kb_context` as the final
+        selected context that reached the agent.
+      - Use `expected_response` as the expert reference. Treat it as a
+        reference for essential banking facts, required actions, constraints,
+        and expected outcomes; do not require exact wording, ordering,
+        greeting, verbosity, or harmless stylistic details. The gold ENUM
+        list is intentionally withheld from this judge to avoid biasing
+        `optimal_enum_selection`; exact ENUM-set comparisons are computed
+        downstream.
+      - Use `post_prune_enum_ids` only to keep `optimal_enum_selection`
+        within the post-prune candidate pool and to support qualitative diagnosis.
+      - Use `pre_prune_enum_ids` only as supporting diagnostic evidence
+        when available; do not choose `optimal_enum_selection` from that
+        earlier stage.
+        Exact retrieval recall, reranker recall, precision, and miss
+        categories are computed downstream. Do not treat your own ID-set
+        comparison as the source of truth for exact retrieval or reranker
+        metrics.
+      - Score `kb_selected_context_sufficiency` using ONLY
+        `reranked_kb_context`.
+      - Score `kb_retrieval_pool_adequacy` using ONLY the best
+        possible selection from `post_prune_candidates_text`. Do not infer
+        what may exist elsewhere in the full SKKB.
+      - A post-prune candidate-pool content gap is not automatically a KB
+        content team issue. If the post-prune candidate pool is missing the
+        relevant topic or contains mostly off-topic candidates, treat that as
+        retrieval/pruning-side evidence or leave exact miss attribution to
+        downstream metrics. Recommend KB content team work only when relevant
+        post-prune KB fragments are present but their content is too thin,
+        incomplete, or unclear.
+      - Treat `expected_reference_looks_wrong` as a high-bar exception
+        for obvious gold-reference defects only. Do NOT use it to explain
+        ordinary retrieval, reranking, KB-content, or agent-answer failures.
+      - When `expected_reference_looks_wrong` is true, do not force low
+        answer/context scores only because they disagree with the defective
+        reference. Score against the user query and available KB evidence,
+        then describe the reference defect separately.
+
+  domain_specific_guidance: |
+    - ENUM codes are KB fragment identifiers, e.g. `SAVING@ACCOUNT_MOVEMENTS`.
+      Each ENUM represents one retrieved or selected knowledge-base fragment.
+    - The agent may personalize the greeting (uses the user's first name).
+      Do not penalize or reward personalization.
+    - **Language**: `answer_language_compliance` compares `agent_response`
+      with the language of `user_query`. This SKKB dataset is expected to
+      contain Slovak user queries, so Czech output for a Slovak query, mixed
+      Czech/Slovak paragraphs, or another language is a language-compliance
+      failure.
+    - **Agent-prompt root cause**: Czech drift is likely an agent
+      prompt or language-guard issue. When it occurs, score
+      `answer_language_compliance` low and make `agent_improvement_suggestion`
+      specific in English.
+    - Banking-specific terms (e.g. "sporenie", "pokladnička", "trvalý
+      príkaz") must be factually accurate.
+    - Transactional / account-specific queries ("what is my balance?")
+      typically belong to `case_scope=api`, not the KB. Use
+      `case_scope=kb_and_api` only when the user genuinely needs both
+      account-specific data/tooling and KB policy/process guidance. Do
+      NOT treat pure API/account-data queries as KB content gaps.
+    - ENUM IDs usually follow `<PRODUCT>@<TOPIC>`, e.g. `SAVING@ACCOUNT_MOVEMENTS`, 
+      where `SAVING` is the product namespace.
+    - Product-specific queries should generally be supported by ENUMs whose
+      product namespace matches the queried product. Do not rely on product
+      prefix alone if the topic after `@` is semantically wrong. Generic
+      queries may use generic or cross-product ENUMs.
+
+  final_reminders: |
+    1. **Output ONLY valid JSON** — no markdown fencing, no prose outside JSON.
+    2. **English-only output is mandatory.** All JSON string values must
+       be in English. Do not copy Slovak/Czech source text into the output.
+    3. **Per-dimension reasoning** under 250 characters;
+       **overall_explanation** between 250 and 500 characters; all
+       improvement suggestion fields under 400 characters each;
+       **expected_reference_issue_description** under 300 characters;
+       **language_mismatch_description** under 200 characters.
+    4. All array fields must be arrays of strings. Use `[]` when nothing
+       applies.
+    5. Cite ENUM IDs (e.g. `SAVING@ACCOUNT_MOVEMENTS`) verbatim when
+       naming them in reasoning fields.
+    6. When explaining retrieval/reranker issues, describe the semantic
+       pattern you observe. Exact expected-ENUM membership, retrieval
+       misses, and reranker misses are derived downstream from ID lists.
+    7. Set `expected_reference_looks_wrong=true` only for clear
+       query/reference contradictions or obvious gold-label defects. Do
+       not use it merely because the agent answer is poor or the post-prune
+       candidate pool is weak.
+
+  # ── Dimensions ──────────────────────────────
+  dimensions:
+    # --- Query ---
+    - id: query_clarity
+      name: "Query Clarity"
+      weight: 1.0
+      description: >
+        Is `user_query` clear and understandable, or ambiguous / unclear?
+        Judge only whether the user's intent is discernible — not whether
+        the system can or should answer the user's query: a clearly phrased
+        out-of-scope or account-specific question is still clear. Ignore
+        typos, slang, and grammar when the intent is unambiguous.
+      scale:
+        - score: 2
+          label: "clear"
+          description: The query is unambiguous; a single well-defined answer is expected.
+        - score: 1
+          label: "ambiguous"
+          description: More than one plausible interpretation, but a reasonable default exists.
+        - score: 0
+          label: "unclear"
+          description: It is hard to discern what the user is asking.
+
+    # --- Reranker semantic quality ---
+    - id: kb_selection_semantic_relevance
+      name: "KB Selection Semantic Relevance"
+      weight: 2.0
+      description: >
+        Are the KB fragments selected by the reranker relevant to the user
+        query? Judge semantic relevance from `reranked_kb_context` and the
+        selected ENUM IDs together, not from ENUM ID strings alone. Judge
+        relevance to the user's query intent only; do not judge against
+        `expected_response` — whether the context supports the expected answer
+        is scored separately. Exact selection precision/recall/F1 should be
+        derived programmatically; this score captures whether the selected
+        fragments would naturally support the user's intent.
+      scale:
+        - score: 2
+          label: "relevant"
+          description: Every selected ENUM directly addresses the query.
+        - score: 1
+          label: "mixed"
+          description: Most selected ENUMs are relevant, but a minority are tangential, off-topic, redundant, or weakly aligned.
+        - score: 0
+          label: "irrelevant"
+          description: Most selected ENUMs are wrong, irrelevant, or misaligned with intent, or the selection is too noisy to naturally support the query. For `case_scope` = `kb` or `kb_and_api`, an empty `reranked_enum_ids` / `reranked_kb_context` is also score 0.
+
+    # --- Context and KB content quality ---
+    - id: kb_selected_context_sufficiency
+      name: "KB Selected Context Sufficiency"
+      weight: 2.0
+      description: >
+        Does `reranked_kb_context`, exactly as passed to the agent, contain
+        enough information to answer the user query and support
+        `expected_response`? Ignore any KB content that is not present in
+        `reranked_kb_context`.
+      scale:
+        - score: 2
+          label: "sufficient"
+          description: The selected context contains specific, actionable content that fully supports the expected answer.
+        - score: 1
+          label: "partly_sufficient"
+          description: The selected context supports the core answer but misses one or two operational details.
+        - score: 0
+          label: "insufficient"
+          description: The selected context is off-topic, empty, or too shallow to answer the query.
+
+    - id: kb_retrieval_pool_adequacy
+      name: "KB Retrieval Pool Adequacy"
+      weight: 2.0
+      description: >
+        Could the best possible selection from the post-prune candidate pool
+        fully answer the user's query? First choose `optimal_enum_selection`
+        from only the ENUMs available in `post_prune_candidates_text`. Then
+        judge whether those post-prune fragments contain enough information
+        for the agent to give a complete, useful, and correct answer to the
+        user's query. Use `expected_response` as the expert reference for
+        essential facts and expected outcome, but do not require exact wording
+        or extra details that are not necessary to satisfy the user. Do not
+        infer what may exist elsewhere in the full knowledge base.
+      scale:
+        - score: 2
+          label: "adequate"
+          description: The best available post-prune candidate selection supports a complete answer that would satisfy the user's reasonable expectation, including all essential facts, steps, limits, conditions, and caveats.
+        - score: 1
+          label: "thin"
+          description: The best available post-prune candidate selection supports the core answer, but a complete user-satisfying answer would still miss some useful operational detail, condition, caveat, or next step.
+        - score: 0
+          label: "gap"
+          description: The best available post-prune candidate selection does not contain enough core information to answer the user's query correctly or usefully. For `case_scope` = `kb` or `kb_and_api`, an empty `post_prune_candidates_text` is score 0.
+
+    # --- Final answer ---
+    - id: answer_expected_alignment
+      name: "Answer Expected Alignment"
+      weight: 2.0
+      description: >
+        Does `agent_response` preserve the essential factual content and
+        expected action from `expected_response`? Paraphrase, different
+        ordering, and harmless omission of stylistic details are acceptable;
+        factual mismatch, contradiction, missing required facts, or wrong
+        refusal is not. Judge only against `expected_response`; do not use the
+        KB context or world knowledge as the standard of correctness.
+        Additional correct information beyond `expected_response` does not by
+        itself reduce alignment — groundedness judges whether it is supported.
+      scale:
+        - score: 2
+          label: "aligned"
+          description: The answer covers all important expected facts and no important expected meaning is lost.
+        - score: 1
+          label: "partial"
+          description: The core answer aligns but one or more important details are missing or slightly wrong.
+        - score: 0
+          label: "misaligned"
+          description: The answer misses the core expected answer, contradicts it, answers a different question, or `agent_response` is empty.
+
+    - id: kb_answer_groundedness
+      name: "KB Answer Groundedness"
+      weight: 2.0
+      description: >
+        Are the factual claims in `agent_response` supported by
+        `reranked_kb_context`? Score support against selected context only,
+        not against real-world truth. A factually correct claim should still
+        be marked unsupported if it is absent from the selected context. Your
+        score must be consistent with the claims you list in
+        `hallucinated_claims_in_agent_response`.
+      scale:
+        - score: 2
+          label: "grounded"
+          description: All material claims are supported by the selected KB context, or `agent_response` is empty (an empty answer makes no claims — the alignment scorer owns that failure).
+        - score: 1
+          label: "mostly_grounded"
+          description: The answer is mostly grounded but contains one minor unsupported claim or wording overreach.
+        - score: 0
+          label: "ungrounded"
+          description: The answer contains important unsupported, fabricated, or contradictory claims. If `reranked_kb_context` is empty, any material factual claim in the answer is unsupported.
+
+    # --- Language compliance ---
+    - id: answer_language_compliance
+      name: "Answer Language Compliance"
+      weight: 1.0
+      description: >
+        Is `agent_response` written in the same language as `user_query`?
+        Brand and product names or labels, UI phrases, URLs, and banking terms
+        (or feature names) commonly used in another language are acceptable;
+        any other non-user-language content is a violation.
+      scale:
+        - score: 2
+          label: "user_language"
+          description: The response is in the user's language throughout, or the response is empty (an empty response cannot violate language compliance). It contains no meaningful non-user-language content, except brand names, URLs, or exact untranslated product/app feature names.
+        - score: 1
+          label: "mostly_user_language"
+          description: The response is mainly in the user's language. The main answer is still understandable in the user's language.
+        - score: 0
+          label: "wrong_language"
+          description: The response is wholly or predominantly in a language other than the user's, or contains more than a couple of isolated non-user-language words or phrases.
+
+  # ── Input Fields ────────────────────────────────────────────
+  input_fields:
+    - name: user_query
+      description: >
+        The user's original question (Slovak).
+      required: true
+
+    - name: pre_prune_enum_ids
+      description: >
+        JSON list of merged retrieve candidates before pruning. Use this
+        only as diagnostic context for possible pruning/retrieval loss; do
+        not choose `optimal_enum_selection` from this earlier stage.
+      required: false
+
+    - name: post_prune_candidates_text
+      description: >
+        The full post-prune candidate pool offered to the reranker, one
+        block per ENUM in rank order. Format:
+        `ENUM_ID: <description>\n\nENUM_ID: <description>\n\n...`
+        The reranker saw this same pool. `reranked_enum_ids` contains the
+        valid final selection after raw reranker output was mapped back to
+        this pool. Use this to understand what content was available to the
+        reranker. Exact retriever and reranker miss categories are computed
+        downstream from the ID lists.
+      required: true
+
+    - name: post_prune_enum_ids
+      description: >
+        JSON list of ENUM IDs in the post-prune candidate pool, in rank
+        order. Use this for exact set/ranking diagnosis instead of
+        string-searching `post_prune_candidates_text`.
+      required: true
+
+    - name: reranked_enum_ids
+      description: >
+        JSON list of valid ENUM IDs that were selected, survived mapping
+        back to post-prune candidates, and were fed to the agent. This is the
+        final system choice, not the unvalidated raw reranker output.
+      required: true
+
+    - name: reranked_kb_context
+      description: >
+        Full text of the KB fragments passed to the agent (post-rerank).
+        Formatted as `ENUM_ID: <text>` blocks. Source of truth for
+        kb_selected_context_sufficiency and kb_answer_groundedness.
+      required: true
+
+    - name: expected_response
+      description: >
+        Expert-authored reference answer (Slovak). Use it as a reference for
+        essential banking facts, required actions, constraints, and expected
+        outcomes. Do not treat greeting, wording, ordering, verbosity, or
+        harmless paraphrase as required.
+      required: true
+
+    - name: agent_response
+      description: >
+        The agent's final answer. Primary target of answer_expected_alignment,
+        kb_answer_groundedness, and answer_language_compliance.
+      required: true
+
+  # ── Output Schema ───────────────────────────────────────────
+  # JSON structure the judge must return in addition to rubric_scores.
+  # Exact numeric metrics should be derived downstream from the ID lists;
+  # this schema captures scope classification, diagnostic evidence, and
+  # concrete action points.
+  output_schema:
+    fields:
+      # --- Scope ---
+      - name: case_scope
+        type: string
+        enum:
+          - kb
+          - api
+          - kb_and_api
+          - chit_chat
+          - ethical
+          - out_of_scope
+          - ambiguous
+        description: >
+          Label the user query's actual scope, independent of answer quality
+          and independent of whether the agent handled it correctly. Commit to
+          a concrete label for any clearly banking-related query, even when it
+          is borderline; use `ambiguous` only when the user's intent is
+          unrecoverable. Use `kb` for general banking, product, policy, fee,
+          limit, process, or troubleshooting questions answerable from KB
+          content without user-specific account data. Use `api` for questions
+          that require user-specific or account-specific data, such as the
+          user's balance, transactions, cards, accounts, personal limits, or
+          application status. Use `kb_and_api` only when a complete answer
+          genuinely requires both KB guidance and user-specific/API data. Use
+          `chit_chat` for greetings, thanks, small talk, or conversational
+          turns that do not require KB or API data. Use `ethical` for safety,
+          harmful, illegal, policy-sensitive, or values-based requests that
+          should be handled by guardrails rather than KB/API evidence. Use
+          `out_of_scope` for clear non-banking factual or task requests that
+          are neither chit-chat nor ethical/safety cases. Use `ambiguous` when
+          the user query is too unclear, underspecified, or broad to determine
+          which scope applies.
+
+      # --- Reference-defect check ---
+      - name: expected_reference_looks_wrong
+        type: boolean
+        description: >
+          True ONLY for clear, evidence-backed defects in the test case's gold
+          reference, such as `expected_response` contradicting the user's query,
+          expecting the wrong scope, or requiring behavior that the query
+          clearly does not ask for. This is a high-bar test-set quality flag.
+          Do NOT set it merely because the agent scored poorly, retrieval was
+          weak, the KB seems incomplete, or you would phrase the answer
+          differently.
+
+      - name: expected_reference_issue_description
+        type: string
+        description: >
+          When `expected_reference_looks_wrong` is true, briefly describe the
+          specific contradiction or defect in the gold reference
+          (`expected_response`) or scope expectation. Focus on the test-case
+          issue/defect itself, not on agent quality. Max 300 chars. Empty
+          string (`""`) when `expected_reference_looks_wrong` is false.
+
+      # --- ENUM/context details for human review ---
+      - name: non_useful_reranked_enums
+        type: array
+        description: >
+          Array of ENUM ID strings from the actual final selection
+          (`reranked_enum_ids`) that are irrelevant, too generic, redundant, or
+          likely to distract answer generation for this query. Use `[]` when
+          every reranked ENUM is useful.
+
+      - name: selected_context_coverage_status
+        type: string
+        enum:
+          - sufficient
+          - partially_missing
+          - empty_or_unusable
+        description: >
+          Label whether `reranked_kb_context` covers the facts needed to
+          support the expected answer for this case. Normally compare against
+          `expected_response`. When `expected_reference_looks_wrong` is true,
+          compare against the user's query and the best-supported answer from
+          available KB evidence instead of blindly using the defective
+          reference. Use `sufficient` when the selected context supports all
+          required facts. Use `partially_missing` when the selected context
+          contains some useful evidence but misses one or more required facts,
+          conditions, steps, limits, fees, channels, or caveats. Use
+          `empty_or_unusable` when `reranked_kb_context` is empty, off-topic, or
+          too generic to identify specific supported facts.
+
+      - name: unavailable_facts_in_selected_context
+        type: array
+        description: >
+          Array of specific facts required by the same comparison target used
+          for `selected_context_coverage_status` but not available in
+          `reranked_kb_context`. List only the missing facts themselves. Do not
+          invent facts that are not required by the comparison target. Use `[]`
+          when `selected_context_coverage_status` is `sufficient` or
+          `empty_or_unusable`.
+
+      # --- Answer-level details ---
+      - name: missing_facts_in_agent_response
+        type: array
+        description: >
+          Array of required facts that are present in `expected_response` but
+          missing or materially weakened in `agent_response`. Use this field for
+          omissions or incomplete coverage only, not for unsupported or
+          contradictory claims made by the agent; put those in
+          `hallucinated_claims_in_agent_response`. When
+          `expected_reference_looks_wrong` is true, compare against the user's
+          query and best-supported answer from available KB evidence instead of
+          blindly using the defective reference. Use `[]` when the agent
+          response includes all required facts.
+
+      - name: hallucinated_claims_in_agent_response
+        type: array
+        description: >
+          Array of material factual claims in `agent_response` that are not
+          supported by `reranked_kb_context` or that contradict it. Use
+          `reranked_kb_context` as the grounding source; do not treat
+          `expected_response` as evidence for whether a claim is grounded. Do
+          not include omissions; put missing expected information in
+          `missing_facts_in_agent_response`. If selected context is empty or
+          insufficient, list only the material factual claims the agent made
+          without support from that selected context. Use `[]` when the agent
+          makes no unsupported material factual claims.
+
+      # --- Language details ---
+      - name: user_query_detected_language
+        type: string
+        description: >
+          ISO 639-1 lowercase code for the language of `user_query` (e.g. `cs`,
+          `sk`, `en`, `uk`, `de`, `hu`, `pl`, `ru`). Use `mixed` when two or
+          more languages share roughly equal share. Use `unknown` when the
+          language genuinely cannot be determined.
+
+      - name: actual_response_detected_language
+        type: string
+        description: >
+          ISO 639-1 lowercase code for the language of `agent_response`, using
+          the same scheme as `user_query_detected_language`. Additionally, use
+          `empty` when `agent_response` is empty or whitespace only.
+
+      - name: language_mismatch_description
+        type: string
+        description: >
+          When the `answer_language_compliance` score is below 2, briefly
+          describe the mismatch in English, such as "user wrote in Slovak,
+          agent answered in Czech". Max 200 chars. Empty string (`""`) when the
+          score is 2.
+
+      # --- Candidate-pool diagnosis ---
+      - name: post_prune_candidates_context_inadequacy_description
+        type: string
+        description: >
+          For `kb` or `kb_and_api` cases, briefly describe any required
+          information (normally from `expected_response`; when
+          `expected_reference_looks_wrong` is true, from the user's query and
+          the best-supported answer from available KB evidence) that is missing
+          from the post-prune candidates context before reranking. Base this
+          only on `post_prune_candidates_text`, not on the final
+          `reranked_kb_context`. Mention the missing facts, steps, limits,
+          conditions, channels, fees, or caveats needed to answer the
+          KB-answerable part of the query. Empty string (`""`) when the
+          post-prune candidates context contains enough useful evidence, or
+          when the case is `api`, `out_of_scope`, or `ambiguous`. Max 400 chars.
+
+      - name: optimal_enum_selection
+        type: array
+        description: >
+          Array of ENUM ID strings from `post_prune_enum_ids` that best support
+          the expected answer for this test case. Normally use `user_query` and
+          `expected_response` to understand which facts are required. When
+          `expected_reference_looks_wrong` is true, use the user's query and the
+          best-supported answer from available KB evidence instead of blindly
+          using the defective reference. Select IDs whose candidate text
+          directly provides required facts, steps, limits, conditions, channels,
+          fees, caveats, or disambiguation needed to answer the user's query.
+          Include all necessary non-redundant ENUMs. Exclude off-topic,
+          generic-only, redundant, or distracting ENUMs. Do not invent IDs
+          outside `post_prune_enum_ids`. Use `[]` when no post-prune candidate
+          provides useful evidence.
+
+      # --- Technical/action diagnosis ---
+      - name: reranker_improvement_suggestion
+        type: string
+        description: >
+          Concrete action for improving reranker selection behavior. Use this
+          only when the post-prune candidates context contained one or more
+          ENUMs that should have been selected for the query, but
+          `reranked_enum_ids` omitted them, or when `reranked_enum_ids` included
+          clearly irrelevant/distracting ENUMs. Base this on the content of
+          `post_prune_candidates_text`, `optimal_enum_selection`, and
+          `reranked_enum_ids`; do not rely only on ID-name similarity. Because
+          `optimal_enum_selection` is reference-informed, suggest a reranker
+          action only when the missed or distracting selection pattern is also
+          understandable from the user's query and candidate text. Describe the
+          selection pattern to fix, such as prioritizing specific
+          policy/fee/limit ENUMs over generic overview ENUMs, or downranking
+          candidates about a different product/topic. Do not suggest KB,
+          retrieval, or agent changes here. Max 400 chars. Empty string (`""`)
+          when no reranker-side selection issue is evidenced.
+
+      - name: agent_improvement_suggestion
+        type: string
+        description: >
+          Concrete action for the agent/answer-generation team. Use this for
+          failures in answer completeness, groundedness, context use,
+          disambiguation, refusal behavior, or language compliance. Examples
+          include improving the answer prompt, strengthening context-use
+          instructions, adding a disambiguation branch, or tightening the
+          user-language guard. If mentioning drift away from the user's
+          language, describe the evidence in English only and do not copy
+          non-English phrases. Max 400 chars. Empty string (`""`) when no
+          agent-side improvement is needed.
+
+      - name: kb_improvement_suggestion
+        type: string
+        description: >
+          Concrete action for the KB content team, such as expanding an
+          incomplete ENUM, clarifying conditions, or adding concrete limits,
+          fees, channels, or timing details. Non-empty ONLY when the available
+          KB fragment itself is too thin, incomplete, or unclear for a
+          KB-answerable query, or when the test case provides clear evidence
+          that a required KB topic is genuinely absent. Do NOT assign a KB
+          content action merely because retrieval failed to retrieve the right
+          topic, the post-prune candidate pool is missing the topic, or the
+          reranker failed to select it. Max 400 chars. Empty string (`""`) when
+          no KB-side improvement is evidenced.
+
+      - name: test_case_improvement_suggestion
+        type: string
+        description: >
+          Concrete action for test-set maintainers. Non-empty ONLY when the
+          gold reference appears wrong (`expected_reference_looks_wrong ==
+          true`) or the case is too ambiguous, underspecified, mislabeled, or
+          missing necessary inputs for reliable KB evaluation. Use this for
+          fixing scope labels, expected answers, user-query framing, or
+          required test metadata. Max 400 chars. Empty string (`""`) when no
+          test-set action is needed.
+
+      - name: overall_explanation
+        type: string
+        description: >
+          English only. Provide a concise 3-5 sentence summary of the main
+          evaluation outcome, tying together the most important per-dimension
+          reasons. Explain the weakest score, and mention any other major
+          failure driver if it changes the diagnosis. If relevant, briefly
+          mention the gold-reference problem, but put the concrete dataset fix
+          in `test_case_improvement_suggestion`. 250-500 chars.
+
+    additional_instructions: |
+      ## Cross-field rules
+
+      - **Evaluation order:** perform the judgment in this order: first
+        classify `case_scope`; then check whether
+        `expected_reference_looks_wrong`; then label
+        `selected_context_coverage_status`; then write
+        `unavailable_facts_in_selected_context`; then detect query/response
+        languages and write `language_mismatch_description`; then describe
+        any `post_prune_candidates_context_inadequacy_description`; then
+        choose `optimal_enum_selection`; then score the rubric dimensions; then
+        write diagnostic fields and team-specific action suggestions. Do not
+        let a later answer-quality failure retroactively change the
+        candidate-pool or selected-context judgments.
+      - **Selection relevance:** judge selected ENUM relevance from the
+        selected KB fragment text in `reranked_kb_context`, using
+        `reranked_enum_ids` as identifiers. If selection is empty for a
+        KB-answerable case and useful candidates exist in the post-prune
+        pool, this is reranker-side evidence. If no useful candidate exists
+        in the post-prune pool, leave reranker action empty and use
+        `post_prune_candidates_context_inadequacy_description` plus downstream
+        retrieval metrics to explain it.
+      - **Selected-context consistency:** `selected_context_coverage_status`
+        and `unavailable_facts_in_selected_context` must agree with
+        `rubric_scores.kb_selected_context_sufficiency.score`. Use
+        `sufficient` with score 2, `partially_missing` with score 1, and
+        `empty_or_unusable` with score 0, except for non-KB scopes where KB
+        context is not required and does not mislead the final answer.
+      - **Grounding consistency:** `hallucinated_claims_in_agent_response`
+        must agree with `rubric_scores.kb_answer_groundedness.score`. If the
+        score is below 2, list the unsupported material claims that caused the
+        score. If the score is 2, use `[]`.
+      - **Language consistency:** `user_query_detected_language`,
+        `actual_response_detected_language`, `language_mismatch_description`,
+        and `rubric_scores.answer_language_compliance.score` must agree. For a
+        Slovak `user_query`, Czech or mixed Czech/Slovak `agent_response`
+        should score below 2 and have a non-empty mismatch description.
+      - **Case-scope usage:** `case_scope` is the actual scope label. Use
+        ONLY the declared values (`kb`, `api`, `kb_and_api`,
+        `chit_chat`, `ethical`, `out_of_scope`, `ambiguous`). For
+        account-data/tool queries, prefer `api`; use `kb_and_api` only when
+        both KB policy/process content and API/account data are genuinely
+        required.
+      - **Scope-aware scoring:** For `case_scope` values `api`, `chit_chat`,
+        `ethical`, `out_of_scope`, or `ambiguous`, do not treat weak or empty
+        KB context as a retriever, reranker, or KB-content failure. For these
+        scopes, set `kb_selection_semantic_relevance`,
+        `kb_selected_context_sufficiency`, and
+        `kb_retrieval_pool_adequacy` to score 2 when KB context is not required
+        and the selected KB context does not actively mislead the final answer.
+        Score these dimensions low only when the case is `kb` or `kb_and_api`,
+        or when KB content is genuinely required.
+      - **Team separation in suggestions:** each `*_improvement_suggestion`
+        targets exactly one team. Do not put reranker prompt/parser
+        actions in `agent_improvement_suggestion`, KB content team asks in
+        `reranker_improvement_suggestion`, or answer-prompt actions in
+        `reranker_improvement_suggestion`. There is no retrieval-team action
+        output field in this schema; record post-prune candidate-pool gaps in
+        `post_prune_candidates_context_inadequacy_description` and leave exact
+        retrieval miss attribution to downstream metrics.
+      - **Reference-defect rule:** set `expected_reference_looks_wrong`
+        only for obvious gold-reference defects. When it is `true`,
+        `expected_reference_issue_description` and
+        `test_case_improvement_suggestion` MUST both be non-empty. When
+        it is `false`, `expected_reference_issue_description` should be
+        `""`. When it is `true`, score answer/context dimensions against
+        the user query and available KB evidence rather than forcing low
+        scores solely because the answer differs from the defective
+        reference. Diagnostic fields that normally compare against
+        `expected_response` should instead compare against the user's query
+        and the best-supported answer from available KB evidence. Do not
+        list facts as missing merely because they appear only in a defective
+        reference.
+      - **At-least-one-action rule:** at least one of the four action outputs
+        (`reranker_improvement_suggestion`, `agent_improvement_suggestion`,
+        `kb_improvement_suggestion`, or `test_case_improvement_suggestion`)
+        MUST be non-empty when a low score reflects an actionable reranker, KB,
+        agent, or test-set issue, or when `expected_reference_looks_wrong ==
+        true`. Do not invent actions for expected low scores caused solely by
+        `case_scope=api`, `chit_chat`, `ethical`, `out_of_scope`, or
+        `ambiguous`; explain those in `overall_explanation` instead.

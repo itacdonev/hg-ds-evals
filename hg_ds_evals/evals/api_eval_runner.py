@@ -180,6 +180,10 @@ def _checkpoint_suffix_for_run(
 ) -> str:
     if checkpoint_suffix is not None:
         raw_suffix = checkpoint_suffix
+        if unique_default and not any(
+            token in raw_suffix for token in ("{run_id}", "{short_run_id}", "{run_index}")
+        ):
+            raw_suffix = f"{raw_suffix}_{_short_run_id(run_id)}"
     elif unique_default:
         raw_suffix = f"{report_name}_{_short_run_id(run_id)}"
     else:
@@ -268,10 +272,16 @@ def _fetch_traces(
     return traces_df
 
 
-def _merge_kb_diagnostics(trace_level_df: pd.DataFrame, traces_df: pd.DataFrame) -> pd.DataFrame:
+def _merge_kb_diagnostics(
+    trace_level_df: pd.DataFrame,
+    traces_df: pd.DataFrame,
+    ignore_tool_span_names: Sequence[str] | None = None,
+) -> pd.DataFrame:
     from hg_ds_evals.preprocessing.traces import build_skkb_dataframe_from_mlflow_search_traces
 
-    skkb_df = build_skkb_dataframe_from_mlflow_search_traces(traces_df).dataframe
+    skkb_df = build_skkb_dataframe_from_mlflow_search_traces(
+        traces_df, ignore_tool_span_names
+    ).dataframe
     if "trace_id" not in skkb_df.columns or "trace_id" not in trace_level_df.columns:
         return trace_level_df
     kb_columns = [
@@ -604,6 +614,7 @@ def _prepare_deterministic_run(
     paths: RunnerPaths,
     max_results: int | None,
     apply_parameter_equivalence: bool,
+    ignore_tool_span_names: Sequence[str] | None = None,
 ) -> PreparedRun:
     from hg_ds_evals.preprocessing.mlflow_traces import build_dataframe_from_mlflow_traces
     from hg_ds_evals.preprocessing.traces import write_prompt_sidecar
@@ -622,14 +633,14 @@ def _prepare_deterministic_run(
     traces_df.to_csv(raw_path, index=False)
     print(f"Wrote raw traces: {raw_path}")
 
-    parse_result = build_dataframe_from_mlflow_traces(traces_df)
+    parse_result = build_dataframe_from_mlflow_traces(traces_df, ignore_tool_span_names)
     trace_level_df = parse_result.dataframe
     print(f"Parsed rows:  {len(trace_level_df):,}")
     print(f"Parse errors: {len(parse_result.parse_errors):,}")
     for parse_error in parse_result.parse_errors[:5]:
         print(f"  parse error {parse_error.trace_id}: {parse_error.error}")
 
-    trace_level_df = _merge_kb_diagnostics(trace_level_df, traces_df)
+    trace_level_df = _merge_kb_diagnostics(trace_level_df, traces_df, ignore_tool_span_names)
     sidecar_path = write_prompt_sidecar(traces_df, run_id, paths.input_traces_dir)
     print(f"Wrote prompt sidecar: {sidecar_path}")
 
@@ -830,6 +841,13 @@ def _load_report_modules(paths: RunnerPaths):
     experiments_dir = paths.repo_root / "experiments"
     if str(experiments_dir) not in sys.path:
         sys.path.insert(0, str(experiments_dir))
+    # Always re-import the report builders: they are edited frequently during
+    # analysis and a long-lived notebook kernel otherwise serves a stale copy
+    # from sys.modules (importlib.import_module returns the cached module, so
+    # on-disk edits are silently ignored until a kernel restart). Popping them
+    # first forces a fresh import on every report build.
+    for module_name in ("api_report", "api_report_multi"):
+        sys.modules.pop(module_name, None)
     api_report = importlib.import_module("api_report")
     api_report_multi = importlib.import_module("api_report_multi")
     return api_report, api_report_multi
@@ -902,6 +920,7 @@ def run_api_evaluation(
     report_name: str,
     run_baseline: str | Sequence[str] | None = None,
     apply_parameter_equivalence: bool = True,
+    ignore_tool_span_names: Sequence[str] | None = None,
     run_judge: bool = False,
     checkpoint_suffix: str | None = None,
     yaml_file_name: str = DEFAULT_API_YAML,
@@ -920,6 +939,14 @@ def run_api_evaluation(
     This is the notebook-friendly entry point. It returns one ``PreparedRun``
     per requested run id, with paths to the enriched CSV, judge checkpoint
     and single-run report.
+
+    ``ignore_tool_span_names`` lists TOOL-span names to drop from
+    ``actual_tool_calls`` before the deterministic scorers run (and from
+    ``query_scope`` classification). Defaults to
+    ``["agent_tool_calls"]`` — parser/instrumentation spans that are not
+    real tool calls. Pass your own list to replace it (include
+    ``"agent_tool_calls"`` to keep ignoring it), or ``[]`` to score every
+    TOOL span.
     """
     run_id_list = _as_list(run_ids)
     if not run_id_list:
@@ -954,6 +981,7 @@ def run_api_evaluation(
             paths=paths,
             max_results=max_results,
             apply_parameter_equivalence=apply_parameter_equivalence,
+            ignore_tool_span_names=ignore_tool_span_names,
         )
 
     for baseline_id in sorted(baseline_set - requested_set):
@@ -974,6 +1002,7 @@ def run_api_evaluation(
             paths=paths,
             max_results=max_results,
             apply_parameter_equivalence=apply_parameter_equivalence,
+            ignore_tool_span_names=ignore_tool_span_names,
         )
 
     prepared_runs: list[PreparedRun] = []
@@ -1068,6 +1097,20 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Disable parameter equivalence and score raw tool parameters.",
     )
     parser.add_argument(
+        "--ignore-tool-span-names",
+        "--IGNORE_TOOL_SPAN_NAMES",
+        dest="ignore_tool_span_names",
+        nargs="+",
+        action="append",
+        default=None,
+        help=(
+            "TOOL-span names to drop from actual_tool_calls before scoring "
+            "(space- or comma-separated). Defaults to 'agent_tool_calls'. Pass "
+            "your own list to replace the default (include 'agent_tool_calls' to "
+            "keep ignoring it); pass an empty value to score every TOOL span."
+        ),
+    )
+    parser.add_argument(
         "--run-judge",
         "--RUN_JUDGE",
         dest="run_judge",
@@ -1081,7 +1124,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=None,
         help=(
             "Judge checkpoint suffix. Defaults to report-name for one run, "
-            "or report-name_<short_run_id> for multiple judge runs. "
+            "or report-name_<short_run_id> for multiple judge runs. With multiple "
+            "judge runs, a static custom suffix also gets _<short_run_id> appended. "
             "Supports {run_id}, {short_run_id}, and {run_index} placeholders."
         ),
     )
@@ -1163,6 +1207,11 @@ def main(argv: Sequence[str] | None = None) -> None:
             else None
         ),
         apply_parameter_equivalence=args.apply_parameter_equivalence,
+        ignore_tool_span_names=(
+            _split_cli_values(args.ignore_tool_span_names)
+            if args.ignore_tool_span_names is not None
+            else None
+        ),
         report_name=args.report_name,
         run_judge=args.run_judge,
         checkpoint_suffix=args.checkpoint_suffix,
