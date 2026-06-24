@@ -1252,22 +1252,52 @@ _PROMPT_HASH_COLS = (
 )
 
 
+def _run_id_from_input_name(input_path: Path) -> str:
+    """Parse the run id out of a ``{enriched,scored,raw}_traces_{run_id}.csv``
+    filename. Returns ``""`` when the name doesn't follow the convention."""
+    stem = input_path.stem
+    for prefix in ("enriched_traces_", "scored_traces_", "raw_traces_"):
+        if stem.startswith(prefix):
+            return stem[len(prefix):]
+    return ""
+
+
 def _load_prompt_sidecar(input_path: Path, source_run_id: str,
                           prompts_path: Path | None = None) -> dict[str, Any] | None:
-    """Locate the prompt sidecar JSON: explicit flag → next to input CSV."""
-    candidate: Path | None = None
+    """Locate the prompt sidecar JSON, trying in order:
+
+    1. an explicit ``prompts_path`` (a file, or a directory + ``source_run_id``);
+    2. ``prompt_{source_run_id}.json`` next to the input CSV;
+    3. ``prompt_{run_id}.json`` next to the input CSV, where ``run_id`` is
+       parsed from the ``enriched_traces_{run_id}.csv`` filename.
+
+    The runner names the sidecar by the *evaluation* run id, but the report
+    resolves ``source_run_id`` from ``mlflow.sourceRun`` — which the current
+    orchestrator build no longer emits (the column is empty, so it renders
+    as ``–``). Fallback 3 keeps the Prompts tab working in that case.
+    """
+    candidates: list[Path] = []
+    placeholder = ("–", "—", "mixed", "")
     if prompts_path is not None:
-        candidate = prompts_path
-        if candidate.is_dir() and source_run_id:
-            candidate = candidate / f"prompt_{source_run_id}.json"
-    elif source_run_id and source_run_id not in ("–", "—", "mixed"):
-        candidate = input_path.parent / f"prompt_{source_run_id}.json"
-    if candidate is None or not candidate.exists():
-        return None
-    try:
-        return json.loads(candidate.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return None
+        if prompts_path.is_dir():
+            if source_run_id not in placeholder:
+                candidates.append(prompts_path / f"prompt_{source_run_id}.json")
+        else:
+            candidates.append(prompts_path)
+    else:
+        if source_run_id not in placeholder:
+            candidates.append(input_path.parent / f"prompt_{source_run_id}.json")
+        run_id_from_name = _run_id_from_input_name(input_path)
+        if run_id_from_name:
+            candidates.append(input_path.parent / f"prompt_{run_id_from_name}.json")
+
+    for candidate in candidates:
+        if candidate.exists():
+            try:
+                return json.loads(candidate.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                return None
+    return None
 
 
 def _prompt_hash_warnings(df: pd.DataFrame) -> list[dict[str, Any]]:

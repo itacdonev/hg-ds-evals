@@ -174,18 +174,28 @@ rubric:
       name: "Language Compliance"
       weight: 1.0
       description: >
-        Is `actual_response` written in the same language as `user_query`?
+        Is `actual_response` written in the same language as `user_query`? 
+        Brand and product names or labels, UI phrases, URLs, and banking terms (or feature names) commonly used in 
+        another language are acceptable; any other non-user-language content is a violation.
       scale:
         - score: 2
           label: "matches"
-          description: Response is in the same language as the user query throughout.
+          description: > 
+              The response is in the user's language throughout, or the response is 
+              empty (an empty response cannot violate language compliance). It contains 
+              no meaningful non-user-language content, except brand names, URLs, or exact 
+              untranslated product/app feature names.
         - score: 1
           label: "mostly_matches"
-          description: Response is mostly in the user's language with one or two isolated foreign words or short phrases (a single idiom or loanword slipped in), but the dominant language matches.
+          description: >
+              The response is mainly in the user's language. The main answer is still
+              understandable in the user's language.
         - score: 0
           label: "mismatch"
-          description: Response is in a different language than the user query, OR substantially mixes multiple languages, OR exhibits Czech↔Slovak drift, OR `actual_response` is empty when the user asked a question.
-
+          description: >
+                The response is wholly or predominantly in a language other than the 
+                user's, or contains more than a couple of isolated non-user-language 
+                words or phrases.
   # ── Input Fields ────────────────────────────────────────────
   input_fields:
     - name: user_query

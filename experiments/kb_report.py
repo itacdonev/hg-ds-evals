@@ -2,7 +2,7 @@
 
 Works for both Czech (CZKB) and Slovak (SKKB) runs — pick with ``--lang cz`` or
 ``--lang sk``. The lang choice drives visible labels (button labels, the
-``language_compliance`` dimension prompt, etc.) and the config-dir lookup;
+``answer_language_compliance`` dimension prompt, etc.) and the config-dir lookup;
 the internal data model is identical for both.
 
 Standalone — does NOT require the results-viewer notebook to have run.
@@ -33,6 +33,7 @@ import re
 import sys
 from collections import Counter
 from pathlib import Path
+from typing import TypeVar
 
 import numpy as np
 import pandas as pd
@@ -56,6 +57,8 @@ from hg_ds_evals.preprocessing.latency import (  # noqa: E402 — needs sys.path
     RETRY_MAX_TOK_PER_S,
     RETRY_MIN_DURATION_MS,
 )
+
+_METADATA_T = TypeVar("_METADATA_T")
 
 # g-evals design tokens (mirrored from g-evals/frontend/src/index.css).
 GE_FONT = "Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif"
@@ -107,19 +110,22 @@ def _style_fig(fig, *, height: int | None = None):
 # threshold (0.7 always = 70% of the weighted maximum).
 DIMENSION_WEIGHTS = {
     # Display order grouped by stage of the pipeline:
-    #   query understanding → selection quality → answer quality →
-    #   pool adequacy. Dictionary order drives the order of the per-scorer
-    #   sub-cards on Summary, the per-scorer distribution table on Scorers,
-    #   and the heatmap axes.
-    "query_clarity":                       1.0,
-    "language_compliance":                 1.0,
-    "selection_semantic_relevance":        2.0,
-    "selected_context_sufficiency":        2.0,
-    "answer_expected_alignment":           2.0,
-    "answer_groundedness":                 2.0,
-    "optimal_retrieved_context_adequacy":  2.0,
+    #   query understanding → KB selection/context quality → answer quality.
+    # Dictionary order drives the order of the per-scorer sub-cards on
+    # Summary, the per-scorer distribution table on Scorers, and the heatmap
+    # axes. These are the current scorer names from the new rubric; older
+    # checkpoint column names are handled only as aliases below.
+    "query_clarity":                        1.0,
+    "kb_selection_semantic_relevance":      2.0,
+    "kb_selected_context_sufficiency":      2.0,
+    "kb_retrieval_pool_adequacy":           2.0,
+    "answer_expected_alignment":            2.0,
+    "kb_answer_groundedness":               2.0,
+    "answer_language_compliance":           1.0,
 }
 PASS_THRESHOLD = 0.7
+RECALL_TARGET_SINGLE_EXPECTED_ENUM = 0.90
+RECALL_TARGET_MULTI_EXPECTED_ENUM = 0.70
 # Hard veto on top of the threshold: if any *critical* (weight ≥ 2)
 # scorer scored 0, the case fails regardless of weighted_avg. Without
 # this, a case can still clear 0.7 with one weight-2 dimension at zero
@@ -127,6 +133,93 @@ PASS_THRESHOLD = 0.7
 # "the agent fabricated something but the rest looked fine" outcome we
 # don't want hidden behind a high mean.
 CRITICAL_DIMS = tuple(d for d, w in DIMENSION_WEIGHTS.items() if w >= 2.0)
+
+# The report keeps the new scorer/output names as its stable internal schema.
+# Older checkpoints are still readable: aliases below fill the new canonical
+# columns from the previous names when needed.
+CHECKPOINT_COLUMN_ALIASES = {
+    "kb_selection_semantic_relevance_score": (
+        "selection_semantic_relevance_score",
+    ),
+    "kb_selection_semantic_relevance_reasoning": (
+        "selection_semantic_relevance_reasoning",
+    ),
+    "kb_selected_context_sufficiency_score": (
+        "selected_context_sufficiency_score",
+    ),
+    "kb_selected_context_sufficiency_reasoning": (
+        "selected_context_sufficiency_reasoning",
+    ),
+    "kb_retrieval_pool_adequacy_score": (
+        "optimal_retrieved_context_adequacy_score",
+    ),
+    "kb_retrieval_pool_adequacy_reasoning": (
+        "optimal_retrieved_context_adequacy_reasoning",
+    ),
+    "kb_answer_groundedness_score": (
+        "answer_groundedness_score",
+    ),
+    "kb_answer_groundedness_reasoning": (
+        "answer_groundedness_reasoning",
+    ),
+    "answer_language_compliance_score": (
+        "language_compliance_score",
+    ),
+    "answer_language_compliance_reasoning": (
+        "language_compliance_reasoning",
+    ),
+    "non_useful_reranked_enums": (
+        "extra_or_distracting_enums",
+    ),
+    "missing_facts_in_agent_response": (
+        "missing_facts",
+    ),
+    "hallucinated_claims_in_agent_response": (
+        "hallucinated_claims",
+    ),
+    "post_prune_candidates_context_inadequacy_description": (
+        "retrieved_pool_inadequacy_description",
+    ),
+}
+
+DIMENSION_ID_ALIASES = {
+    "kb_selection_semantic_relevance": (
+        "selection_semantic_relevance",
+    ),
+    "kb_selected_context_sufficiency": (
+        "selected_context_sufficiency",
+    ),
+    "kb_retrieval_pool_adequacy": (
+        "optimal_retrieved_context_adequacy",
+    ),
+    "kb_answer_groundedness": (
+        "answer_groundedness",
+    ),
+    "answer_language_compliance": (
+        "language_compliance",
+    ),
+}
+
+OUTPUT_FIELD_ORDER = (
+    "case_scope",
+    "expected_reference_looks_wrong",
+    "expected_reference_issue_description",
+    "non_useful_reranked_enums",
+    "selected_context_coverage_status",
+    "unavailable_facts_in_selected_context",
+    "missing_facts_in_agent_response",
+    "hallucinated_claims_in_agent_response",
+    "user_query_detected_language",
+    "actual_response_detected_language",
+    "language_mismatch_description",
+    "post_prune_candidates_context_inadequacy_description",
+    "optimal_enum_selection",
+    "reranker_improvement_suggestion",
+    "agent_improvement_suggestion",
+    "kb_improvement_suggestion",
+    "test_case_improvement_suggestion",
+    "overall_explanation",
+)
 
 # ── Language scaffolding ────────────────────────────────────────────────────
 # Set by `main()` from the ``--lang`` CLI flag. Defaults to "cz" so the module
@@ -272,6 +365,25 @@ def _split_expected_enum_atoms(eid) -> list[str]:
     return [p.strip() for p in parts if p.strip()]
 
 
+def _expected_enum_atoms_with_raw(expected_list) -> list[tuple[str, str]]:
+    """Return expected ENUM atoms while keeping the original test-set value."""
+    if not isinstance(expected_list, list):
+        return []
+    out: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for raw_eid in expected_list:
+        raw_text = "" if raw_eid is None else str(raw_eid).strip()
+        atoms = _split_expected_enum_atoms(raw_eid)
+        if not atoms and raw_text:
+            atoms = [raw_text]
+        for atom in atoms:
+            key = (atom, raw_text)
+            if atom and key not in seen:
+                seen.add(key)
+                out.append(key)
+    return out
+
+
 # ── Sentinel normalization ──────────────────────────────────────────────────
 # The judge emits an "Answer is not available based on given information"
 # string (with several incidental whitespace variants) in three list fields
@@ -293,6 +405,145 @@ def _normalize_array(arr):
     return [x for x in arr if not (isinstance(x, str) and _is_void_string(x))]
 
 
+def _blank_like(s: pd.Series) -> pd.Series:
+    """True for cells that should be treated as missing in checkpoint CSVs."""
+    text = s.astype("object").where(s.notna(), "").astype(str).str.strip()
+    return text.eq("") | text.str.lower().isin({"nan", "none"})
+
+
+def normalize_checkpoint_schema(df: pd.DataFrame) -> pd.DataFrame:
+    """Translate known scorer-output variants to the report's stable schema.
+
+    This lets one report compare old and new checkpoints without forcing the
+    HTML, metrics, and failure-mode logic to learn every historical column
+    name. Existing canonical columns are preserved; aliases only fill gaps.
+    """
+    df = df.copy()
+
+    for canonical, aliases in CHECKPOINT_COLUMN_ALIASES.items():
+        for alias in aliases:
+            if alias not in df.columns:
+                continue
+            if canonical not in df.columns:
+                df[canonical] = df[alias]
+            else:
+                missing = _blank_like(df[canonical])
+                df[canonical] = df[canonical].where(~missing, df[alias])
+
+    if (
+        "post_prune_candidates_context_inadequacy_description" in df.columns
+        and (
+            "retrieved_pool_inadequacy_identified" not in df.columns
+            or _blank_like(df["retrieved_pool_inadequacy_identified"]).all()
+        )
+    ):
+        score = pd.to_numeric(
+            df.get(
+                "kb_retrieval_pool_adequacy_score",
+                pd.Series([np.nan] * len(df), index=df.index),
+            ),
+            errors="coerce",
+        )
+        case_scope = (
+            df.get("case_scope", pd.Series([""] * len(df), index=df.index))
+            .fillna("")
+            .astype(str)
+            .str.strip()
+        )
+        has_description = ~_blank_like(
+            df["post_prune_candidates_context_inadequacy_description"]
+        )
+        df["retrieved_pool_inadequacy_identified"] = (
+            case_scope.isin({"kb", "kb_and_api"})
+            & score.le(1)
+            & has_description
+        )
+
+    return df
+
+
+def _add_dimension_metadata_aliases(
+    items: dict[str, _METADATA_T],
+) -> dict[str, _METADATA_T]:
+    """Expose renamed YAML dimension metadata under canonical report ids."""
+    out = dict(items)
+    for canonical, aliases in DIMENSION_ID_ALIASES.items():
+        if canonical in out:
+            continue
+        for alias in aliases:
+            if alias in items:
+                out[canonical] = items[alias]
+                break
+    return out
+
+
+def _dimension_weights_for_df(df: pd.DataFrame) -> dict[str, float]:
+    """Return scorer weights for scorer columns present in this checkpoint."""
+    return {
+        dim: weight
+        for dim, weight in DIMENSION_WEIGHTS.items()
+        if f"{dim}_score" in df.columns
+    }
+
+
+def _critical_dims_for_df(df: pd.DataFrame) -> tuple[str, ...]:
+    return tuple(
+        dim for dim, weight in _dimension_weights_for_df(df).items() if weight >= 2.0
+    )
+
+
+def _available_output_fields(
+    df: pd.DataFrame,
+    output_field_order: tuple[str, ...] = OUTPUT_FIELD_ORDER,
+) -> list[str]:
+    return [field for field in output_field_order if field in df.columns]
+
+
+def _report_schema_warnings(
+    df: pd.DataFrame,
+    output_field_order: tuple[str, ...] = OUTPUT_FIELD_ORDER,
+) -> list[str]:
+    missing_scorers = [
+        dim for dim in DIMENSION_WEIGHTS if f"{dim}_score" not in df.columns
+    ]
+    missing_outputs = [field for field in output_field_order if field not in df.columns]
+    warnings: list[str] = []
+    if missing_scorers:
+        warnings.append(
+            "Missing scorer columns, so these scorers are hidden: "
+            + ", ".join(missing_scorers)
+        )
+    if missing_outputs:
+        warnings.append(
+            "Missing judge output fields, so these fields are hidden: "
+            + ", ".join(missing_outputs)
+        )
+    return warnings
+
+
+def _enum_recall_target(expected_counts: pd.Series, mask: pd.Series) -> dict[str, object]:
+    """Return one benchmark target for the micro-recall population."""
+    aligned_mask = mask.reindex(expected_counts.index, fill_value=False).astype(bool)
+    counts = expected_counts[aligned_mask]
+    counts = counts[counts > 0]
+    if counts.empty:
+        return {"target": float("nan"), "basis": "none"}
+    single_expected = counts.eq(1)
+    multiple_expected = counts.gt(1)
+    target_sum = (
+        (counts[single_expected] * RECALL_TARGET_SINGLE_EXPECTED_ENUM).sum()
+        + (counts[multiple_expected] * RECALL_TARGET_MULTI_EXPECTED_ENUM).sum()
+    )
+    target = float(target_sum / counts.sum())
+    if bool(single_expected.all()):
+        basis = "single expected ENUM"
+    elif bool(multiple_expected.all()):
+        basis = "multiple expected ENUMs"
+    else:
+        basis = "mixed expected ENUM counts"
+    return {"target": target, "basis": basis}
+
+
 # ── Failure-mode taxonomy ────────────────────────────────────────────────────
 # Per-case primary tag computed deterministically from existing fields.
 # Priority order matters — first match wins. Owners map to teams referenced
@@ -300,6 +551,7 @@ def _normalize_array(arr):
 FAILURE_MODES = (
     "pass",
     "test_set_defect",
+    "expected_enum_missing_from_kb",
     "enum_name_mismatch",
     "scope_misroute",
     "retrieval_gap",
@@ -316,6 +568,7 @@ FAILURE_MODES = (
 FAILURE_MODE_OWNER = {
     "pass":                "—",
     "test_set_defect":     "Test set",
+    "expected_enum_missing_from_kb": "Test set",
     "enum_name_mismatch":  "Test set",
     "scope_misroute":      "Agent",
     "retrieval_gap":       "Retrieval",
@@ -332,6 +585,7 @@ FAILURE_MODE_OWNER = {
 FAILURE_MODE_LABEL = {
     "pass":                "Clean pass",
     "test_set_defect":     "Test-set issue",
+    "expected_enum_missing_from_kb": "Expected ENUM missing from KB",
     "enum_name_mismatch":  "ENUM name mismatch",
     "scope_misroute":      "Wrong agent routing",
     "retrieval_gap":       "Retrieval gap",
@@ -351,6 +605,7 @@ FAILURE_MODE_LABEL = {
 FAILURE_MODE_INFO = {
     "pass":                f"weighted_avg ≥ {PASS_THRESHOLD:g}, no weight-2 scorer at 0, AND no other issue fired. Strict subset of the headline pass rate (which also counts judge-passes where a higher-priority issue fired, e.g. test-set defects).",
     "test_set_defect":     "Judge flagged the gold reference as needing review.",
+    "expected_enum_missing_from_kb": "Expected ENUM is absent from the KB export used for this report.",
     "enum_name_mismatch":  "Expected ENUM matches a KB ENUM only after stripping case/separators — false-zero risk.",
     "scope_misroute":      "Judge said KB; system never reached the KB.",
     "retrieval_gap":       "Expected ENUM never entered the pre-prune candidate pool.",
@@ -371,6 +626,13 @@ FAILURE_MODE_INFO_LONG = {
         "Cases the judge classified as api / out_of_scope / ambiguous are "
         "pre-filtered out of the report; they appear in the Doc tab's "
         "case_scope distribution.",
+    "expected_enum_missing_from_kb":
+        "Report-time KB check: at least one expected_enum from the test set "
+        "does not exist in the KB CSV passed to --kb-en-csv / --kb-native-csv, "
+        "even after the report's separator/case-tolerant normalization. This "
+        "is counted as a test-set issue because the retrieval/reranker pipeline "
+        "cannot select a fragment that is not present in the KB export being "
+        "used for the run.",
     "enum_name_mismatch":
         "Deterministic check: expected_enum doesn't match any retrieved / "
         "post-prune ENUM exactly, but matches after normalization (case + "
@@ -398,8 +660,8 @@ FAILURE_MODE_INFO_LONG = {
         "answer disagreed with the expected reference (alignment = 0). "
         "Agent prompt or generation issue.",
     "hallucination":
-        "Severe hallucination only: answer_groundedness == 0 AND ≥ 1 "
-        "hallucinated_claim AND non-empty kb_context. Per the YAML rubric, "
+        "Severe hallucination only: kb_answer_groundedness == 0 AND ≥ 1 "
+        "hallucinated_claims_in_agent_response AND non-empty kb_context. Per the YAML rubric, "
         "score 0 means \"important unsupported, fabricated, or contradictory "
         "claims\" — the agent is genuinely making things up. Cases with "
         "groundedness = 1 (\"one minor unsupported claim or wording "
@@ -408,7 +670,7 @@ FAILURE_MODE_INFO_LONG = {
         "and co-occurrence heatmap still surface the broader signal via "
         "_failure_modes_all.",
     "language_drift":
-        "language_compliance ≤ 1 — agent answered in {LANG_NAME} or another "
+        "answer_language_compliance ≤ 1 — agent answered in {LANG_NAME} or another "
         "non-{LANG_NAME} language.",
     "critical_score_zero":
         f"weighted_avg ≥ {PASS_THRESHOLD:g} (so the average says \"pass\"), "
@@ -428,32 +690,47 @@ _apply_lang(LANG)
 
 
 def _root_cause(r) -> str:
+    def score(name: str, default=np.nan):
+        value = r.get(name, default)
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
     if r.get("error") is True or str(r.get("error", "")).lower() == "true":
         return "judge_error"
-    if r.get("language_compliance_score") == 0:
+    if score("answer_language_compliance_score") == 0:
         return "language_mismatch"
-    if r.get("query_clarity_score") == 0:
+    if score("query_clarity_score") == 0:
         return "query_ambiguous"
-    if r.get("retrieval_recall_score", 2) <= 1:
+    if score("retrieval_recall_score", 2) <= 1:
         return "retriever_missed_enums"
-    if r.get("selection_semantic_relevance_score") == 0:
+    if score("kb_selection_semantic_relevance_score") == 0:
         return "reranker_wrong_selection"
-    if r.get("optimal_retrieved_context_adequacy_score") == 0:
+    if score("kb_retrieval_pool_adequacy_score") == 0:
         return "retrieved_pool_inadequacy"
-    if r.get("selected_context_sufficiency_score") <= 1:
+    if score("kb_selected_context_sufficiency_score") <= 1:
         return "selected_context_insufficient"
-    if r.get("answer_groundedness_score") <= 1:
+    if score("kb_answer_groundedness_score") <= 1:
         return "hallucination_or_ungrounded_answer"
-    if r.get("answer_expected_alignment_score") <= 1:
+    if score("answer_expected_alignment_score") <= 1:
         return "answer_generation_issue"
-    if r.get("language_compliance_score") == 1:
+    if score("answer_language_compliance_score") == 1:
         return "language_mismatch"
     return "no_issue"
 
 
-def enrich(df: pd.DataFrame) -> pd.DataFrame:
+def enrich(
+    df: pd.DataFrame,
+    kb_description_lookup: dict[str, dict[str, str]] | None = None,
+) -> pd.DataFrame:
     """Add all programmatic columns consumed by the report."""
-    df = df.copy()
+    df = normalize_checkpoint_schema(df)
+    kb_export_enum_ids = {
+        enum_id.strip()
+        for enum_id in (kb_description_lookup or {})
+        if isinstance(enum_id, str) and enum_id.strip()
+    }
 
     # Every row needs a non-empty, unique test_case_id: the Test Cases tab
     # uses it as the DOM key for selection/highlighting, and every drill-down
@@ -478,10 +755,11 @@ def enrich(df: pd.DataFrame) -> pd.DataFrame:
         tid = tid.mask(missing, synthetic)
     df["test_case_id"] = tid
 
-    for dim in DIMENSION_WEIGHTS:
+    dim_weights = _dimension_weights_for_df(df)
+    df.attrs["report_schema_warnings"] = _report_schema_warnings(df)
+
+    for dim in dim_weights:
         col = f"{dim}_score"
-        if col not in df.columns:
-            raise KeyError(f"missing dimension column: {col}")
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
     # Latency columns arrive as strings from read_checkpoint_csv (which forces
@@ -494,35 +772,45 @@ def enrich(df: pd.DataFrame) -> pd.DataFrame:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    w_sum = sum(DIMENSION_WEIGHTS.values())
+    w_sum = sum(dim_weights.values())
     # Per-dim scores are 0/1/2; the extra `/ 2.0` puts the weighted average in
     # [0, 1] for easier human interpretation. Threshold is scaled accordingly
     # (1.4/2 = 0.7), so pass/fail outcomes are unchanged vs the [0, 2] scale.
-    df["weighted_avg"] = (sum(df[f"{d}_score"] * w for d, w in DIMENSION_WEIGHTS.items())
-                            / w_sum / 2.0)
+    if dim_weights:
+        df["weighted_avg"] = (
+            sum(df[f"{d}_score"] * w for d, w in dim_weights.items()) / w_sum / 2.0
+        )
+    else:
+        df["weighted_avg"] = np.nan
     # Critical-zero veto: any weight-≥2 dimension at score 0 blocks pass
     # regardless of the weighted average. See CRITICAL_DIMS comment above.
-    df["_critical_zero"] = pd.concat(
-        [df[f"{d}_score"].eq(0) for d in CRITICAL_DIMS], axis=1
-    ).any(axis=1)
+    critical_dims = _critical_dims_for_df(df)
+    if critical_dims:
+        df["_critical_zero"] = pd.concat(
+            [df[f"{d}_score"].eq(0) for d in critical_dims], axis=1
+        ).any(axis=1)
+    else:
+        df["_critical_zero"] = False
     df["pass"] = (df["weighted_avg"] >= PASS_THRESHOLD) & ~df["_critical_zero"]
-    df["total_score_judge"] = sum(df[f"{d}_score"] for d in DIMENSION_WEIGHTS)
+    df["total_score_judge"] = (
+        sum(df[f"{d}_score"] for d in dim_weights) if dim_weights else np.nan
+    )
 
     for c in ("reranked_enum_ids", "expected_enums",
               "post_prune_enum_ids", "pre_prune_enum_ids",
               "missing_enums", "missing_enums_in_candidate_pool", "missing_enums_not_in_pool",
-              "extra_or_distracting_enums", "optimal_enum_selection",
-              "hallucinated_claims", "missing_facts",
+              "non_useful_reranked_enums", "optimal_enum_selection",
+              "hallucinated_claims_in_agent_response", "missing_facts_in_agent_response",
               "unavailable_facts_in_selected_context"):
         if c in df.columns:
             df[f"_{c}"] = df[c].apply(_parse_list)
 
     # Claim-count columns + kb_context_empty flag (used by the Judge Eval tab).
     for src, dst in (
-        ("hallucinated_claims",                 "hallucinated_claims_cnt"),
-        ("missing_facts",                       "missing_facts_cnt"),
+        ("hallucinated_claims_in_agent_response","hallucinated_claims_cnt"),
+        ("missing_facts_in_agent_response",     "missing_facts_cnt"),
         ("unavailable_facts_in_selected_context","unavailable_facts_cnt"),
-        ("extra_or_distracting_enums",          "extra_distracting_enums_cnt"),
+        ("non_useful_reranked_enums",           "extra_distracting_enums_cnt"),
     ):
         if f"_{src}" in df.columns:
             df[dst] = df[f"_{src}"].apply(len)
@@ -578,18 +866,18 @@ def enrich(df: pd.DataFrame) -> pd.DataFrame:
         df["enum_relevance_score"] = pd.to_numeric(df["enum_relevance_score"], errors="coerce")
 
     # ── Sentinel-normalized list columns + per-claim counters ────────────────
-    # These override the raw _hallucinated_claims / _unavailable_facts /
-    # _missing_facts so any downstream consumer (counters, judge-eval contract
+    # These override the raw hallucination / missing-fact / unavailable-fact
+    # lists so any downstream consumer (counters, judge-eval contract
     # checks, failure-mode classifier) treats the void sentinel as [].
-    for src in ("hallucinated_claims",
+    for src in ("hallucinated_claims_in_agent_response",
                 "unavailable_facts_in_selected_context",
-                "missing_facts"):
+                "missing_facts_in_agent_response"):
         col = f"_{src}"
         if col in df.columns:
             df[col] = df[col].apply(_normalize_array)
     for src, dst in (
-        ("hallucinated_claims",                 "hallucinated_claims_cnt"),
-        ("missing_facts",                       "missing_facts_cnt"),
+        ("hallucinated_claims_in_agent_response","hallucinated_claims_cnt"),
+        ("missing_facts_in_agent_response",     "missing_facts_cnt"),
         ("unavailable_facts_in_selected_context","unavailable_facts_cnt"),
     ):
         if f"_{src}" in df.columns:
@@ -633,19 +921,19 @@ def enrich(df: pd.DataFrame) -> pd.DataFrame:
     g = lambda c: pd.to_numeric(df.get(c, pd.Series([np.nan]*len(df), index=df.index)),
                                   errors="coerce")
     align = g("answer_expected_alignment_score")
-    suff  = g("selected_context_sufficiency_score")
-    grd   = g("answer_groundedness_score")
-    lang  = g("language_compliance_score")
+    suff  = g("kb_selected_context_sufficiency_score")
+    grd   = g("kb_answer_groundedness_score")
+    lang  = g("answer_language_compliance_score")
 
     df["_context_use_failure"] = (align == 0) & (suff >= 1)
     # Two hallucination flags with different strictness:
     #   _hallucinated_severe  — primary failure-mode classifier uses this.
-    #     answer_groundedness == 0 ("important unsupported, fabricated, or
+    #     kb_answer_groundedness == 0 ("important unsupported, fabricated, or
     #     contradictory claims"). Excludes minor / nit-pick cases that
     #     would otherwise dominate the failure-mode table even though the
     #     case itself passed.
     #   _hallucinated_any     — chip filter + co-occurrence heatmap use
-    #     this via _failure_modes_all. Any non-empty hallucinated_claims
+    #     this via _failure_modes_all. Any non-empty hallucinated claim
     #     with non-empty context, regardless of severity. Lets colleagues
     #     still surface every case the judge flagged in the diagnostic
     #     views.
@@ -701,11 +989,12 @@ def enrich(df: pd.DataFrame) -> pd.DataFrame:
     # ── Deterministic test-set hygiene: ENUM name mismatch detection ────────
     # Build a "known KB enum IDs" universe by taking the union of every ID
     # observed in any row's pre-prune / post-prune / reranked stage. That's
-    # an approximation of the KB index's surface area as exercised by the
-    # eval; good enough to catch separator/format mismatches like
-    # SHARE_PRODUCT_INFO vs SHARE_PRODUCTINFO without requiring direct KB
-    # CSV access from the report.
+    # an approximation of the KB index's surface area as exercised by the eval.
+    # When a KB CSV is supplied, include every exported KB id too; this lets
+    # the report distinguish a true missing expected ENUM from a naming-only
+    # mismatch even when the matching KB id never appeared in retrieval.
     known_enums: set[str] = set()
+    known_enums.update(kb_export_enum_ids)
     for col in ("_pre_prune_enum_ids", "_post_prune_enum_ids", "_reranked_enum_ids"):
         if col in df.columns:
             for lst in df[col]:
@@ -721,30 +1010,19 @@ def enrich(df: pd.DataFrame) -> pd.DataFrame:
 
     def _find_naming_mismatches(expected_list) -> list[dict]:
         out: list[dict] = []
-        if not isinstance(expected_list, list):
-            return out
-        for raw_eid in expected_list:
-            atoms = _split_expected_enum_atoms(raw_eid)
-            # If splitting found nothing usable, fall back to the raw eid
-            # so we still try to match it.
-            if not atoms:
-                if isinstance(raw_eid, str) and raw_eid.strip():
-                    atoms = [raw_eid.strip()]
-                else:
-                    continue
-            for atom in atoms:
-                if atom in known_enums:
-                    continue                                   # exact match
-                norm = _normalize_enum_id(atom)
-                if not norm:
-                    continue
-                kb_forms = known_norm_to_ids.get(norm, [])
-                if kb_forms and atom not in kb_forms:
-                    out.append({
-                        "expected": atom,
-                        "kb_form": kb_forms[0] if len(kb_forms) == 1 else kb_forms,
-                        "raw_expected": raw_eid,
-                    })
+        for atom, raw_eid in _expected_enum_atoms_with_raw(expected_list):
+            if atom in known_enums:
+                continue                                   # exact match
+            norm = _normalize_enum_id(atom)
+            if not norm:
+                continue
+            kb_forms = known_norm_to_ids.get(norm, [])
+            if kb_forms and atom not in kb_forms:
+                out.append({
+                    "expected": atom,
+                    "kb_form": kb_forms[0] if len(kb_forms) == 1 else kb_forms,
+                    "raw_expected": raw_eid,
+                })
         return out
 
     df["_enum_naming_mismatches"] = df.get(
@@ -752,17 +1030,48 @@ def enrich(df: pd.DataFrame) -> pd.DataFrame:
     ).apply(_find_naming_mismatches)
     df["_naming_mismatch"] = df["_enum_naming_mismatches"].apply(lambda x: bool(x))
 
+    kb_export_norm_to_ids: dict[str, list[str]] = {}
+    for enum_id in kb_export_enum_ids:
+        kb_export_norm_to_ids.setdefault(_normalize_enum_id(enum_id), []).append(enum_id)
+
+    def _find_expected_missing_from_kb(expected_list) -> list[dict]:
+        # This check is only meaningful when the report was given a KB export.
+        if not kb_export_enum_ids:
+            return []
+        out: list[dict] = []
+        seen: set[str] = set()
+        for atom, raw_eid in _expected_enum_atoms_with_raw(expected_list):
+            if atom in kb_export_enum_ids:
+                continue
+            norm = _normalize_enum_id(atom)
+            # A normalized match means the KB has the fragment under a
+            # different spelling; the existing naming-mismatch bucket handles
+            # that separately.
+            if norm and kb_export_norm_to_ids.get(norm):
+                continue
+            if atom not in seen:
+                seen.add(atom)
+                out.append({"expected": atom, "raw_expected": raw_eid})
+        return out
+
+    df["_expected_enums_missing_from_kb"] = df.get(
+        "_expected_enums", pd.Series([[]] * len(df), index=df.index)
+    ).apply(_find_expected_missing_from_kb)
+    df["_expected_enum_missing_from_kb"] = df["_expected_enums_missing_from_kb"].apply(bool)
+
     # NOTE: _rel2_adjusted (per-case adjustment of upstream rel2 for naming
-    # mismatches) used to live here. It was dropped once we decided naming
-    # mismatches are test-set issues and should be EXCLUDED from KB Recall /
-    # KB Precision / Rel2 / funnel rather than adjusted into them. Downstream
-    # consumers now read `enum_relevance_score` directly and apply the
-    # exclusion at the metric level.
+    # mismatches) used to live here. It was dropped once we decided test-set
+    # ENUM hygiene issues should be EXCLUDED from KB Recall / KB Precision /
+    # Rel2 / funnel rather than adjusted into them. Downstream consumers now
+    # read `enum_relevance_score` directly and apply the exclusion at the
+    # metric level.
 
     # ── Primary failure mode (priority order) ────────────────────────────────
     def _classify_failure(r) -> str:
         if r.get("_gold_defect", False) or r.get("_case_scope_test_defect", False):
             return "test_set_defect"
+        if r.get("_expected_enum_missing_from_kb", False):
+            return "expected_enum_missing_from_kb"
         if r.get("_naming_mismatch", False):
             return "enum_name_mismatch"
         if r.get("_agent_skipped_kb", False):
@@ -810,6 +1119,8 @@ def enrich(df: pd.DataFrame) -> pd.DataFrame:
         modes: list[str] = []
         if r.get("_gold_defect", False) or r.get("_case_scope_test_defect", False):
             modes.append("test_set_defect")
+        if r.get("_expected_enum_missing_from_kb", False):
+            modes.append("expected_enum_missing_from_kb")
         if r.get("_naming_mismatch", False):
             modes.append("enum_name_mismatch")
         if r.get("_agent_skipped_kb", False):
@@ -852,7 +1163,10 @@ def enrich(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ── Baseline loading (per-run comparison) ────────────────────────────────────
-def load_baseline(path: Path) -> dict:
+def load_baseline(
+    path: Path,
+    kb_description_lookup: dict[str, dict[str, str]] | None = None,
+) -> dict:
     """Load a prior judge checkpoint CSV and reduce it to the same shape the
     rendering layer expects for the "vs baseline" Δ chips.
 
@@ -865,8 +1179,9 @@ def load_baseline(path: Path) -> dict:
     Returns a dict with the same keys ``render_html`` reads:
       ``label``         — derived from the file stem; used as the chip title prefix.
       ``metrics``       — ``{pass_rate_clean, dataset_recall, dataset_precision, rel2_mean}``.
-      ``issue_counts``  — ``{failure_mode: count}`` for every Top-3 failure mode,
-                          counted on the SAME filter the current run uses
+      ``issue_counts``  — ``{failure_mode: failed_count}`` for every row in
+                          the Issues table, counted on the SAME filter the
+                          current Summary top cards use
                           (``failure_mode == X AND judge_pass == False AND clean``).
       ``n_clean``       — clean-denominator count for context.
       ``cases``         — per-``test_case_id`` lookup for future per-case
@@ -879,7 +1194,7 @@ def load_baseline(path: Path) -> dict:
     short-circuits to ``""`` when any half of the pair is missing.
     """
     df = read_checkpoint_csv(path)
-    df = enrich(df)
+    df = enrich(df, kb_description_lookup=kb_description_lookup)
     summary = compute_summary_metrics(df, df_all=df)
     metrics = {
         "pass_rate_clean":   summary.get("pass_rate_clean"),
@@ -887,11 +1202,10 @@ def load_baseline(path: Path) -> dict:
         "dataset_precision": summary.get("dataset_precision"),
         "rel2_mean":         summary.get("rel2_mean"),
     }
-    issue_counts = {
-        entry["key"]: entry["n"]
-        for entry in summary.get("top_failures_clean", [])
-        if isinstance(entry, dict) and entry.get("key")
-    }
+    # Store the complete Issues-tab fail-count map, not just the baseline
+    # run's Top-3 cards. A current top issue may have been ranked #4 or lower
+    # in the baseline; it still needs a delta on the Summary card.
+    issue_counts = _baseline_issue_counts_from_summary(summary)
     cases: dict[str, dict] = {}
     if "test_case_id" in df.columns:
         for _, row in df.iterrows():
@@ -910,7 +1224,21 @@ def load_baseline(path: Path) -> dict:
         "metrics":      metrics,
         "issue_counts": issue_counts,
         "n_clean":      summary.get("n_clean", 0),
+        "n_fail_clean": summary.get("n_fail_clean", 0),
         "cases":        cases,
+    }
+
+
+def _baseline_issue_counts_from_summary(summary: dict) -> dict[str, int]:
+    """Return baseline issue counts for Summary-card deltas.
+
+    The source is the full Issues table, not the baseline run's Top-3
+    Summary cards, so every current top issue can show a baseline delta.
+    """
+    return {
+        entry["key"]: int(entry.get("n_fail", 0) or 0)
+        for entry in summary.get("failure_modes", [])
+        if isinstance(entry, dict) and entry.get("key")
     }
 
 
@@ -934,7 +1262,12 @@ def _h(s) -> str:
 
 
 
-def _case_payload(r: pd.Series, *, baseline_lookup: dict | None = None) -> dict:
+def _case_payload(
+    r: pd.Series,
+    *,
+    baseline_lookup: dict | None = None,
+    output_field_order: tuple[str, ...] = OUTPUT_FIELD_ORDER,
+) -> dict:
     """Build the per-case dict that ships to the JS layer.
 
     When ``baseline_lookup`` is provided, this function also resolves the
@@ -957,6 +1290,11 @@ def _case_payload(r: pd.Series, *, baseline_lookup: dict | None = None) -> dict:
         if isinstance(value, bool):
             return value
         return str(value).strip().lower() in {"true", "1", "1.0", "yes"}
+    output_fields = {}
+    for field in output_field_order:
+        if field not in r.index:
+            continue
+        output_fields[field] = "true" if field == "expected_reference_looks_wrong" and b(field) else g(field)
     # Parse the per-trace latency breakdown emitted by backfill_latency.py.
     lat_steps_raw = g("lat_steps_json", "")
     try:
@@ -1059,7 +1397,7 @@ def _case_payload(r: pd.Series, *, baseline_lookup: dict | None = None) -> dict:
         "reranker_selection_violations": g("reranker_selection_violations"),
         "missing_enums_in_candidate_pool": g("missing_enums_in_candidate_pool"),
         "missing_enums_not_in_pool": g("missing_enums_not_in_pool"),
-        "extra_or_distracting_enums": g("extra_or_distracting_enums"),
+        "non_useful_reranked_enums": g("non_useful_reranked_enums"),
         "optimal_enum_selection": g("optimal_enum_selection"),
         "dims": {
             d: {
@@ -1067,22 +1405,22 @@ def _case_payload(r: pd.Series, *, baseline_lookup: dict | None = None) -> dict:
                 "reasoning": g(f"{d}_reasoning"),
             }
             for d in DIMENSION_WEIGHTS
+            if f"{d}_score" in r.index
         },
         "overall_explanation": g("overall_explanation"),
         "retrieved_pool_inadequacy_identified": b("retrieved_pool_inadequacy_identified"),
-        "retrieved_pool_inadequacy_description": g("retrieved_pool_inadequacy_description"),
+        "post_prune_candidates_context_inadequacy_description": (
+            g("post_prune_candidates_context_inadequacy_description")
+        ),
         "retrieval_improvement_suggestion": g("retrieval_improvement_suggestion"),
         "reranker_improvement_suggestion": g("reranker_improvement_suggestion"),
         "agent_improvement_suggestion": g("agent_improvement_suggestion"),
         "kb_improvement_suggestion": g("kb_improvement_suggestion"),
         "test_case_improvement_suggestion": g("test_case_improvement_suggestion"),
-        "missing_facts": g("missing_facts"),
-        "hallucinated_claims": g("hallucinated_claims"),
+        "missing_facts_in_agent_response": g("missing_facts_in_agent_response"),
+        "hallucinated_claims_in_agent_response": g("hallucinated_claims_in_agent_response"),
         "unavailable_facts_in_selected_context": g("unavailable_facts_in_selected_context"),
-        "expected_answer_summary_with_optimal_context": (
-            g("expected_answer_summary_with_optimal_context")
-            or g("Expected_answer_summary_with_optimal_context")
-        ),
+        "output_fields": output_fields,
         "agents_called": g("agents_called"),
         "tools_called": g("tools_called"),
         "case_scope": g("case_scope"),
@@ -1103,6 +1441,12 @@ def _case_payload(r: pd.Series, *, baseline_lookup: dict | None = None) -> dict:
             r["_enum_naming_mismatches"]
             if "_enum_naming_mismatches" in r.index
                and isinstance(r["_enum_naming_mismatches"], list)
+            else []
+        ),
+        "expected_enums_missing_from_kb": (
+            r["_expected_enums_missing_from_kb"]
+            if "_expected_enums_missing_from_kb" in r.index
+               and isinstance(r["_expected_enums_missing_from_kb"], list)
             else []
         ),
         # Set when the row was filtered out of the analysis denominator.
@@ -1264,30 +1608,33 @@ def _build_corr_figs(df: pd.DataFrame):
 
 
 def _build_figs(df: pd.DataFrame, reranker_miss: Counter, retriever_miss: Counter):
-    n = len(DIMENSION_WEIGHTS)
-    ncols = (n + 1) // 2
-    fig_dim = make_subplots(
-        rows=2, cols=ncols,
-        subplot_titles=list(DIMENSION_WEIGHTS.keys()), shared_yaxes=True,
-        horizontal_spacing=0.06, vertical_spacing=0.22,
-    )
-    for i, dim in enumerate(DIMENSION_WEIGHTS):
-        row = (i // ncols) + 1
-        col = (i % ncols) + 1
-        counts = df[f"{dim}_score"].value_counts().reindex([0, 1, 2]).fillna(0)
-        fig_dim.add_trace(
-            go.Bar(
-                x=[0, 1, 2], y=counts.values, showlegend=False,
-                marker=dict(color=[GE_RED, GE_YELLOW, GE_GREEN],
-                            line=dict(width=0), cornerradius=5),
-            ),
-            row=row, col=col,
+    dim_weights = _dimension_weights_for_df(df)
+    n = len(dim_weights)
+    fig_dim = None
+    if n:
+        ncols = (n + 1) // 2
+        fig_dim = make_subplots(
+            rows=2, cols=ncols,
+            subplot_titles=list(dim_weights.keys()), shared_yaxes=True,
+            horizontal_spacing=0.06, vertical_spacing=0.22,
         )
-    _style_fig(fig_dim, height=460)
-    fig_dim.update_layout(margin=dict(t=40, b=30, l=30, r=20), bargap=0.35)
-    for ann in fig_dim.layout.annotations:
-        ann.font = dict(family=GE_FONT, size=11, color=GE_MUTED)
-    fig_dim.update_xaxes(tickvals=[0, 1, 2])
+        for i, dim in enumerate(dim_weights):
+            row = (i // ncols) + 1
+            col = (i % ncols) + 1
+            counts = df[f"{dim}_score"].value_counts().reindex([0, 1, 2]).fillna(0)
+            fig_dim.add_trace(
+                go.Bar(
+                    x=[0, 1, 2], y=counts.values, showlegend=False,
+                    marker=dict(color=[GE_RED, GE_YELLOW, GE_GREEN],
+                                line=dict(width=0), cornerradius=5),
+                ),
+                row=row, col=col,
+            )
+        _style_fig(fig_dim, height=460)
+        fig_dim.update_layout(margin=dict(t=40, b=30, l=30, r=20), bargap=0.35)
+        for ann in fig_dim.layout.annotations:
+            ann.font = dict(family=GE_FONT, size=11, color=GE_MUTED)
+        fig_dim.update_xaxes(tickvals=[0, 1, 2])
 
     # weighted_avg histogram rendered on the Notes tab next to the Pass
     # rate card. The interactive threshold slider (wired up in JS) drives a
@@ -1606,13 +1953,11 @@ def _build_dim_heatmap(df: pd.DataFrame):
     # Re-order so query_clarity and language_compliance sit next to each other
     # at the start (they're both meta-axes about the query / output language;
     # easier to read them as a pair than split across the matrix).
-    _dim_order = ["query_clarity", "language_compliance",
-                   "selection_semantic_relevance", "selected_context_sufficiency",
-                   "optimal_retrieved_context_adequacy", "answer_expected_alignment",
-                   "answer_groundedness"]
-    dims = [d for d in _dim_order if d in DIMENSION_WEIGHTS and f"{d}_score" in df.columns]
+    _dim_order = list(DIMENSION_WEIGHTS)
+    dim_weights = _dimension_weights_for_df(df)
+    dims = [d for d in _dim_order if d in dim_weights and f"{d}_score" in df.columns]
     # Fallback: append any DIMENSION_WEIGHTS entries the order list missed.
-    for d in DIMENSION_WEIGHTS:
+    for d in dim_weights:
         if d not in dims and f"{d}_score" in df.columns:
             dims.append(d)
     if not dims:
@@ -1736,6 +2081,7 @@ def compute_summary_metrics(df: pd.DataFrame, df_all: pd.DataFrame) -> dict:
     defect_mask   = (
         df.get("_gold_defect", pd.Series([False]*len(df), index=df.index))
         | df.get("_case_scope_test_defect", pd.Series([False]*len(df), index=df.index))
+        | df.get("_expected_enum_missing_from_kb", pd.Series([False]*len(df), index=df.index))
         | df.get("_naming_mismatch", pd.Series([False]*len(df), index=df.index))
     )
     n_defect      = int(defect_mask.sum())
@@ -1755,11 +2101,11 @@ def compute_summary_metrics(df: pd.DataFrame, df_all: pd.DataFrame) -> dict:
                   if "case_scope" in df_all.columns else {})
 
     # Failure mode roll-up. Two groups with different denominators:
-    #   1. Test-set group (test_set_defect, enum_name_mismatch) — % of
+    #   1. Test-set group (gold defects, missing KB enum, enum_name_mismatch) — % of
     #      n_eval. These rows quantify how much of the analyzed sample is
     #      unusable ground truth.
     #   2. Valid-cases group (everything else, including pass) — % of
-    #      n_clean (= n_eval − test_set_defect − enum_name_mismatch).
+    #      n_clean (= n_eval − all test-set issues).
     #      Once defects are excluded, percentages reflect agent-side
     #      performance on the trustworthy subset, matching the Top-3
     #      failure-reasons card AND the "Pass rate · excl. test-set
@@ -1771,15 +2117,19 @@ def compute_summary_metrics(df: pd.DataFrame, df_all: pd.DataFrame) -> dict:
     # pass_mask is False. The "Clean pass" row is 0 by construction (a
     # failure_mode of "pass" requires weighted_avg ≥ threshold AND no
     # weight-2 scorer at 0, which is exactly the pass_mask predicate). The
-    # sum over the clean group (everything except test_set_defect /
-    # enum_name_mismatch / pass) equals n_fail_clean — surfaced as the
+    # sum over the clean group (everything except test-set issues / pass)
+    # equals n_fail_clean — surfaced as the
     # "Hard fail" summary row in _failure_mode_table_html so the reader can
     # see how the headline "total clean failures" decomposes by mode.
     if "failure_mode" in df.columns:
         fm_fail_counts = df.loc[~pass_mask, "failure_mode"].value_counts().to_dict()
     else:
         fm_fail_counts = {}
-    test_set_group = ("test_set_defect", "enum_name_mismatch")
+    test_set_group = (
+        "test_set_defect",
+        "expected_enum_missing_from_kb",
+        "enum_name_mismatch",
+    )
     valid_group_order = ("pass", "scope_misroute", "retrieval_gap", "pruning_loss",
                           "reranker_miss", "pool_content_gap", "context_use_failure",
                           "hallucination", "language_drift",
@@ -1810,16 +2160,18 @@ def compute_summary_metrics(df: pd.DataFrame, df_all: pd.DataFrame) -> dict:
 
     # Funnel — micro-averaged expected-ENUM recall at each pipeline stage.
     # Mask matches KB Recall / KB Precision / Rel2 exactly:
-    #   query_scope == 'kb' AND NOT _naming_mismatch.
-    # ENUM-naming-mismatch cases are excluded because the upstream gold
-    # ENUM IDs use a different naming convention than the KB — that's a
-    # test-set issue, not an agent failure, and counting them here would
-    # drag the agent's metrics down for something the agent can't fix.
+    #   query_scope == 'kb' AND no test-set ENUM hygiene issue.
+    # ENUM naming mismatches and expected ENUMs absent from the supplied KB
+    # export are test-set issues, not agent failures. Counting them here
+    # would drag the agent's metrics down for something the agent can't fix.
     qs_kb_route = df.get("query_scope", pd.Series([""]*len(df), index=df.index)) \
                     .fillna("").astype(str).eq("kb")
     naming_mismatch_mask = df.get("_naming_mismatch",
         pd.Series([False]*len(df), index=df.index)).astype(bool)
-    funnel_mask = qs_kb_route & ~naming_mismatch_mask
+    missing_expected_kb_mask = df.get("_expected_enum_missing_from_kb",
+        pd.Series([False]*len(df), index=df.index)).astype(bool)
+    enum_hygiene_issue_mask = naming_mismatch_mask | missing_expected_kb_mask
+    funnel_mask = qs_kb_route & ~enum_hygiene_issue_mask
     funnel_sub = df[funnel_mask]
     # Micro-averaged recall AND precision per stage: sum TPs, |expected|,
     # and |stage selection| across cases first, then divide. Matches the
@@ -1872,10 +2224,8 @@ def compute_summary_metrics(df: pd.DataFrame, df_all: pd.DataFrame) -> dict:
 
     # Per-dimension card data (label, mean, counts at 0/1/2, ids per bucket).
     dim_data = []
-    for dim in DIMENSION_WEIGHTS:
+    for dim in _dimension_weights_for_df(df):
         col = f"{dim}_score"
-        if col not in df.columns:
-            continue
         scores = pd.to_numeric(df[col], errors="coerce")
         n_def = int(scores.notna().sum())
         bucket_ids = {
@@ -1946,13 +2296,10 @@ def compute_summary_metrics(df: pd.DataFrame, df_all: pd.DataFrame) -> dict:
     # cases — gives a single "how well did the pipeline retrieve the gold
     # ENUMs over the whole run" number, distinct from the per-case mean.
     # Basis: cases the system routed through the KB pipeline (query_scope
-    # == 'kb') AND that don't have an ENUM-naming-mismatch. Naming-
-    # mismatch cases are test-set issues (gold ENUM IDs use a different
-    # naming convention than the KB), so they shouldn't drag down agent
-    # metrics for something the agent can't fix.
+    # == 'kb') AND that don't have a test-set ENUM hygiene issue.
     qs_kb_mask = df.get("query_scope", pd.Series([""]*len(df), index=df.index)) \
                     .fillna("").astype(str).eq("kb")
-    recall_mask = qs_kb_mask & ~naming_mismatch_mask
+    recall_mask = qs_kb_mask & ~enum_hygiene_issue_mask
     dataset_recall_n = int(recall_mask.sum())
     if dataset_recall_n:
         sub_e = df.loc[recall_mask, "_expected_enums"]
@@ -1979,15 +2326,19 @@ def compute_summary_metrics(df: pd.DataFrame, df_all: pd.DataFrame) -> dict:
         dataset_recall_total_expected = 0
         dataset_recall_total_reranked = 0
 
-    # Rel2 — same basis as KB Recall: KB-routed cases with no naming
-    # mismatch. We use the upstream enum_relevance_score directly (no
-    # per-case adjustment) since naming-mismatch rows are now removed
-    # from the population entirely rather than recomputed.
+    expected_enum_counts = df.get(
+        "_expected_enums", pd.Series([[]] * len(df), index=df.index)
+    ).apply(lambda values: len(values) if isinstance(values, list) else 0)
+    dataset_recall_target = _enum_recall_target(expected_enum_counts, recall_mask)
+
+    # Rel2 — same basis as KB Recall: KB-routed cases with no test-set ENUM
+    # hygiene issue. We use the upstream enum_relevance_score directly because
+    # those rows are removed from the population rather than recomputed.
     rel2_series = pd.to_numeric(df.get("enum_relevance_score",
         pd.Series([np.nan]*len(df), index=df.index)), errors="coerce")
-    reranker_ran_mask = qs_kb_mask & ~naming_mismatch_mask
+    reranker_ran_mask = qs_kb_mask & ~enum_hygiene_issue_mask
     rel2_defined = rel2_series[reranker_ran_mask].dropna()
-    n_rel2_naming_excluded = int((qs_kb_mask & naming_mismatch_mask).sum())
+    n_rel2_enum_hygiene_excluded = int((qs_kb_mask & enum_hygiene_issue_mask).sum())
     rel2_mean   = float(rel2_defined.mean())   if len(rel2_defined) else float("nan")
     rel2_median = float(rel2_defined.median()) if len(rel2_defined) else float("nan")
     rel2_std    = float(rel2_defined.std(ddof=0)) if len(rel2_defined) else float("nan")
@@ -2044,7 +2395,7 @@ def compute_summary_metrics(df: pd.DataFrame, df_all: pd.DataFrame) -> dict:
     fm_in_scope = (df.loc[top_filter_mask, "failure_mode"]
                     if "failure_mode" in df.columns
                     else pd.Series(dtype=object))
-    excluded_for_top = {"pass", "test_set_defect"}
+    excluded_for_top = {"pass", *test_set_group}
     fm_in_scope_failures = fm_in_scope[~fm_in_scope.isin(excluded_for_top)]
     fm_top_counts = fm_in_scope_failures.value_counts()
     top_failures_clean = []
@@ -2086,7 +2437,8 @@ def compute_summary_metrics(df: pd.DataFrame, df_all: pd.DataFrame) -> dict:
         "rel2_std":        rel2_std,
         "rel2_n":          rel2_n,
         "rel2_buckets":    rel2_buckets,
-        "rel2_naming_excluded": n_rel2_naming_excluded,
+        "rel2_enum_hygiene_excluded": n_rel2_enum_hygiene_excluded,
+        "rel2_naming_excluded": n_rel2_enum_hygiene_excluded,
         "top_failures_clean": top_failures_clean,
         "n_fail_clean":    n_fail_clean,
         "hard_fail_ids":   hard_fail_ids,
@@ -2101,6 +2453,8 @@ def compute_summary_metrics(df: pd.DataFrame, df_all: pd.DataFrame) -> dict:
         "dataset_recall_tp":        dataset_recall_tp,
         "dataset_recall_total_expected": dataset_recall_total_expected,
         "dataset_recall_total_reranked": dataset_recall_total_reranked,
+        "dataset_recall_target": dataset_recall_target["target"],
+        "dataset_recall_target_basis": dataset_recall_target["basis"],
     }
 
 
@@ -2108,24 +2462,24 @@ def compute_summary_metrics(df: pd.DataFrame, df_all: pd.DataFrame) -> dict:
 def _dim_plain_label(dim: str) -> str:
     return {
         "query_clarity":                       "Was the user's question clear?",
-        "selection_semantic_relevance":        "Did the reranker pick relevant content?",
-        "selected_context_sufficiency":        "Did the chosen context contain the answer?",
-        "optimal_retrieved_context_adequacy":  "Was the right content available to pick from?",
+        "kb_selection_semantic_relevance":     "Did the reranker pick relevant content?",
+        "kb_selected_context_sufficiency":     "Did the chosen context contain the answer?",
+        "kb_retrieval_pool_adequacy":          "Was the right content available to pick from?",
         "answer_expected_alignment":           "Did the agent give the expected answer?",
-        "answer_groundedness":                 "Did the agent stick to the provided context?",
-        "language_compliance":                 f"Did the agent answer in {LANG_NAME}?",
+        "kb_answer_groundedness":              "Did the agent stick to the provided context?",
+        "answer_language_compliance":          f"Did the agent answer in {LANG_NAME}?",
     }.get(dim, dim)
 
 
 def _dim_owner(dim: str) -> str:
     return {
         "query_clarity":                       "Test set",
-        "selection_semantic_relevance":        "Reranker",
-        "selected_context_sufficiency":        "Reranker / KB",
-        "optimal_retrieved_context_adequacy":  "Retrieval / KB",
+        "kb_selection_semantic_relevance":     "Reranker",
+        "kb_selected_context_sufficiency":     "Reranker / KB",
+        "kb_retrieval_pool_adequacy":          "Retrieval / KB",
         "answer_expected_alignment":           "Agent",
-        "answer_groundedness":                 "Agent",
-        "language_compliance":                 "Agent",
+        "kb_answer_groundedness":              "Agent",
+        "answer_language_compliance":          "Agent",
     }.get(dim, "—")
 
 
@@ -2299,6 +2653,21 @@ def _prompt_warning_card(warnings: list[dict]) -> str:
         f"{_info_icon('A uniform eval run produces one hash per agent-prompt and one for the tool-registry. More than one — or any trace with no prompt at all — means the run mixed deploys or had span-extraction failures.')}"
         "</div>"
         f"{''.join(items)}"
+        "</div>"
+    )
+
+
+def _schema_warning_card(warnings: list[str]) -> str:
+    if not warnings:
+        return ""
+    items = "".join(f"<li>{_h(w)}</li>" for w in warnings)
+    return (
+        "<div class='card prompt-warning-card'>"
+        "<div class='card-title prompt-warning-title'>"
+        "Report schema warning"
+        f"{_info_icon('The report now renders only scorer and output fields that are present in the checkpoint after applying known old-name aliases. Missing fields are hidden instead of stopping report generation.')}"
+        "</div>"
+        f"<ul class='schema-warning-list'>{items}</ul>"
         "</div>"
     )
 
@@ -2500,10 +2869,10 @@ def _failure_mode_table_html(metrics: dict) -> str:
     )
 
     # ── Failure modes ─────────────────────────────────────────────────────
-    # Two groups: test-set rows (test_set_defect, enum_name_mismatch) use
+    # Two groups: test-set rows use
     # n_eval as their denominator and come first; remaining rows use
     # n_clean to match the Top-3 failure-reasons card and the "Pass rate ·
-    # excl. test-set issues" headline. After the second test-set row we
+    # excl. test-set issues" headline. After the final test-set row we
     # drop in an "All valid cases" denominator marker so the switch is
     # explicit. Each row's row["pct"] is already computed against the right
     # denominator in compute_summary_metrics, so we just format it.
@@ -2541,7 +2910,11 @@ def _failure_mode_table_html(metrics: dict) -> str:
         else:
             n_fail_cell = "<td style='text-align:right'>0</td>"
         row_cls = (" class='fm-row-defect'"
-                    if row["key"] in {"test_set_defect", "enum_name_mismatch"}
+                    if row["key"] in {
+                        "test_set_defect",
+                        "expected_enum_missing_from_kb",
+                        "enum_name_mismatch",
+                    }
                     else "")
         long_info = FAILURE_MODE_INFO_LONG.get(row["key"])
         info_cell = _h(row['info'])
@@ -2569,7 +2942,7 @@ def _failure_mode_table_html(metrics: dict) -> str:
                 f"<td style='text-align:right'><strong>{pct(n_clean, n_total)}</strong></td>"
                 "<td style='text-align:right;color:#5c7999'>—</td>"
                 "<td>—</td>"
-                "<td>All analyzed cases minus test-set issues and ENUM name mismatches. "
+                "<td>All analyzed cases minus test-set issues. "
                 "Same denominator as the Top-3 issues card above and the "
                 "\"Pass rate · excl. test-set issues\" headline; rows below report "
                 "% of this number so the values reflect agent-side performance on "
@@ -2679,8 +3052,10 @@ def _kb_findings_table_html(df: pd.DataFrame) -> str:
     """Filterable review queue for the KB / dataset team.
 
     Surfaces every case that has at least one of:
-      * failure_mode in {test_set_defect, enum_name_mismatch, pool_content_gap}
+      * failure_mode in {test_set_defect, expected_enum_missing_from_kb,
+        enum_name_mismatch, pool_content_gap}
       * non-empty kb_improvement_suggestion or test_case_improvement_suggestion
+      * expected ENUMs absent from the supplied KB export
       * detected ENUM naming mismatches
     Each row links into the Test Cases tab. The table reuses the existing
     `tbl-filterable` JS so per-column filters work out of the box.
@@ -2693,20 +3068,34 @@ def _kb_findings_table_html(df: pd.DataFrame) -> str:
                       pd.Series([""]*len(df), index=df.index)).fillna("").astype(str)
     kb_sugg = df.get("kb_improvement_suggestion",
                       pd.Series([""]*len(df), index=df.index)).fillna("").astype(str)
+    missing_kb_enum = df.get(
+        "_expected_enum_missing_from_kb", pd.Series([False] * len(df), index=df.index)
+    )
     naming = df.get("_naming_mismatch", pd.Series([False]*len(df), index=df.index))
 
-    issue_modes = {"test_set_defect", "enum_name_mismatch", "pool_content_gap"}
+    issue_modes = {
+        "test_set_defect",
+        "expected_enum_missing_from_kb",
+        "enum_name_mismatch",
+        "pool_content_gap",
+    }
     mask = (fm.isin(issue_modes)
             | tc_sugg.str.strip().ne("")
             | kb_sugg.str.strip().ne("")
+            | missing_kb_enum.astype(bool)
             | naming.astype(bool))
     sub = df[mask]
     if sub.empty:
         return "<p class='placeholder'>no test-case issues detected in this run.</p>"
 
-    # Stable sort: defects first, then naming mismatches, then KB content gaps,
-    # then everything else; secondary sort by test_case_id for deterministic order.
-    rank = {"test_set_defect": 0, "enum_name_mismatch": 1, "pool_content_gap": 2}
+    # Stable sort: defects first, then missing KB enums, naming mismatches,
+    # KB content gaps, then everything else. Secondary sort by test_case_id.
+    rank = {
+        "test_set_defect": 0,
+        "expected_enum_missing_from_kb": 1,
+        "enum_name_mismatch": 2,
+        "pool_content_gap": 3,
+    }
     sub = sub.assign(_rank=fm[mask].map(lambda k: rank.get(k, 9))) \
               .sort_values(by=["_rank", "test_case_id"], na_position="last") \
               .drop(columns="_rank")
@@ -2716,6 +3105,14 @@ def _kb_findings_table_html(df: pd.DataFrame) -> str:
         v = r.get("expected_reference_issue_description", "")
         if isinstance(v, str) and v.strip():
             parts.append(f"GOLD: {v.strip()}")
+        missing = r.get("_expected_enums_missing_from_kb") or []
+        if isinstance(missing, list) and missing:
+            shown = ", ".join(
+                str(m.get("expected", "") if isinstance(m, dict) else m)
+                for m in missing[:5]
+            )
+            extra = "" if len(missing) <= 5 else f" (+{len(missing) - 5})"
+            parts.append(f"EXPECTED NOT IN KB: {shown}{extra}")
         misses = r.get("_enum_naming_mismatches") or []
         if isinstance(misses, list) and misses:
             shown = "; ".join(
@@ -2724,7 +3121,7 @@ def _kb_findings_table_html(df: pd.DataFrame) -> str:
             )
             extra = "" if len(misses) <= 3 else f" (+{len(misses) - 3})"
             parts.append(f"NAMING: {shown}{extra}")
-        v = r.get("retrieved_pool_inadequacy_description", "")
+        v = r.get("post_prune_candidates_context_inadequacy_description", "")
         if isinstance(v, str) and v.strip():
             parts.append(f"POOL: {v.strip()}")
         v = r.get("kb_improvement_suggestion", "")
@@ -2757,9 +3154,11 @@ def _kb_findings_table_html(df: pd.DataFrame) -> str:
     issue_tip = (
         "Concatenated, prefixed by source: "
         "GOLD: judge's expected_reference_issue_description (gold reference flagged for review). "
+        "EXPECTED NOT IN KB: expected ENUM IDs from the test set that are absent from the supplied KB export. "
         "NAMING: ENUM name mismatches detected by the deterministic check "
         "(expected ↔ KB-form). "
-        "POOL: judge's retrieved_pool_inadequacy_description (post-prune fragments too thin). "
+        "POOL: judge's post_prune_candidates_context_inadequacy_description "
+        "(post-prune fragments too thin). "
         "KB SUGG: judge's kb_improvement_suggestion. "
         "TEST-SET SUGG: judge's test_case_improvement_suggestion."
     )
@@ -2834,6 +3233,70 @@ def _aggregate_naming_mismatches(df: pd.DataFrame) -> list[dict]:
     rows = list(bucket.values())
     rows.sort(key=lambda x: (-len(x["cases"]), x["expected"]))
     return rows
+
+
+def _aggregate_expected_enums_missing_from_kb(df: pd.DataFrame) -> list[dict]:
+    """Collect expected ENUM IDs that are absent from the supplied KB export."""
+    if "_expected_enums_missing_from_kb" not in df.columns:
+        return []
+    bucket: dict[str, dict] = {}
+    for _, row in df.iterrows():
+        missing = row.get("_expected_enums_missing_from_kb") or []
+        if not isinstance(missing, list):
+            continue
+        case_id = "" if pd.isna(row.get("test_case_id")) else str(row.get("test_case_id"))
+        for item in missing:
+            expected = (
+                item.get("expected", "")
+                if isinstance(item, dict)
+                else str(item or "")
+            )
+            expected = str(expected).strip()
+            if not expected:
+                continue
+            entry = bucket.setdefault(expected, {"expected": expected, "cases": []})
+            if case_id and case_id not in entry["cases"]:
+                entry["cases"].append(case_id)
+    rows = list(bucket.values())
+    rows.sort(key=lambda x: (-len(x["cases"]), x["expected"]))
+    return rows
+
+
+def _expected_enums_missing_from_kb_card_html(agg: list[dict]) -> str:
+    if not agg:
+        return ""
+    body_rows = ""
+    for entry in agg:
+        case_ids = entry["cases"]
+        n = len(case_ids)
+        cases_link = _ids_filter_link(
+            case_ids,
+            f"expected enum absent from KB: {entry['expected']}",
+            classes="judge-eval-link",
+            inner=f"{n} {'case' if n == 1 else 'cases'}",
+        ) if n else "0"
+        body_rows += (
+            "<tr>"
+            f"<td><code class='naming-expected'>{_h(entry['expected'])}</code></td>"
+            f"<td style='text-align:right'>{cases_link}</td>"
+            "</tr>"
+        )
+    return (
+        "<div class='card'>"
+        f"<div class='card-title'>Expected ENUMs absent from KB "
+        f"{_info_icon('Compares expected_enums from the test set to the KB CSV passed to the report. Exact misses that also have a normalized KB match are treated as naming mismatches instead; this card shows IDs with no exact or normalized KB export match.')}"
+        f"</div>"
+        "<p style='font-size:12px;color:#5c7999;margin-bottom:8px'>"
+        "These are test-set issues for this run: the pipeline cannot retrieve or rerank "
+        "an expected fragment that is not present in the supplied KB export."
+        "</p>"
+        f"<table class='tbl naming-table'>"
+        "<thead><tr>"
+        "<th>Expected (test set)</th>"
+        "<th style='text-align:right'>Cases affected</th>"
+        "</tr></thead>"
+        f"<tbody>{body_rows}</tbody></table></div>"
+    )
 
 
 def _naming_mismatches_card_html(agg: list[dict]) -> str:
@@ -3072,10 +3535,17 @@ def _baseline_compare_cards_html(counts: dict[str, int],
     return title + f"<div class='headline-row headline-row-3'>{''.join(pieces)}</div>"
 
 
-def _top_failures_html(top: list[dict], n_fail_clean: int,
-                         *, baseline: dict | None = None) -> str:
-    """Render the top-3 failure reasons (excl. test-set issues) as a row of
-    headline-style cards. Click any card to drill into the matching cases.
+def _top_failures_html(
+    top: list[dict],
+    n_fail_clean: int,
+    n_clean: int,
+    hard_fail_ids: list[str] | None = None,
+    *,
+    baseline: dict | None = None,
+) -> str:
+    """Render hard-fail total + top-3 failure reasons as headline cards.
+
+    Click any card to drill into the matching cases.
 
     ``n_fail_clean`` is the denominator that each card's pre-computed
     percentage was divided by — the total number of clean failures
@@ -3083,19 +3553,54 @@ def _top_failures_html(top: list[dict], n_fail_clean: int,
     therefore read as "share of clean failures attributable to this
     issue", not "share of all clean cases".
 
-    Returns "" when there's nothing to show (no failures, or no clean
-    rows after defect exclusion).
+    The first card uses ``n_clean`` as its denominator so it matches the
+    Issues tab's "Hard fail" row: clean failures as a share of All valid cases.
+
+    Returns "" when there's nothing to show (no failures, or no clean rows
+    after defect exclusion).
     """
-    if not top or n_fail_clean <= 0:
+    if n_fail_clean <= 0 or n_clean <= 0:
         return ""
-    # Baseline-count lookup for the inline Δ chip — only failure modes that
-    # appeared in the baseline run's own Top-3 (and therefore carry an entry
-    # in ``baseline['issue_counts']``) get a Δ chip. Anything else, including
-    # all failure modes when no ``--baseline`` was passed, simply omits the
-    # chip via _inline_delta_html's None-short-circuit.
+    # Baseline-count lookup for the inline Δ chip. This map is built from the
+    # full baseline Issues table, not the baseline Summary Top-3, so current
+    # Top-3 cards still show a delta when the same issue ranked lower in the
+    # baseline run.
     baseline_issue_counts = (baseline or {}).get("issue_counts", {}) if baseline else {}
     baseline_label = (baseline or {}).get("label", "")
     cards = []
+    hard_fail_ids = hard_fail_ids or []
+    hard_fail_pct = n_fail_clean / n_clean if n_clean else float("nan")
+    hard_fail_link = _ids_filter_link(
+        hard_fail_ids,
+        "hard fail: clean cases the judge failed",
+        classes="judge-eval-link top-failure-link",
+        inner=f"{n_fail_clean}",
+    ) if hard_fail_ids else str(n_fail_clean)
+    baseline_hard_fail_n = (baseline or {}).get("n_fail_clean") if baseline else None
+    hard_fail_delta = _inline_delta_html(
+        baseline_hard_fail_n,
+        n_fail_clean,
+        fmt="count",
+        good_dir="down",
+        title_prefix=f"vs baseline {baseline_label}" if baseline_label else "vs baseline",
+    )
+    hard_fail_tip = _info_icon(
+        "Clean cases the judge actually returned FAIL on "
+        "(weighted_avg below threshold or weight-2 scorer at 0). "
+        "This is the same value as the Issues tab's Hard fail row.\n\n"
+        f"This run: {n_fail_clean} hard failures / {n_clean} All valid cases "
+        f"= {_fmt_pct(hard_fail_pct)}. Click the card to inspect the failed cases."
+    )
+    cards.append(
+        "<div class='headline-card top-failure-card top-failure-total-card'>"
+        f"<div class='hc-label'>Hard fail <span class='top-failure-owner'>· all valid cases</span> "
+        f"{hard_fail_tip}</div>"
+        f"<div class='hc-value'>{hard_fail_link}</div>"
+        f"<div class='hc-detail'>{_fmt_pct(hard_fail_pct)} of all valid cases</div>"
+        f"{hard_fail_delta}"
+        "</div>"
+    )
+
     for entry in top:
         n = entry["n"]
         pct = entry["pct"]
@@ -3137,10 +3642,12 @@ def _top_failures_html(top: list[dict], n_fail_clean: int,
             "</div>"
         )
     section_tooltip = (
-        f"Top issues among clean cases that ALSO failed the judge "
+        f"First card: total Hard fail cases from the Issues tab, divided by "
+        f"All valid cases ({n_clean} this run). The remaining cards show the "
+        f"top issues among clean cases that ALSO failed the judge "
         f"(judge_pass = False). A case is counted only when it both "
         f"carries the issue as its primary cause AND has a FAIL tag. "
-        f"The percentage on each card divides by the TOTAL clean "
+        f"The percentage on each top-issue card divides by the TOTAL clean "
         f"failures ({n_fail_clean} this run), not by all clean cases — "
         f"so it reads as 'share of clean failures attributable to this "
         f"issue', letting the three numbers be compared on equal "
@@ -3156,12 +3663,14 @@ def _top_failures_html(top: list[dict], n_fail_clean: int,
         f"and is unaffected by this filter."
     )
     note = (
-        f"<div class='top-failure-title'>Top {len(cards)} "
-        f"issue{'s' if len(cards) != 1 else ''} · failures only "
+        f"<div class='top-failure-title'>Top {len(top)} "
+        f"issue{'s' if len(top) != 1 else ''} · failures only "
         f"(excl. test-set issues) {_info_icon(section_tooltip)}</div>"
     )
     grid_cls = "headline-row"
-    if len(cards) == 3:
+    if len(cards) == 4:
+        grid_cls += " headline-row-4"
+    elif len(cards) == 3:
         grid_cls += " headline-row-3"
     elif len(cards) == 2:
         grid_cls += " headline-row-2"
@@ -3247,7 +3756,7 @@ def _scope_distribution_html(cs_counts: dict, n_eval: int) -> str:
     )
 
 
-def _build_threshold_explainer_html() -> str:
+def _build_threshold_explainer_html(dim_weights: dict[str, float] | None = None) -> str:
     """Notes-tab card: how the pass threshold interacts with the scorer
     weights. Renders the weight table and a set of pass/fail example
     configurations so colleagues can see the boundary concretely.
@@ -3256,7 +3765,9 @@ def _build_threshold_explainer_html() -> str:
     to the Pass-rate card (with a draggable threshold slider) — that's
     the more discoverable home for an interactive sanity-check of the
     cut-off, alongside the definition that explains it."""
-    w = DIMENSION_WEIGHTS
+    w = dim_weights or DIMENSION_WEIGHTS
+    if not w:
+        return "<p class='placeholder'>no scorer columns available for threshold explanation.</p>"
     w_sum = sum(w.values())
     max_score = 2 * w_sum
     threshold_raw = PASS_THRESHOLD * max_score
@@ -3278,14 +3789,6 @@ def _build_threshold_explainer_html() -> str:
         f"<td style='text-align:right;font-weight:700'>{w_sum:g}</td></tr>"
     )
 
-    # Pre-build a couple of useful "shape" dicts for the example configurations.
-    weight2_keys = [k for k, v in w.items() if v >= 2]
-    weight1_keys = [k for k, v in w.items() if v < 2]
-
-    def _shape(values_for_w2: list[int], values_for_w1: list[int]) -> dict:
-        return ({k: values_for_w2[i] for i, k in enumerate(weight2_keys)}
-                | {k: values_for_w1[i] for i, k in enumerate(weight1_keys)})
-
     examples = [
         ("All scorers at 2 (perfect)",
             {k: 2 for k in w}),
@@ -3293,22 +3796,28 @@ def _build_threshold_explainer_html() -> str:
             {k: 1 for k in w}),
         ("All scorers at 0",
             {k: 0 for k in w}),
-        ("3 of 5 weight-2 scorers at 2, rest at 1",
-            _shape([2, 2, 2, 1, 1], [1, 1])),
-        ("2 of 5 weight-2 scorers at 2, rest at 1",
-            _shape([2, 2, 1, 1, 1], [1, 1])),
-        ("All at 2 except one weight-1 scorer at 0",
-            _shape([2, 2, 2, 2, 2], [0, 2])),
-        ("All at 2 except one weight-2 scorer at 0",
-            _shape([0, 2, 2, 2, 2], [2, 2])),
-        ("All at 2 except two weight-2 scorers at 0",
-            _shape([0, 0, 2, 2, 2], [2, 2])),
     ]
+    weight2_keys = [k for k, v in w.items() if v >= 2]
+    weight1_keys = [k for k, v in w.items() if v < 2]
+    critical_dims = tuple(weight2_keys)
+    if weight1_keys:
+        scores = {k: 2 for k in w}
+        scores[weight1_keys[0]] = 0
+        examples.append(("All at 2 except one weight-1 scorer at 0", scores))
+    if weight2_keys:
+        scores = {k: 2 for k in w}
+        scores[weight2_keys[0]] = 0
+        examples.append(("All at 2 except one weight-2 scorer at 0", scores))
+    if len(weight2_keys) >= 2:
+        scores = {k: 2 for k in w}
+        scores[weight2_keys[0]] = 0
+        scores[weight2_keys[1]] = 0
+        examples.append(("All at 2 except two weight-2 scorers at 0", scores))
 
     example_rows = ""
     for label, scores in examples:
         raw, wa = _wavg(scores)
-        critical_zero = any(scores[k] == 0 for k in CRITICAL_DIMS)
+        critical_zero = any(scores[k] == 0 for k in critical_dims)
         wa_clears = wa >= PASS_THRESHOLD
         passes = wa_clears and not critical_zero
         if passes:
@@ -3346,7 +3855,7 @@ case passes  ⇔ weighted_avg ≥ {PASS_THRESHOLD:g} AND
       (all scorers at 2). The pass cut-off in raw weighted units is
       <strong>{threshold_raw:g}</strong> — equivalent to "70% of the
       weighted maximum". The critical scorers (weight ≥ 2) the veto
-      applies to: <code>{', '.join(CRITICAL_DIMS)}</code>.
+      applies to: <code>{', '.join(critical_dims)}</code>.
       Each scorer's weight from the YAML rubric:</p>
       <table class="tbl funnel-tbl" style="max-width:480px">
         <thead><tr><th>Scorer</th><th style="text-align:right">Weight</th></tr></thead>
@@ -3355,11 +3864,9 @@ case passes  ⇔ weighted_avg ≥ {PASS_THRESHOLD:g} AND
 
       <p style="margin-top:14px"><strong>Reference configurations</strong> —
       where the threshold sits relative to common scoring patterns. The
-      "minimum to pass with no zeros" is roughly <em>three of the five
-      weight-2 scorers at 2, everything else at 1</em>; one fewer
-      upgrade and the case fails. Weight-1 scorers (query_clarity,
-      language_compliance) carry less leverage, so dropping them to 1
-      from 2 affects the score less than dropping a weight-2 scorer.</p>
+      examples below show how the active scorer weights affect the threshold.
+      Weight-1 scorers carry less leverage than weight-2 scorers, so dropping
+      them to 1 from 2 affects the score less than dropping a weight-2 scorer.</p>
       <table class="tbl funnel-tbl">
         <thead><tr>
           <th>Configuration</th>
@@ -3374,6 +3881,7 @@ case passes  ⇔ weighted_avg ≥ {PASS_THRESHOLD:g} AND
 
 
 def _doc_tab_html(metrics: dict, wavg_hist_fig=None, *,
+                  dim_weights: dict[str, float] | None = None,
                   include_latency: bool = False) -> str:
     """Notes page — companion text to the rest of the report. Every count
     or percentage referenced in the body comes from ``metrics`` so the
@@ -3443,7 +3951,7 @@ def _doc_tab_html(metrics: dict, wavg_hist_fig=None, *,
       <code>weighted_avg ≥ {PASS_THRESHOLD}</code> <em>and</em> no
       weight-2 (critical) scorer is at 0. The first half is the headline
       gate; the second is a hard veto that prevents one catastrophic
-      dimension (e.g. <code>answer_groundedness = 0</code>) from hiding
+      dimension (e.g. <code>kb_answer_groundedness = 0</code>) from hiding
       behind an otherwise-high mean. <code>weighted_avg</code> is the
       weighted mean of the seven judge scorers, normalized to [0, 1].
       This single rule drives the per-case PASS/FAIL badge, the Pass | Fail
@@ -3468,15 +3976,15 @@ def _doc_tab_html(metrics: dict, wavg_hist_fig=None, *,
             {PASS_RATE_TARGET:.0%}) — drops rows the judge flagged with
             <code>expected_reference_looks_wrong</code>, rows classified
             as <code>ambiguous</code> / <code>out_of_scope</code>, and
-            rows the deterministic check flagged as ENUM naming
-            mismatches; measures the agent against trustworthy ground
+            rows the deterministic checks flagged as test-set ENUM
+            hygiene issues; measures the agent against trustworthy ground
             truth only. The value turns green on the card when it meets
             or exceeds the target.</li>
         <li><strong>Pass rate · all cases</strong>
             ({metrics['n_pass']} / {metrics['n_eval']} =
             {_fmt_pct(metrics['pass_rate_all'])}) — for reference only;
-            includes cases with gold-reference issues and ENUM-naming
-            mismatches in the denominator, so it's a "production
+            includes cases with gold-reference issues and test-set ENUM
+            hygiene issues in the denominator, so it's a "production
             realistic" view that the test-set hygiene drags down.</li>
       </ul>
 
@@ -3497,13 +4005,13 @@ def _doc_tab_html(metrics: dict, wavg_hist_fig=None, *,
     {wavg_side_card}
     {pass_row_close}
 
-    {_build_threshold_explainer_html()}
+    {_build_threshold_explainer_html(dim_weights)}
 
     <div class="card">
       <div class="card-title">KB Recall · KB Precision · Stage funnel</div>
       <p>Three metrics that share the same basis: cases where the search
       tool actually ran (<code>query_scope == "kb"</code>) AND the
-      deterministic check did NOT flag an ENUM-naming mismatch. The
+      deterministic checks did NOT flag a test-set ENUM hygiene issue. The
       headline KB Recall and KB Precision numbers are micro-averaged
       (Σ TP / Σ expected and Σ TP / Σ selected respectively, summed across
       cases first then divided). The Stage funnel shows the same
@@ -3511,8 +4019,13 @@ def _doc_tab_html(metrics: dict, wavg_hist_fig=None, *,
       → post-prune (after dedup/filtering) → reranked (final selection).
       The reranked row equals the headline numbers exactly. Recall trends
       down through the pipeline (gold ENUMs can only be lost as the set
-      shrinks); precision trends up (later stages drop noise). Run-level
-      n = <strong>{metrics['dataset_recall_n']}</strong>.</p>
+      shrinks); precision trends up (later stages drop noise). The Summary
+      card's Recall benchmark is chosen from the expected-ENUM shape:
+      <strong>{RECALL_TARGET_SINGLE_EXPECTED_ENUM:.0%}</strong> for
+      single-expected-ENUM cases and
+      <strong>{RECALL_TARGET_MULTI_EXPECTED_ENUM:.0%}</strong> for
+      multiple-expected-ENUM cases. Run-level n =
+      <strong>{metrics['dataset_recall_n']}</strong>.</p>
     </div>
 
     <div class="card">
@@ -3545,10 +4058,10 @@ def _doc_tab_html(metrics: dict, wavg_hist_fig=None, *,
       <div class="card-title">Placeholder handling</div>
       <p>The judge emits the literal string
       <code>"Answer is not available based on given information"</code>
-      in <code>hallucinated_claims</code>,
+      in <code>hallucinated_claims_in_agent_response</code>,
       <code>unavailable_facts_in_selected_context</code>,
-      <code>missing_facts</code>, and
-      <code>expected_answer_summary_with_optimal_context</code> when the
+      <code>missing_facts_in_agent_response</code>, and
+      related diagnostic fields when the
       post-prune pool / reranked context cannot support an answer. We
       normalize that placeholder out of every list before counting, and
       surface it as a separate "no achievable answer" signal — counting
@@ -3781,7 +4294,7 @@ def _judge_eval_html(df: pd.DataFrame) -> str:
     in_kb_scope  = (df.get("case_scope", pd.Series([""] * len(df), index=df.index))
                       .isin({"kb", "kb_and_api"}))
     adeq_low     = pd.to_numeric(
-        df.get("optimal_retrieved_context_adequacy_score", pd.Series([2] * len(df), index=df.index)),
+        df.get("kb_retrieval_pool_adequacy_score", pd.Series([2] * len(df), index=df.index)),
         errors="coerce",
     ) <= 1
 
@@ -3792,7 +4305,10 @@ def _judge_eval_html(df: pd.DataFrame) -> str:
         index=df.index,
     )
 
-    hc = df.get("_hallucinated_claims", pd.Series([[]] * len(df), index=df.index))
+    hc = df.get(
+        "_hallucinated_claims_in_agent_response",
+        pd.Series([[]] * len(df), index=df.index),
+    )
     uf = df.get("_unavailable_facts_in_selected_context", pd.Series([[]] * len(df), index=df.index))
     is_sentinel = lambda s: s.map(lambda v: v == [SENTINEL])
 
@@ -3803,21 +4319,21 @@ def _judge_eval_html(df: pd.DataFrame) -> str:
     cnt = lambda col: df[col] if col in df.columns else pd.Series([0]*len(df), index=df.index)
 
     checks = {
-        "groundedness<=1 & ctx non-empty but hallucinated_claims=[]":
-            (g("answer_groundedness_score") <= 1) & ctx_nonempty & (cnt("hallucinated_claims_cnt") == 0),
-        "groundedness==2 but hallucinated_claims non-empty":
-            (g("answer_groundedness_score") == 2) & (cnt("hallucinated_claims_cnt") > 0),
-        "alignment==2 but missing_facts non-empty":
+        "kb_answer_groundedness<=1 & ctx non-empty but hallucinated_claims_in_agent_response=[]":
+            (g("kb_answer_groundedness_score") <= 1) & ctx_nonempty & (cnt("hallucinated_claims_cnt") == 0),
+        "kb_answer_groundedness==2 but hallucinated_claims_in_agent_response non-empty":
+            (g("kb_answer_groundedness_score") == 2) & (cnt("hallucinated_claims_cnt") > 0),
+        "answer_expected_alignment==2 but missing_facts_in_agent_response non-empty":
             (g("answer_expected_alignment_score") == 2) & (cnt("missing_facts_cnt") > 0),
-        "sufficiency==2 but unavailable_facts non-empty":
-            (g("selected_context_sufficiency_score") == 2) & (cnt("unavailable_facts_cnt") > 0),
-        "selection_relevance==2 but extra_or_distracting_enums non-empty":
-            (g("selection_semantic_relevance_score") == 2) & (cnt("extra_distracting_enums_cnt") > 0),
-        "ctx empty but hallucinated_claims is not the placeholder array":
+        "kb_selected_context_sufficiency==2 but unavailable_facts_in_selected_context non-empty":
+            (g("kb_selected_context_sufficiency_score") == 2) & (cnt("unavailable_facts_cnt") > 0),
+        "kb_selection_semantic_relevance==2 but non_useful_reranked_enums non-empty":
+            (g("kb_selection_semantic_relevance_score") == 2) & (cnt("extra_distracting_enums_cnt") > 0),
+        "ctx empty but hallucinated_claims_in_agent_response is not the placeholder array":
             ctx_empty & ~is_sentinel(hc),
         "ctx empty but unavailable_facts is not the placeholder array":
             ctx_empty & ~is_sentinel(uf),
-        "ctx non-empty but hallucinated_claims is the placeholder array":
+        "ctx non-empty but hallucinated_claims_in_agent_response is the placeholder array":
             ctx_nonempty & is_sentinel(hc),
         "ctx non-empty but unavailable_facts is the placeholder array":
             ctx_nonempty & is_sentinel(uf),
@@ -3825,10 +4341,10 @@ def _judge_eval_html(df: pd.DataFrame) -> str:
             pool_flag & ~(in_kb_scope & adeq_low),
         "retrieved_pool_inadequacy=False but contract conditions met":
             ~pool_flag & in_kb_scope & adeq_low,
-        "retrieved_pool_inadequacy=True but description empty":
-            pool_flag & ~_nonempty("retrieved_pool_inadequacy_description"),
-        "retrieved_pool_inadequacy=False but description non-empty":
-            ~pool_flag & _nonempty("retrieved_pool_inadequacy_description"),
+        "retrieved_pool_inadequacy=True but post_prune_candidates_context_inadequacy_description empty":
+            pool_flag & ~_nonempty("post_prune_candidates_context_inadequacy_description"),
+        "retrieved_pool_inadequacy=False but post_prune_candidates_context_inadequacy_description non-empty":
+            ~pool_flag & _nonempty("post_prune_candidates_context_inadequacy_description"),
         "expected_reference_looks_wrong=True but issue description empty":
             ref_wrong & ~_nonempty("expected_reference_issue_description"),
         "expected_reference_looks_wrong=True but test_case suggestion empty":
@@ -3880,10 +4396,10 @@ def _judge_eval_html(df: pd.DataFrame) -> str:
 
     # Crosstabs
     pairs = [
-        ("hallucinated_claims_cnt",     "answer_groundedness_score"),
+        ("hallucinated_claims_cnt",     "kb_answer_groundedness_score"),
         ("missing_facts_cnt",           "answer_expected_alignment_score"),
-        ("unavailable_facts_cnt",       "selected_context_sufficiency_score"),
-        ("extra_distracting_enums_cnt", "selection_semantic_relevance_score"),
+        ("unavailable_facts_cnt",       "kb_selected_context_sufficiency_score"),
+        ("extra_distracting_enums_cnt", "kb_selection_semantic_relevance_score"),
     ]
     grounded = df[~ctx_empty]
     no_ctx   = df[ctx_empty]
@@ -3968,9 +4484,9 @@ def _judge_eval_rel2_html(df: pd.DataFrame) -> str:
         sub["rel2"] = rel2[bucket == "kb routed"].round(2)
 
     judge_cols = [
-        "selection_semantic_relevance_score",
-        "selected_context_sufficiency_score",
-        "optimal_retrieved_context_adequacy_score",
+        "kb_selection_semantic_relevance_score",
+        "kb_selected_context_sufficiency_score",
+        "kb_retrieval_pool_adequacy_score",
     ]
     crosstabs_html = ""
     for jcol in judge_cols:
@@ -3986,7 +4502,7 @@ def _judge_eval_rel2_html(df: pd.DataFrame) -> str:
     # Illogical combinations: Rel2 and the judge disagree strongly.
     illogical_link = ""
     if not sub.empty:
-        sel_score = pd.to_numeric(sub.get("selection_semantic_relevance_score"),
+        sel_score = pd.to_numeric(sub.get("kb_selection_semantic_relevance_score"),
                                     errors="coerce")
         illogical_mask = (
             ((sub["rel2"] >= 0.99) & (sel_score <= 1))
@@ -4007,8 +4523,8 @@ def _judge_eval_rel2_html(df: pd.DataFrame) -> str:
     illogical_block = (
         "<p style='font-size:12px;color:#537090;margin-top:14px'>"
         "<strong>Illogical combinations</strong> — rows where Rel2 ≥ 0.99 but "
-        "<code>selection_semantic_relevance ≤ 1</code>, OR Rel2 ≤ 0.01 but "
-        "<code>selection_semantic_relevance == 2</code>. "
+        "<code>kb_selection_semantic_relevance ≤ 1</code>, OR Rel2 ≤ 0.01 but "
+        "<code>kb_selection_semantic_relevance == 2</code>. "
         f"Count: {illogical_link}"
         "</p>"
     )
@@ -4029,7 +4545,76 @@ def _judge_eval_rel2_html(df: pd.DataFrame) -> str:
     )
 
 
-def _build_kb_data(df: pd.DataFrame) -> dict:
+def _load_kb_description_lookup(path: Path | None, *, lang_slot: str) -> dict[str, dict[str, str]]:
+    """Load KB descriptions from a pipe-delimited KB export.
+
+    The SK exports currently use ``feature-and-product-knowledge.*`` headers,
+    while older / CZ exports may use ``kb.*``. The report only needs the enum
+    id and description, so this helper accepts either shape.
+    """
+    if path is None:
+        return {}
+    if lang_slot not in {"cz", "en"}:
+        raise ValueError(f"unsupported KB language slot: {lang_slot!r}")
+    if not path.exists():
+        raise FileNotFoundError(f"KB CSV not found: {path}")
+
+    kb_df = pd.read_csv(path, sep="|", dtype=str, keep_default_na=False, na_filter=False)
+    id_col = next(
+        (
+            col for col in (
+                "kb.knowledgeId",
+                "feature-and-product-knowledge.knowledgeId",
+                "knowledgeId",
+            )
+            if col in kb_df.columns
+        ),
+        None,
+    )
+    desc_col = next(
+        (
+            col for col in (
+                "kb.description",
+                "feature-and-product-knowledge.description",
+                "description",
+            )
+            if col in kb_df.columns
+        ),
+        None,
+    )
+    if id_col is None or desc_col is None:
+        raise ValueError(
+            f"{path} must contain a knowledge id column and a description column"
+        )
+
+    lookup: dict[str, dict[str, str]] = {}
+    for _, row in kb_df.iterrows():
+        enum_id = str(row.get(id_col, "")).strip()
+        description = str(row.get(desc_col, "")).strip()
+        if not enum_id or not description:
+            continue
+        lookup.setdefault(enum_id, {"cz": "", "en": ""})[lang_slot] = description
+    return lookup
+
+
+def _merge_kb_description_lookups(
+    *lookups: dict[str, dict[str, str]],
+) -> dict[str, dict[str, str]]:
+    merged: dict[str, dict[str, str]] = {}
+    for lookup in lookups:
+        for enum_id, lang_map in lookup.items():
+            bucket = merged.setdefault(enum_id, {"cz": "", "en": ""})
+            for lang_slot in ("cz", "en"):
+                description = lang_map.get(lang_slot, "")
+                if description:
+                    bucket[lang_slot] = description
+    return merged
+
+
+def _build_kb_data(
+    df: pd.DataFrame,
+    kb_description_lookup: dict[str, dict[str, str]] | None = None,
+) -> dict:
     """Aggregate every distinct KB entry referenced by any case, keyed by
     ``enum_id``. Each entry holds:
 
@@ -4119,6 +4704,15 @@ def _build_kb_data(df: pd.DataFrame) -> dict:
                 bucket = descriptions.setdefault(eid, {"cz": "", "en": ""})
                 if not bucket[lang]:
                     bucket[lang] = _unescape(desc)
+
+    # Optional report-time KB CSVs are read-only metadata. They let an old
+    # checkpoint render KB text without rerunning the expensive judge calls.
+    for eid, lang_map in (kb_description_lookup or {}).items():
+        bucket = descriptions.setdefault(eid, {"cz": "", "en": ""})
+        for lang in ("cz", "en"):
+            desc = lang_map.get(lang, "")
+            if desc:
+                bucket[lang] = _unescape(desc)
 
     # ── Step 2: tag expected / reranked membership per enum per case ─────
     kb: dict[str, dict] = {}
@@ -4444,6 +5038,7 @@ code { font-family: monospace; font-size: 12px; background: #e7effd; padding: 1p
 .prompt-warning-item { margin-top: 8px; }
 .prompt-warning-item + .prompt-warning-item { border-top: 1px dashed #f0c5c5; padding-top: 8px; }
 .prompt-warning-tbl { margin-top: 4px; }
+.schema-warning-list { margin: 8px 0 0 18px; padding: 0; color: #7d2d2d; font-size: 12px; line-height: 1.45; }
 .prompt-missing-tag { display: inline-block; padding: 1px 6px; border-radius: 3px;
                        background: #fbe2e2; color: #b32424; font-size: 11px; margin-left: 6px; }
 .tab-btn.tab-home.active { background: #d8e6fc; }
@@ -5140,6 +5735,7 @@ hr.enum-divider { border: none; border-top: 1px solid #c8d3e1;
 .summary-banner .sb-warn { color: #b46504; font-weight: 600; }
 .headline-row { display: grid; grid-template-columns: 1fr 1fr;
                  gap: 14px; margin-bottom: 16px; }
+.headline-row.headline-row-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 .headline-row.headline-row-3 { grid-template-columns: 1fr 1fr 1fr; }
 .headline-row.headline-row-2 { grid-template-columns: 1fr 1fr; }
 /* Row variant for "small left card + wide right card" — used on Summary
@@ -5183,7 +5779,8 @@ hr.enum-divider { border: none; border-top: 1px solid #c8d3e1;
    so the multi-stat Rel2 card has more horizontal room (so Mean | Median
    | STDEV stay big and don't crowd each other). */
 .headline-row.headline-row-pass-rel2 { grid-template-columns: 0.85fr 0.85fr 1.3fr; }
-@media (max-width: 980px) { .headline-row.headline-row-3 { grid-template-columns: 1fr; }
+@media (max-width: 980px) { .headline-row.headline-row-4,
+                             .headline-row.headline-row-3 { grid-template-columns: 1fr; }
                              .headline-row.headline-row-pass-rel2 { grid-template-columns: 1fr; } }
 .top-failure-title { font-size: 12px; font-weight: 600; color: #5c7999;
                       text-transform: uppercase; letter-spacing: .04em;
@@ -5337,7 +5934,7 @@ a.headline-card.hc-good .hc-value { color: #057f19; }
 .kb-recall-card .hc-stat-detail { font-size: 11px; color: #5c7999;
                                     margin-top: 4px; line-height: 1.4; }
 .fm-table tr.fm-total-row td { background: #eef4fd; }
-/* Test-set-side failures (gold-defect + naming mismatch) get a soft cream
+/* Test-set-side failures (gold-defect + missing KB enum + naming mismatch) get a soft cream
    tint so the same maintainer team can see at a glance which rows belong
    to them. Light enough to coexist with the orange accent strip. */
 .fm-table tr.fm-row-hard-fail td { background: #fdeceb; }
@@ -5455,6 +6052,7 @@ a.fm-clear-link:hover { text-decoration: underline; }
              font-size: 11px; font-weight: 600; white-space: nowrap; }
 .fm-pass                { background: #dff5ea; color: #028661; }
 .fm-test_set_defect     { background: #e7effd; color: #1d69ec; }
+.fm-expected_enum_missing_from_kb { background: #e7effd; color: #1d69ec; }
 .fm-scope_misroute      { background: #fef4e2; color: #b46504; }
 .fm-retrieval_gap       { background: #fef4e2; color: #b46504; }
 .fm-pruning_loss        { background: #fef4e2; color: #b46504; }
@@ -5510,19 +6108,12 @@ a.fm-clear-link:hover { text-decoration: underline; }
 .owner-tag-kbsearch { background: #ede5fb; color: #5b3da3;
                        border: 1px solid #cdb4eb; }
 
-/* KB Findings row 1 — small Empty-queries card (1/4) next to the wider
-   naming-mismatches card (3/4). Drops to single column on narrow screens.
-   When only one of the two cards is rendered (e.g. zero empty user
-   queries, so _empty_user_queries_card_html returns ""), make the sole
-   surviving card span both tracks instead of collapsing into the 1fr
-   column with empty space on its right — that's what caused the
-   naming-mismatch table to render at ~25% of the row width with the
-   "Cases affected" column overflowing past the card border. */
+/* KB Findings row 1 — compact issue-summary cards. auto-fit keeps the row
+   stable whether one, two, or three cards are rendered. */
 .kb-findings-row1 { display: grid;
-                     grid-template-columns: minmax(0, 1fr) minmax(0, 3fr);
+                     grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
                      gap: 16px; margin-bottom: 16px; }
 .kb-findings-row1 > .card { min-width: 0; }
-.kb-findings-row1 > .card:only-child { grid-column: 1 / -1; }
 @media (max-width: 900px) {
   .kb-findings-row1 { grid-template-columns: minmax(0, 1fr); }
 }
@@ -5551,6 +6142,7 @@ a.fm-clear-link:hover { text-decoration: underline; }
 JS = r"""
 const CASES = __CASES__;
 const DIM_NAMES = __DIM_NAMES__;
+const OUTPUT_FIELD_ORDER = __OUTPUT_FIELD_ORDER__;
 const PASS_THRESHOLD = __PASS_THRESHOLD__;
 // Native-language label rendered on the language-toggle button next to
 // "EN". "CZ" for CZKB runs, "SK" for SKKB runs. The data-lang attribute
@@ -5814,6 +6406,7 @@ function agentBadge(slug) {
 const FAILURE_MODE_LABELS = {
   pass: "Pass",
   test_set_defect: "Test-set issue",
+  expected_enum_missing_from_kb: "Expected ENUM missing from KB",
   enum_name_mismatch: "ENUM name mismatch",
   scope_misroute: "Wrong agent routing",
   retrieval_gap: "Retrieval gap",
@@ -6601,15 +7194,16 @@ function selectCase(id) {
         <hr class="enum-divider">
         ${enumRow("post-prune", "Candidate ENUM pool after dedup/pruning, before reranking (post_prune_enum_ids).", enumChips(c.post_prune_enum_ids, c.expected_enums, c.reranked_enum_ids))}
         <hr class="enum-divider">
+        ${missingExpectedKbIds(c).length ? enumRow("not in KB CSV", "Expected ENUM IDs from the test set that are absent from the supplied KB export. These are test-set issues, not retrieval/reranker misses.", enumChips(missingExpectedKbIds(c), c.expected_enums, c.reranked_enum_ids, "expected")) : ""}
         ${enumRow("retriever miss", "Expected ENUMs that never made it into the post-prune pool — the retriever didn't surface them. Computed as expected_enums − post_prune_enum_ids.", enumChips(c.missing_enums_not_in_pool, c.expected_enums, c.reranked_enum_ids))}
         ${enumRow("reranker miss", "Expected ENUMs that WERE in the post-prune pool but the reranker did NOT pick them. Computed as (expected_enums ∩ post_prune_enum_ids) − reranked_enum_ids.", enumChips(c.missing_enums_in_candidate_pool, c.expected_enums, c.reranked_enum_ids))}
-        ${enumRow("extra or distracting", "Selected ENUMs the judge flagged as irrelevant / distracting (extra_or_distracting_enums).", enumChips(c.extra_or_distracting_enums, c.expected_enums, c.reranked_enum_ids))}
+        ${enumRow("non-useful reranked", "Selected ENUMs the judge flagged as irrelevant, too generic, redundant, or distracting (non_useful_reranked_enums).", enumChips(c.non_useful_reranked_enums, c.expected_enums, c.reranked_enum_ids))}
         <hr class="enum-divider">
         ${enumRow("optimal selection", "Judge-picked optimal subset of the post-prune pool that would answer the query (optimal_enum_selection).", enumChips(c.optimal_enum_selection, c.expected_enums, c.reranked_enum_ids, "vs_expected"))}
       </div>
     </div>
     ${c.overall_explanation ? `<div class="detail-section"><h3>Overall explanation</h3><div class="body">${esc(c.overall_explanation)}</div></div>` : ""}
-    ${c.retrieved_pool_inadequacy_description ? `<div class="detail-section"><h3>KB gap</h3><div class="body">${esc(c.retrieved_pool_inadequacy_description)}</div></div>` : ""}
+    ${c.post_prune_candidates_context_inadequacy_description ? `<div class="detail-section"><h3>KB gap</h3><div class="body">${esc(c.post_prune_candidates_context_inadequacy_description)}</div></div>` : ""}
     ${namingMismatchesHtml(c)}
     ${outputSchemaHtml(c)}
   `;
@@ -6654,26 +7248,26 @@ function namingMismatchesHtml(c) {
   </div>`;
 }
 
+function missingExpectedKbIds(c) {
+  const list = Array.isArray(c.expected_enums_missing_from_kb)
+    ? c.expected_enums_missing_from_kb
+    : [];
+  return list
+    .map(item => (item && typeof item === "object") ? item.expected : item)
+    .filter(v => v != null && String(v).trim() !== "")
+    .map(String);
+}
+
 function outputSchemaHtml(c) {
+  const fields = c.output_fields || {};
   // Order matches the YAML output_schema definition. Trace metadata follows.
-  const rows =
-    schemaRow("case_scope", c.case_scope) +
-    schemaRow("categories_list", c.categories_list, {mono: true, showEmpty: true}) +
-    schemaRow("expected_reference_looks_wrong", c.expected_reference_looks_wrong ? "true" : "false") +
-    schemaRow("expected_reference_issue_description", c.expected_reference_issue_description, {showEmpty: true}) +
-    schemaRow("optimal_enum_selection", c.optimal_enum_selection, {mono: true, showEmpty: true}) +
-    schemaRow("expected_answer_summary_with_optimal_context", c.expected_answer_summary_with_optimal_context, {showEmpty: true}) +
-    schemaRow("unavailable_facts_in_selected_context", c.unavailable_facts_in_selected_context, {showEmpty: true}) +
-    schemaRow("missing_facts", c.missing_facts, {showEmpty: true}) +
-    schemaRow("hallucinated_claims", c.hallucinated_claims, {showEmpty: true}) +
-    schemaRow("retrieved_pool_inadequacy_identified", c.retrieved_pool_inadequacy_identified ? "true" : "false") +
-    schemaRow("retrieved_pool_inadequacy_description", c.retrieved_pool_inadequacy_description, {showEmpty: true}) +
-    schemaRow("retrieval_improvement_suggestion", c.retrieval_improvement_suggestion, {showEmpty: true}) +
-    schemaRow("reranker_improvement_suggestion", c.reranker_improvement_suggestion, {showEmpty: true}) +
-    schemaRow("agent_improvement_suggestion", c.agent_improvement_suggestion, {showEmpty: true}) +
-    schemaRow("kb_improvement_suggestion", c.kb_improvement_suggestion, {showEmpty: true}) +
-    schemaRow("test_case_improvement_suggestion", c.test_case_improvement_suggestion, {showEmpty: true}) +
-    schemaRow("overall_explanation", c.overall_explanation, {showEmpty: true}) +
+  const rows = OUTPUT_FIELD_ORDER
+    .filter(name => Object.prototype.hasOwnProperty.call(fields, name))
+    .map(name => schemaRow(name, fields[name], {
+      mono: Array.isArray(fields[name]) || name.endsWith("_enums") || name === "categories_list",
+      showEmpty: true
+    }))
+    .join("") +
     schemaRow("agents_called", c.agents_called, {mono: true, showEmpty: true}) +
     schemaRow("tools_called", c.tools_called, {mono: true, showEmpty: true}) +
     schemaRow("trace_invariant_violations", c.trace_invariant_violations, {mono: true, showEmpty: true});
@@ -8009,6 +8603,7 @@ def render_html(df: pd.DataFrame, *, df_all: pd.DataFrame | None = None,
                 include_latency: bool = False,
                 checkpoint_path: Path | None = None,
                 prompts_path: Path | None = None,
+                kb_description_lookup: dict[str, dict[str, str]] | None = None,
                 baseline: dict | None = None) -> str:
     if df_all is None:
         df_all = df
@@ -8038,20 +8633,26 @@ def render_html(df: pd.DataFrame, *, df_all: pd.DataFrame | None = None,
     enum_count_dist_html = _enum_count_distribution_table_html(df)
     fig_fm_cooccurrence = _build_failure_mode_cooccurrence_fig(df)
     judge_eval_html = _judge_eval_html(df)
-    kb_html = _render_kb_html(_build_kb_data(df))
+    kb_html = _render_kb_html(_build_kb_data(df, kb_description_lookup))
     fig_rel2_expert = _build_rel2_expert_scatter(df)
     fig_rel2_wavg = _build_rel2_wavg_scatter(df)
     dim_descriptions = _load_dimension_descriptions(yaml_name)
     dim_full_info = _load_dimension_full_info(yaml_name)
+    output_field_order = _load_output_field_order(yaml_name)
+    active_dim_weights = _dimension_weights_for_df(df)
     corr = _build_corr_figs(df)
 
     summary_metrics = compute_summary_metrics(df, df_all)
+    missing_expected_kb_agg = _aggregate_expected_enums_missing_from_kb(df)
     naming_mismatches_agg = _aggregate_naming_mismatches(df)
     pass_rate = df["pass"].mean()
 
     prompts_sidecar = _load_prompt_sidecar(prompts_path, checkpoint_path, mlflow_run_id)
     prompt_warnings = _prompt_hash_warnings(df_all if df_all is not None else df)
     prompt_warning_card = _prompt_warning_card(prompt_warnings)
+    schema_warning_card = _schema_warning_card(
+        _report_schema_warnings(df_all if df_all is not None else df, output_field_order)
+    )
     prompts_tab_html = _prompts_tab(prompts_sidecar, mlflow_run_id)
 
     def _count_cell(dim: str, score: int, n: int) -> str:
@@ -8064,7 +8665,7 @@ def render_html(df: pd.DataFrame, *, df_all: pd.DataFrame | None = None,
                 f' title="Show these {n} cases in the Test Cases tab">{n}</a></td>')
 
     dim_rows_html = ""
-    for dim in DIMENSION_WEIGHTS:
+    for dim in active_dim_weights:
         col = f"{dim}_score"
         counts = df[col].value_counts().reindex([0, 1, 2]).fillna(0).astype(int)
         desc = dim_descriptions.get(dim, "")
@@ -8093,7 +8694,11 @@ def render_html(df: pd.DataFrame, *, df_all: pd.DataFrame | None = None,
     # still inspectable when a Summary failure-mode link drills into them.
     baseline_cases_lookup = (baseline or {}).get("cases") if baseline else None
     cases_payload = sorted(
-        (_case_payload(r, baseline_lookup=baseline_cases_lookup)
+        (_case_payload(
+            r,
+            baseline_lookup=baseline_cases_lookup,
+            output_field_order=output_field_order,
+        )
          for _, r in df_all.iterrows()),
         key=lambda c: _tid_key(c.get("id", "")),
     )
@@ -8107,7 +8712,8 @@ def render_html(df: pd.DataFrame, *, df_all: pd.DataFrame | None = None,
         mean_lat_payload = None
 
     js = (JS.replace("__CASES__", json.dumps(cases_payload))
-            .replace("__DIM_NAMES__", json.dumps(list(DIMENSION_WEIGHTS.keys())))
+            .replace("__DIM_NAMES__", json.dumps(list(active_dim_weights.keys())))
+            .replace("__OUTPUT_FIELD_ORDER__", json.dumps(list(output_field_order)))
             .replace("__PASS_THRESHOLD__", json.dumps(PASS_THRESHOLD))
             .replace("__LANG_LABEL_UPPER__", json.dumps(LANG_LABEL_UPPER))
             .replace("__MEAN_LAT_MS__", json.dumps(mean_lat_payload if include_latency else None))
@@ -8199,7 +8805,7 @@ def render_html(df: pd.DataFrame, *, df_all: pd.DataFrame | None = None,
     # in <details> so the section is foldable; default collapsed since a
     # 7×3 matrix is a lot to show always.
     scorer_matrix_rows = ""
-    for dim_key in DIMENSION_WEIGHTS:
+    for dim_key in active_dim_weights:
         name = (dim_full_info.get(dim_key, {}).get("name") or dim_key).strip()
         chips = "".join(
             f'<button type="button" class="chip dim-chip" '
@@ -8300,33 +8906,31 @@ def render_html(df: pd.DataFrame, *, df_all: pd.DataFrame | None = None,
             f"Green when the run mean strictly exceeds the benchmark."
         )
 
-    # ── KB Recall vs benchmark recall ────────────────────────────────────────
-    # Same pattern as the Rel2 mean above: turn the Recall cell green
-    # when the run's micro-averaged recall strictly exceeds the
-    # external benchmark. None benchmark → "–" cell, no tint.
+    # ── KB Recall vs expected-ENUM-count target ─────────────────────────────
+    # Recall is computed once. The benchmark value in the card depends on the
+    # expected-ENUM shape of the same population: 0.90 for single-expected
+    # ENUM cases, 0.70 for multiple-expected ENUM cases.
     _recall_val = summary_metrics.get("dataset_recall")
-    _recall_beats_csas = (
-        CSAS_BENCHMARK_RECALL is not None
+    _recall_target_val = summary_metrics.get("dataset_recall_target")
+    _recall_meets_target = (
+        isinstance(_recall_target_val, (int, float))
         and isinstance(_recall_val, (int, float))
         and not (isinstance(_recall_val, float) and np.isnan(_recall_val))
-        and _recall_val > CSAS_BENCHMARK_RECALL
+        and not (isinstance(_recall_target_val, float) and np.isnan(_recall_target_val))
+        and _recall_val >= _recall_target_val
     )
-    kb_recall_cls = " kb-recall-good" if _recall_beats_csas else ""
-    if CSAS_BENCHMARK_RECALL is None:
-        kb_recall_title = (
-            f"Run recall ({_fmt_pct(_recall_val)}). No external benchmark "
-            f"configured for this run — pass --benchmark-recall to add one."
-        )
-    elif _recall_beats_csas:
-        kb_recall_title = (
-            f"Run recall ({_fmt_pct(_recall_val)}) beats the benchmark "
-            f"({CSAS_BENCHMARK_RECALL:.1%})."
-        )
-    else:
-        kb_recall_title = (
-            f"Run recall vs benchmark ({CSAS_BENCHMARK_RECALL:.1%}). "
-            f"Green when the run recall strictly exceeds the benchmark."
-        )
+    kb_recall_cls = " kb-recall-good" if _recall_meets_target else ""
+    kb_recall_title = (
+        f"Run recall ({_fmt_pct(_recall_val)}) vs benchmark "
+        f"({_fmt_pct(_recall_target_val)}). Benchmark basis: "
+        f"{summary_metrics.get('dataset_recall_target_basis', 'unknown')}. "
+        "Green when recall meets or exceeds the benchmark."
+    )
+    kb_recall_benchmark_title = (
+        "Recall benchmark chosen from the expected ENUM count in the same "
+        "population: 90% for single-expected-ENUM cases, 70% for "
+        "multiple-expected-ENUM cases."
+    )
 
     # ── Pass-rate (excl. test-set issues) vs internal target ─────────────────
     # Pre-computed flag so the f-string below stays readable. Met when the
@@ -8362,7 +8966,7 @@ def render_html(df: pd.DataFrame, *, df_all: pd.DataFrame | None = None,
         f"cases with trustworthy ground truth — i.e. dropping rows the "
         f"judge flagged with expected_reference_looks_wrong=True, rows "
         f"classified as ambiguous/out_of_scope, and rows the "
-        f"deterministic check flagged as ENUM naming mismatches. "
+        f"deterministic checks flagged as test-set ENUM hygiene issues. "
         f"Matches the per-case PASS/FAIL badge and the Pass | Fail chip "
         f"filter on the Test Cases tab. Compared against an internal "
         f"target of {PASS_RATE_TARGET:.0%}; the run value turns green "
@@ -8385,7 +8989,7 @@ def render_html(df: pd.DataFrame, *, df_all: pd.DataFrame | None = None,
         "where TP is the count of expected ENUMs that appeared in the "
         "reranker's final selection. Restricted to cases where the "
         "search tool was used (query_scope == 'kb') AND the "
-        "deterministic check did NOT flag an ENUM-naming-mismatch "
+        "deterministic checks did NOT flag a test-set ENUM hygiene issue "
         "(those are test-set issues, not agent failures). The Stage "
         "funnel card in the row below uses the same basis at each "
         "pipeline stage; its reranked-stage recall equals this "
@@ -8395,25 +8999,28 @@ def render_html(df: pd.DataFrame, *, df_all: pd.DataFrame | None = None,
           f"positives · denominator = "
           f"{summary_metrics['dataset_recall_total_expected']} expected "
           f"ENUMs."
-        + (f" Benchmark recall = {CSAS_BENCHMARK_RECALL:.1%} "
-           f"(external baseline; the Recall cell turns green when the "
-           f"run value strictly exceeds it)."
-           if CSAS_BENCHMARK_RECALL is not None else
-           " No external benchmark configured for this run.")
+        + f" Benchmark recall = {_fmt_pct(_recall_target_val)} "
+          "(chosen from expected ENUM count; the Recall cell turns green "
+          "when the run value meets or exceeds it)."
+        + _NL
+        + f"The Benchmark cell uses {_fmt_pct(_recall_target_val)} for this "
+          f"run because the benchmark basis is "
+          f"{summary_metrics.get('dataset_recall_target_basis', 'unknown')}."
     )
     _rel2_excluded_note = (
-        f" Excluded {summary_metrics['rel2_naming_excluded']} "
-        f"ENUM-naming-mismatch "
-        f"case{'s' if summary_metrics['rel2_naming_excluded'] != 1 else ''}."
-        if summary_metrics['rel2_naming_excluded'] else ""
+        f" Excluded {summary_metrics['rel2_enum_hygiene_excluded']} "
+        f"test-set ENUM hygiene "
+        f"case{'s' if summary_metrics['rel2_enum_hygiene_excluded'] != 1 else ''}."
+        if summary_metrics['rel2_enum_hygiene_excluded'] else ""
     )
     rel2_tooltip = (
         "Upstream semantic-overlap metric between expected_enums and "
         "the system's selected ENUM IDs over cases where the search "
         "tool was actually used (query_scope == 'kb'). Cases the "
-        "deterministic check flagged as ENUM-naming-mismatch are "
+        "deterministic checks flagged as test-set ENUM hygiene issues are "
         "excluded — those are test-set issues (gold ENUM IDs use a "
-        "different naming convention than the KB), not agent failures, "
+        "different naming convention than the KB or are absent from the "
+        "supplied KB export), not agent failures, "
         "so they shouldn't drag down the score. Range [0, 1]; higher "
         "is better. See the Doc tab for the exact computation."
         + _NL
@@ -8574,6 +9181,7 @@ def render_html(df: pd.DataFrame, *, df_all: pd.DataFrame | None = None,
 <main class="content">
 
   <div id="tab-summary" class="tab-panel active">
+    {schema_warning_card}
     <div class="headline-row headline-row-3">
       <div class="headline-card pass-rate-card">
         <div class="hc-label">Pass rate · excl. test-set issues {_info_icon(pass_rate_tooltip)}
@@ -8599,9 +9207,9 @@ def render_html(df: pd.DataFrame, *, df_all: pd.DataFrame | None = None,
             <div class="hc-stat-value{kb_recall_cls}">{_fmt_pct(summary_metrics['dataset_recall'])}</div>
             {recall_delta_chip}
           </div>
-          <div class="hc-stat" title="External baseline recall (Σ TP / Σ expected). Pass --benchmark-recall on the CLI (or --no-benchmark to suppress) to set the value for this run; default comes from the per-lang BENCHMARKS table.">
+          <div class="hc-stat" title="{kb_recall_benchmark_title}">
             <div class="hc-stat-label">Benchmark</div>
-            <div class="hc-stat-value hc-stat-reference">{_fmt_pct(CSAS_BENCHMARK_RECALL) if CSAS_BENCHMARK_RECALL is not None else "–"}</div>
+            <div class="hc-stat-value hc-stat-reference">{_fmt_pct(summary_metrics['dataset_recall_target'])}</div>
           </div>
         </div>
       </div>
@@ -8634,7 +9242,7 @@ def render_html(df: pd.DataFrame, *, df_all: pd.DataFrame | None = None,
             "Micro-averaged recall (Σ TP / Σ expected) and precision (Σ TP / "
             "Σ selected) of expected_enums at each pipeline stage. Same basis "
             "as the KB Recall · Precision card above: query_scope == 'kb' AND "
-            "no ENUM-naming mismatch. Recall trends down through the pipeline "
+            "no test-set ENUM hygiene issue. Recall trends down through the pipeline "
             "because the gold ENUM set can only shrink as candidates are "
             "dropped; precision trends up because pre-prune precision is "
             "naturally low — the vector DB returns many candidates by design "
@@ -8647,7 +9255,13 @@ def render_html(df: pd.DataFrame, *, df_all: pd.DataFrame | None = None,
 
     {baseline_compare_cards_html}
 
-    {_top_failures_html(summary_metrics['top_failures_clean'], summary_metrics['n_fail_clean'], baseline=baseline)}
+    {_top_failures_html(
+        summary_metrics['top_failures_clean'],
+        summary_metrics['n_fail_clean'],
+        summary_metrics['n_clean'],
+        summary_metrics.get('hard_fail_ids', []),
+        baseline=baseline,
+    )}
 
     <div class="card foldable collapsed">
       <div class="card-title">Methodology {_info_icon(
@@ -8684,7 +9298,7 @@ def render_html(df: pd.DataFrame, *, df_all: pd.DataFrame | None = None,
               <td>Denominator for the Pass-rate · all cases card and the Issues table.</td>
             </tr>
             <tr>
-              <td><span class='fm-indent'>↳</span> Excluded · test-set issues (gold-defect, naming mismatch, ambiguous, out_of_scope)</td>
+              <td><span class='fm-indent'>↳</span> Excluded · test-set issues (gold-defect, expected ENUM absent from KB, naming mismatch, ambiguous, out_of_scope)</td>
               <td style="text-align:right;font-variant-numeric:tabular-nums;color:#5c7999">{summary_metrics['n_defect']}</td>
               <td>Untrustworthy ground truth; dropped from the agent-side denominator.</td>
             </tr>
@@ -8698,7 +9312,7 @@ def render_html(df: pd.DataFrame, *, df_all: pd.DataFrame | None = None,
         <p style="font-size:11px;color:#5c7999;margin-top:10px">
           KB Recall, KB Precision and the Stage funnel apply a tighter
           internal filter (<code>query_scope == 'kb'</code> AND
-          <code>expected_enums</code> non-empty AND no naming mismatch)
+          <code>expected_enums</code> non-empty AND no test-set ENUM hygiene issue)
           so that only rows the reranker actually ran on contribute. See
           the <em>Notes</em> tab for the full per-metric definitions.
         </p>
@@ -8863,7 +9477,7 @@ def render_html(df: pd.DataFrame, *, df_all: pd.DataFrame | None = None,
             "many candidates by design — and the later stages drop that noise. "
             "The reranked row equals the KB Recall and KB Precision headlines on the Summary page. "
             "Restricted to cases where the search tool was used (query_scope == 'kb') AND the "
-            "deterministic check did NOT flag an ENUM-naming-mismatch (those are test-set issues).")}
+            "deterministic checks did NOT flag an ENUM naming mismatch or an expected ENUM absent from the supplied KB export (those are test-set issues).")}
         </div>
         {_funnel_html(summary_metrics['funnel'])}
       </div>
@@ -8903,13 +9517,14 @@ def render_html(df: pd.DataFrame, *, df_all: pd.DataFrame | None = None,
   <div id="tab-kb-findings" class="tab-panel">
     <div class="kb-findings-row1">
       {_empty_user_queries_card_html(df_all)}
+      {_expected_enums_missing_from_kb_card_html(missing_expected_kb_agg)}
       {_naming_mismatches_card_html(naming_mismatches_agg)}
     </div>
     <div class="card">
       <div class="card-title">Test-case issues — review queue {_info_icon(
           "Every case the report flagged for KB / dataset-side review: "
-          "test-set issues (judge said gold reference needs review), ENUM "
-          "naming mismatches, pool content gaps, and any case the judge "
+          "test-set issues (judge said gold reference needs review), missing "
+          "expected KB enum IDs, ENUM naming mismatches, pool content gaps, and any case the judge "
           "left a kb_improvement_suggestion or test_case_improvement_suggestion "
           "for. Filterable per column. Click the test_case_id to drill into "
           "the case detail.")}
@@ -8927,7 +9542,7 @@ def render_html(df: pd.DataFrame, *, df_all: pd.DataFrame | None = None,
   </div>
 
   <div id="tab-doc" class="tab-panel">
-    {_doc_tab_html(summary_metrics, wavg_hist_fig=fig_wavg_hist, include_latency=include_latency)}
+      {_doc_tab_html(summary_metrics, wavg_hist_fig=fig_wavg_hist, dim_weights=active_dim_weights, include_latency=include_latency)}
   </div>
 
 </main>
@@ -9030,7 +9645,7 @@ def _load_dimension_descriptions(yaml_name: str) -> dict[str, str]:
             descs[current_id] = "\n".join(folded_parts)
             continue
         i += 1
-    return descs
+    return _add_dimension_metadata_aliases(descs)
 
 
 def _load_dimension_full_info(yaml_name: str) -> dict[str, dict]:
@@ -9077,7 +9692,28 @@ def _load_dimension_full_info(yaml_name: str) -> dict[str, dict]:
             "description": (d.get("description") or "").strip(),
             "scale":       scale,
         }
-    return out
+    return _add_dimension_metadata_aliases(out)
+
+
+def _load_output_field_order(yaml_name: str) -> tuple[str, ...]:
+    """Return output_schema field names from the YAML, or the current fallback."""
+    cfg = _resolve_yaml_path(yaml_name)
+    if cfg is None:
+        return OUTPUT_FIELD_ORDER
+    try:
+        parsed = yaml.safe_load(cfg.read_text())
+    except (OSError, yaml.YAMLError):
+        return OUTPUT_FIELD_ORDER
+    if not isinstance(parsed, dict):
+        return OUTPUT_FIELD_ORDER
+    schema = (parsed.get("rubric") or {}).get("output_schema") or {}
+    fields = schema.get("fields") or []
+    names = [
+        f.get("name")
+        for f in fields
+        if isinstance(f, dict) and isinstance(f.get("name"), str) and f.get("name")
+    ]
+    return tuple(names) if names else OUTPUT_FIELD_ORDER
 
 
 def _format_dimension_yaml_tip(info: dict) -> str:
@@ -9223,7 +9859,7 @@ def main():
     ap.add_argument("--lang", choices=sorted(BENCHMARKS.keys()), default="cz",
                     help="Language of the KB run. Drives visible labels "
                          "(language-toggle button text, the "
-                         "language_compliance dimension prompt) and the "
+                         "answer_language_compliance dimension prompt) and the "
                          "default config-dir lookup. Internal CSS/JS slot "
                          "names stay 'cz' for both — only what the user "
                          "sees is templated.")
@@ -9253,6 +9889,15 @@ def main():
                     help="Path to the prompt sidecar JSON (or its directory). "
                          "If omitted, the report looks for "
                          "prompt_{mlflow_run_id}.json next to the checkpoint.")
+    ap.add_argument("--kb-en-csv", default=None, type=Path,
+                    help="Optional pipe-delimited English KB export used to "
+                         "populate the KB tab at report-render time. This "
+                         "does not modify the checkpoint or rerun judge calls.")
+    ap.add_argument("--kb-native-csv", default=None, type=Path,
+                    help="Optional pipe-delimited native-language KB export "
+                         "(CZ for --lang cz, SK for --lang sk) used to "
+                         "populate the native side of the KB tab. This does "
+                         "not modify the checkpoint or rerun judge calls.")
     ap.add_argument("--include-latency", action="store_true",
                     help="Include the experimental Latency surfaces "
                          "(headline card on Summary row 2, Latency tab, "
@@ -9326,20 +9971,41 @@ def main():
     if not ckpt.exists():
         sys.exit(f"checkpoint not found: {ckpt}")
 
+    try:
+        kb_description_lookup = _merge_kb_description_lookups(
+            _load_kb_description_lookup(args.kb_native_csv, lang_slot="cz"),
+            _load_kb_description_lookup(args.kb_en_csv, lang_slot="en"),
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        sys.exit(str(exc))
+    if kb_description_lookup:
+        n_native = sum(1 for item in kb_description_lookup.values() if item.get("cz"))
+        n_en = sum(1 for item in kb_description_lookup.values() if item.get("en"))
+        print(
+            f"kb descriptions: {len(kb_description_lookup)} enum ids "
+            f"({LANG_LABEL_UPPER}: {n_native}, EN: {n_en})"
+        )
+
     # Load the optional baseline run BEFORE the main df so any load failure
     # surfaces before the slow enrich+render path runs.
     baseline_payload: dict | None = None
     if args.baseline is not None:
         if not args.baseline.exists():
             sys.exit(f"--baseline not found: {args.baseline}")
-        baseline_payload = load_baseline(args.baseline)
+        baseline_payload = load_baseline(
+            args.baseline,
+            kb_description_lookup=kb_description_lookup,
+        )
         print(
             f"baseline: {args.baseline.name} · "
             f"n_clean={baseline_payload.get('n_clean')} · "
             f"pass_rate_clean={baseline_payload.get('metrics', {}).get('pass_rate_clean')}"
         )
 
-    df_all = enrich(read_checkpoint_csv(ckpt))
+    df_all = enrich(read_checkpoint_csv(ckpt), kb_description_lookup=kb_description_lookup)
+    output_field_order = _load_output_field_order(yaml_name)
+    for warning in _report_schema_warnings(df_all, output_field_order):
+        print(f"warning: {warning}")
     # Pre-filter to drop only the rows we genuinely cannot score: those
     # with an empty user_query (the judge had nothing to grade). All other
     # rows — including non-KB case_scope (api / out_of_scope / ambiguous)
@@ -9369,6 +10035,7 @@ def main():
         include_latency=args.include_latency,
         checkpoint_path=ckpt,
         prompts_path=args.prompts,
+        kb_description_lookup=kb_description_lookup,
         baseline=baseline_payload,
     )
     out.parent.mkdir(parents=True, exist_ok=True)
