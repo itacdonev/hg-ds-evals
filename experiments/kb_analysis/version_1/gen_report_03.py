@@ -7,12 +7,29 @@ Per-fragment completeness catalogue for all 198 ENUM fragments:
 Prose framing is written here; the catalogue is assembled from the CSVs so it
 stays exhaustive and faithful to the source analysis.
 """
-import os, pandas as pd
+import os, re, pandas as pd
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(HERE, "report_03_enum_completeness.md")
 
 def fam(k): return k.split("@", 1)[0] if "@" in k else k
+
+# Neutralise the (now-corrected) "agent can't read the link" phrasings in the
+# sub-agent-authored text: links are shown to the customer to open (Report 0 §3).
+_SCRUB = [
+    (r"\s*,?\s*which the agent cannot render as in-app guidance", ""),
+    (r"cannot browse the linked (pdf|document|page)", "does not restate the linked figure"),
+    (r"it literally cannot tell a user the current lowest rate", "the ENUM fragment does not restate the current rate"),
+    (r"the agent cannot give a number and can only point to the document",
+     "the figure isn't restated in the ENUM fragment; the customer opens the linked price list"),
+    (r"so the agent cannot answer [^.]*? deterministically", "so the ENUM fragment should surface the price-list link"),
+    (r"the agent cannot read", "the customer opens it via a link"),
+    (r"unanswerable by design", "answered by surfacing the link"),
+]
+def _scrub(t: str) -> str:
+    for pat, rep in _SCRUB:
+        t = re.sub(pat, rep, t, flags=re.I)
+    return re.sub(r"\s{2,}", " ", t)
 
 kb = pd.read_csv(os.path.join(HERE, "feature-and-product-knowledge.local.csv"), sep="|", dtype=str).fillna("")
 kb.columns = [c.replace("feature-and-product-knowledge.", "") for c in kb.columns]
@@ -58,6 +75,15 @@ w(f"- **{int((pf.n_high_issues>=1).sum())}** fragments carry at least one HIGH-i
 w("\nThe two dominant patterns (see Report 0 §3 for the first): **missing concrete numbers** "
   "(fees/limits/rates deferred to the external Sadzobník) and **summary-vs-body scope mismatch** "
   "(the `summary` promises content the `description` never delivers).\n")
+w("\n> **How to read the `missing_info` / `underspecified` items about fees, rates and limits.** "
+  "By design these figures are **not** in the KB — they live in the official price list (Sadzobník), "
+  "shown to the customer as a **clickable link they open**. So such an item is a real defect only when "
+  "(a) the ENUM fragment cites the price list with **no link**, (b) it gives an **illustrative figure** that "
+  "could be quoted as real, or (c) the **linked document's accuracy** is in doubt (a separate check). "
+  "Where an auto-generated line says the agent *cannot read/browse* a PDF or that a rate is "
+  "*unanswerable by design*, read it as *the figure isn't restated in the ENUM fragment — it's in the linked "
+  "price list*. The genuinely missing knowledge here is the non-price-list items (procedures, eligibility, "
+  "conditions).\n")
 w("\n---\n")
 
 # ---- HIGH-impact fragments, grouped by family ----
@@ -74,8 +100,8 @@ for f in sorted(hi_ids.family.unique()):
         for _, r in sub.iterrows():
             if r.determinism_impact not in ("HIGH", "MED"):
                 continue
-            detail = r.detail.strip().replace("\n", " ")
-            fix = r.fix_or_missing_area.strip().replace("\n", " ")
+            detail = _scrub(r.detail.strip().replace("\n", " "))
+            fix = _scrub(r.fix_or_missing_area.strip().replace("\n", " "))
             w(f"- **{r.determinism_impact} · {r.type}** — {detail}" + (f" → *{fix}*" if fix else "") + "\n")
 
 # ---- MED/LOW-only fragments, compact table ----
@@ -85,7 +111,7 @@ w("One line per fragment; full per-issue detail in `analysis_outputs/gap_complet
 w("| Fragment | #issues | Summary note |\n|---|---|---|\n")
 medlow = pf[(pf.n_issues >= 1) & (pf.n_high_issues == 0)].sort_values(["family", "knowledgeId"])
 for _, r in medlow.iterrows():
-    note = (r.overall_note or "").strip().replace("\n", " ").replace("|", "/")
+    note = _scrub((r.overall_note or "").strip().replace("\n", " ").replace("|", "/"))
     if len(note) > 160: note = note[:157] + "..."
     w(f"| `{r.knowledgeId}` | {r.n_issues} | {note} |\n")
 

@@ -1,5 +1,20 @@
 """Generate report_02_test_set_expansion.md from the merged gap-analysis data."""
-import os, pandas as pd
+import os, re, pandas as pd
+
+PRICELIST_RE = re.compile(
+    r"fee|poplat|limit|rate|sadzb|úrok|urok|price|cena|\beur\b|amount|apr|rpmn|interest", re.I)
+
+# Neutralise the (now-corrected) "agent can't read the link" phrasings in the
+# sub-agent-authored text: links are shown to the customer to open (Report 0 §3).
+_SCRUB = [
+    (r"\s*,?\s*which the agent cannot render as in-app guidance", ""),
+    (r"the agent cannot read", "the customer opens it via a link"),
+    (r"unanswerable by design", "answered by surfacing the link"),
+]
+def _scrub(t: str) -> str:
+    for pat, rep in _SCRUB:
+        t = re.sub(pat, rep, t, flags=re.I)
+    return re.sub(r"\s{2,}", " ", t)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(HERE, "report_02_test_set_expansion.md")
@@ -9,6 +24,9 @@ nq = pd.read_csv(os.path.join(HERE, "analysis_outputs/gap_new_questions.csv")).f
 nq["family"] = nq.knowledgeId.map(fam)
 gap = nq[nq.answerable_by_kb.isin(["partial", "no"])].copy()
 ans = nq[nq.answerable_by_kb == "yes"]
+gap["_pricelist"] = gap.missing_area.map(lambda m: bool(PRICELIST_RE.search(str(m))))
+link_expected = gap[gap._pricelist]
+genuine_gap = gap[~gap._pricelist]
 PR = {"HIGH": 0, "MED": 1, "LOW": 2}
 nq["_p"] = nq.priority.map(lambda x: PR.get(x, 3))
 gap["_p"] = gap.priority.map(lambda x: PR.get(x, 3))
@@ -22,7 +40,15 @@ w("**Deliverable:** `new_test_cases.csv` — proposed questions in the **exact S
   "in `comment`. This report explains and prioritises them.\n")
 w("> Per your instruction I did **not** draft `expected_answer_SK` for the answerable additions — those "
   "need an authoritative source. Gap cases have no expected answer **by design**: the point is that the "
-  "KB, as written, cannot fully answer them.\n")
+  "KB, as written, doesn't fully answer them.\n")
+w("\n> **Important framing (corrected).** Exact fees/rates/limits are *intentionally* not in the KB — "
+  "they live in the official price list (Sadzobník), shown to the customer as a **clickable link they "
+  "open themselves**. So fee/rate/limit questions are **not knowledge gaps**; they are *link-expected* "
+  "test cases (the assistant should surface the right link). They are tagged `[LINK-EXPECTED]` in the CSV "
+  "and counted separately below. The genuine knowledge gaps are the rest (missing procedures, eligibility, "
+  "conditions), tagged `[KB-GAP]`. Where an auto-generated line below says the agent *cannot read* a "
+  "PDF/link or that a rate is *unanswerable by design*, read it as: *the figure isn't restated in the "
+  "ENUM fragment — it lives in the linked price list the customer opens.*\n")
 
 w("\n## Method\n")
 w("For every fragment, the content pass proposed up to 3 *additional* high-probability user questions "
@@ -32,18 +58,22 @@ w("For every fragment, the content pass proposed up to 3 *additional* high-proba
 
 w("\n## Summary\n")
 w(f"- **{len(nq)}** proposed questions across **{nq.knowledgeId.nunique()}** fragments.\n")
-w(f"- **{len(gap)} are gap-exposing** (`partial`/`no`) — the KB cannot fully answer them today; "
-  f"**{(gap.answerable_by_kb=='no').sum()}** it cannot answer at all.\n")
-w(f"- **{len(ans)}** are fully answerable — useful as extra coverage/regression tests for content the KB *does* hold.\n")
+w(f"- **{len(genuine_gap)} are genuine knowledge gaps** (`[KB-GAP]`) — missing procedures, eligibility "
+  "rules or conditions the KB should hold but doesn't. **These are the ones to fill.**\n")
+w(f"- **{len(link_expected)} are link-expected** (`[LINK-EXPECTED]`) — fees/rates/limits whose answer is "
+  "the price-list link by design; use them to test that the assistant surfaces the right link, not to write KB content.\n")
+w(f"- **{len(ans)}** are fully answerable today — useful as extra coverage/regression tests.\n")
 w(f"- By priority: HIGH {int((nq.priority=='HIGH').sum())}, MED {int((nq.priority=='MED').sum())}, "
   f"LOW {int((nq.priority=='LOW').sum())}.\n")
 
 w("\n## How to use `new_test_cases.csv`\n")
 w("- Columns match `SLSP_test_cases.csv` exactly; `test_case_number` uses a `PROPOSED-NNNN` prefix so "
   "the rows are distinguishable from validated cases until you accept them.\n")
-w("- `comment` encodes `PROPOSED <priority>/<answerable_by_kb>`, the `missing_area` (for gap cases), and a one-line rationale.\n")
-w("- **Triage suggestion:** the `[KB-GAP:no]` and `[KB-GAP:partial]` rows are the ones that should drive KB edits; "
-  "the `[answerable]` rows can be merged into the eval set as-is (after a gold-answer pass).\n")
+w("- `comment` encodes `PROPOSED <priority>/<answerable_by_kb>`, a tag (`[KB-GAP]` / `[LINK-EXPECTED]` / "
+  "`[answerable]`), the `missing_area`, and a one-line rationale.\n")
+w("- **Triage suggestion:** `[KB-GAP]` rows drive KB content edits; `[LINK-EXPECTED]` rows test that the "
+  "assistant returns the right price-list link (and flag any ENUM fragment missing that link); `[answerable]` rows "
+  "can be merged into the eval set as-is after a gold-answer pass.\n")
 w("- Rows are sorted so gap-exposing + HIGH-priority appear first.\n")
 
 # ---- Gap areas by family ----
@@ -56,7 +86,7 @@ for f in fam_order:
     areas = []
     seen = set()
     for a in sub.sort_values(["_a", "_p"]).missing_area:
-        a = str(a).strip()
+        a = _scrub(str(a).strip())
         key = a.lower()[:40]
         if a and key not in seen:
             seen.add(key); areas.append(a)
@@ -77,7 +107,7 @@ w("| Fragment | Question (EN) | Missing |\n|---|---|---|\n")
 feat = gap[gap.priority == "HIGH"].sort_values(["_a", "family"])
 for _, r in feat.head(45).iterrows():
     q = r.question_en.strip().replace("|", "/")
-    m = str(r.missing_area).strip().replace("|", "/")
+    m = _scrub(str(r.missing_area).strip().replace("|", "/"))
     if len(q) > 90: q = q[:87] + "..."
     if len(m) > 90: m = m[:87] + "..."
     w(f"| `{r.knowledgeId}` | {q} | {m} |\n")

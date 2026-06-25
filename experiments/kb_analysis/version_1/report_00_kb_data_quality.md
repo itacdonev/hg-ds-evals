@@ -58,19 +58,22 @@ The per-fragment content analysis (Report 3) found **36 internal contradictions*
 
 ---
 
-## 3. Systemic gap: exact figures are deferred to documents the agent can't read
+## 3. Fees, rates & limits: deferred to the price list by design (three real gaps remain)
 
-**This is the single biggest content problem.** Of 331 completeness issues, **164 concern a missing concrete number** (fee, limit, rate, threshold, price), and **at least 50 explicitly defer the answer to the external *Sadzobník*, a PDF, or a web link** that the agent cannot open. The result: the most common, highest-intent customer questions are unanswerable or get a "see the price list" non-answer.
+**Corrected framing.** Exact fees/rates/limits change often, so the KB deliberately does **not** duplicate them — it defers to the official **Sadzobník** / product page, surfaced to the customer as a **clickable link they open themselves** (confirmed product design — links are presented for the user to click; the agent is *not* expected to read them). So a "missing number" is **not** a defect in itself: **165 of 331** completeness issues flag a missing figure, but for most the correct behaviour is *"show the link,"* not *"state the number."* This corrects an earlier draft that treated these as unanswerable.
 
-Representative (each is a real, high-frequency question with **no number in the KB**):
-- **ATM:** daily/per-withdrawal cash limit in EUR; fee for other-bank ATMs in SK and abroad (`ATM@WITHDRAWAL`); AML deposit threshold (`ATM@DEPOSIT`).
-- **Cards:** debit-card fees (`CARD_DEBIT@FEES` — pure pointer, zero figures); foreign-transaction / FX margin (`CARD_DEBIT@ABOUT`); replacement-card fee (`CARD_CREDIT@REQUEST_CARD`); card limit standard/max values (`CHANGE_CARD_LIMITS`).
-- **Savings/deposits:** base savings rate as a number (`SAVING@INTEREST_RATES_AND_LIMITS` gives only the +0,50 % bonus); current term-deposit rates (`SAVING@DEPOSIT_INTEREST_RATES` → external PDF + a hypothetical 1,5 % the agent may quote as real); branch cash deposit/withdrawal fee (`SAVING@FEES`).
-- **Credit card:** interest rate / APR for revolving debt (`CARD_CREDIT@REPAY`).
-- **Current accounts:** SPACE monthly maintenance fee, 2nd-card price, foreign-account opening/FX fees (`GIRO@*`).
-- **Investing/insurance:** per-trade commission (`PORTFOLIO@FEES_AND_LIMITS`); life-insurance price & sum insured (`INSURANCE@LIFE_ABOUT`).
+What the data shows:
+- **22 of the 23** ENUM fragments that point to the price list **already include a clickable link** (working as intended). Only **`LOAN@CONSOLIDATION_INSTALMENTS`** cites the Sadzobník with **no link**.
+- Of the 165 missing-number findings, **101 sit on an ENUM fragment that already carries a link**; **64 sit on an ENUM fragment with no link at all** — the customer gets neither a figure nor a place to look.
 
-**Why it matters for determinism specifically:** where the KB gives a *hypothetical example* number (e.g. the 1,5 % term-deposit illustration), the agent may present it as the real rate in some runs and hedge in others — non-deterministic *and* potentially wrong. **Recommendation:** decide a policy — either ingest the Sadzobník figures into the KB (best), or have fragments return a single deterministic "I can't quote the current fee, here's where to find it" response so the answer is at least stable.
+So this category reduces to **three concrete action items**, not a wholesale gap:
+
+1. **No link to click.** Ensure every fees/rates/limits answer surfaces a working link — start with `LOAN@CONSOLIDATION_INSTALMENTS` and the 64 findings on link-less ENUM fragments (e.g. `ATM@WITHDRAWAL` fees, `SAVING@FEES`).
+2. **Illustrative numbers shown as real.** Some fragments embed an *example* figure the agent may quote as the current rate — e.g. the hypothetical **1,5 %** term-deposit illustration in `SAVING@DEPOSIT_INTEREST_RATES`. Remove these or clearly label them as illustrative.
+3. **Link correctness/currency is unverified.** Neither this review nor (per the team) the team itself can currently confirm the linked documents are correct and up to date. **Assign an owner to verify the linked Sadzobník/PDF targets** — this is a residual risk now that "the agent can't read it" is *not* the concern.
+4. **The link isn't reaching the customer in the answer — *raised with the core platform team, in progress* (orchestrator-side, not a KB fix).** In the latest eval run (`skkb_traces_enriched_003c668c41ba4319bf80e75399b99b35.csv`, 604 cases), a link was present in the **retrieved ENUM fragment context** but in the **agent's answer 0 times**, across *every* link type — deep links 246→0, PDF/document 137→0, web 308→0 (any link 416→0; price-list subset 359→0; answer named *Sadzobník* without a link in 36). Since a `georgeapp://` deep link needs no reading (just rendering), this is a **link pass-through** issue, not a PDF-reading one. Per-test-case breakdown in `traces_link_check.csv` (columns `ctx_*` / `ans_*` per link type). *(This is an orchestrator behaviour, owned by the platform team — listed here only as evidence; it is not a KB content fix.)*
+
+*(Distinct from this: questions whose answer is a procedure/eligibility/condition that genuinely isn't written anywhere — those are real knowledge gaps and live in [Report 3](report_03_enum_completeness.md) / Report 2, separate from the price-list category.)*
 
 ---
 
@@ -82,7 +85,7 @@ Representative (each is a real, high-frequency question with **no number in the 
 
 ## 5. Coverage: test set ↔ KB
 
-**Test set shape:** 604 rows over 199 topic IDs (mean ≈ 3 questions/topic; 1 topic with a single question; max 7). Questions are bilingual (SK + EN); **`expected_answer_EN` is empty for all 604 rows** (only `expected_answer_SK` is populated) — flag this if EN gold answers were intended. 30 rows are marked `golden_standard_question? = Y`; 16 are `DESCOPE = fixed` and cluster on exactly the rates/limits/fees topics that §3 shows the KB can't answer — likely descoped for that reason.
+**Test set shape:** 604 rows over 199 topic IDs (mean ≈ 3 questions/topic; 1 topic with a single question; max 7). Questions are bilingual (SK + EN); **`expected_answer_EN` is empty for all 604 rows** (only `expected_answer_SK` is populated) — flag this if EN gold answers were intended. 30 rows are marked `golden_standard_question? = Y`; 16 are `DESCOPE = fixed` and cluster on exactly the rates/limits/fees topics that §3 covers (deferred to the price list) — likely descoped because the answer is "open the link" rather than a stated figure.
 
 **ID drift — 5 test topic IDs have no KB fragment, and 4 of them are spelling mismatches of an (untested) KB fragment:**
 

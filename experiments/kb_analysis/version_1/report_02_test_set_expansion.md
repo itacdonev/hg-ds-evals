@@ -1,21 +1,24 @@
 # Report 2 — test-set expansion: new questions & KB gaps
 **Inputs:** the 198-fragment KB and the existing 604-row test set (`SLSP_test_cases.csv`).
 **Deliverable:** `new_test_cases.csv` — proposed questions in the **exact SLSP schema** (SK + EN), directly appendable; gap-exposing cases are left unanswered with the missing-information area noted in `comment`. This report explains and prioritises them.
-> Per your instruction I did **not** draft `expected_answer_SK` for the answerable additions — those need an authoritative source. Gap cases have no expected answer **by design**: the point is that the KB, as written, cannot fully answer them.
+> Per your instruction I did **not** draft `expected_answer_SK` for the answerable additions — those need an authoritative source. Gap cases have no expected answer **by design**: the point is that the KB, as written, doesn't fully answer them.
+
+> **Important framing (corrected).** Exact fees/rates/limits are *intentionally* not in the KB — they live in the official price list (Sadzobník), shown to the customer as a **clickable link they open themselves**. So fee/rate/limit questions are **not knowledge gaps**; they are *link-expected* test cases (the assistant should surface the right link). They are tagged `[LINK-EXPECTED]` in the CSV and counted separately below. The genuine knowledge gaps are the rest (missing procedures, eligibility, conditions), tagged `[KB-GAP]`. Where an auto-generated line below says the agent *cannot read* a PDF/link or that a rate is *unanswerable by design*, read it as: *the figure isn't restated in the ENUM fragment — it lives in the linked price list the customer opens.*
 
 ## Method
 For every fragment, the content pass proposed up to 3 *additional* high-probability user questions that are **not** already in the test set (deduplicated against the existing questions per topic), prioritising ones the KB **cannot** fully answer. Each is tagged `answerable_by_kb` = `yes` / `partial` / `no`, a `priority`, and — when not fully answerable — a `missing_area`.
 
 ## Summary
 - **398** proposed questions across **198** fragments.
-- **334 are gap-exposing** (`partial`/`no`) — the KB cannot fully answer them today; **165** it cannot answer at all.
-- **64** are fully answerable — useful as extra coverage/regression tests for content the KB *does* hold.
+- **209 are genuine knowledge gaps** (`[KB-GAP]`) — missing procedures, eligibility rules or conditions the KB should hold but doesn't. **These are the ones to fill.**
+- **125 are link-expected** (`[LINK-EXPECTED]`) — fees/rates/limits whose answer is the price-list link by design; use them to test that the assistant surfaces the right link, not to write KB content.
+- **64** are fully answerable today — useful as extra coverage/regression tests.
 - By priority: HIGH 125, MED 237, LOW 36.
 
 ## How to use `new_test_cases.csv`
 - Columns match `SLSP_test_cases.csv` exactly; `test_case_number` uses a `PROPOSED-NNNN` prefix so the rows are distinguishable from validated cases until you accept them.
-- `comment` encodes `PROPOSED <priority>/<answerable_by_kb>`, the `missing_area` (for gap cases), and a one-line rationale.
-- **Triage suggestion:** the `[KB-GAP:no]` and `[KB-GAP:partial]` rows are the ones that should drive KB edits; the `[answerable]` rows can be merged into the eval set as-is (after a gold-answer pass).
+- `comment` encodes `PROPOSED <priority>/<answerable_by_kb>`, a tag (`[KB-GAP]` / `[LINK-EXPECTED]` / `[answerable]`), the `missing_area`, and a one-line rationale.
+- **Triage suggestion:** `[KB-GAP]` rows drive KB content edits; `[LINK-EXPECTED]` rows test that the assistant returns the right price-list link (and flag any ENUM fragment missing that link); `[answerable]` rows can be merged into the eval set as-is after a gold-answer pass.
 - Rows are sorted so gap-exposing + HIGH-priority appear first.
 
 ## 1. Missing-information areas, by product family
@@ -40,7 +43,7 @@ Each family below lists the **distinct information areas** the KB is missing (na
 - Late/missed mortgage payment consequences (late interest, penalties, recovery)
 - Approval/processing time (lives only in MORTGAGE_ABOUT, not in this application fragment)
 - First-drawdown deadline (the 6/36-month figure sits in MORTGAGE_POST_SIGNING_CONDITIONS, not here)
-- Actual current interest-rate figure (KB only links to an external PDF the agent cannot read)
+- Actual current interest-rate figure (KB only links to an external PDF the customer opens it via a link)
 - Income documentation for applicants working abroad (this fragment covers employees, pensioners and self-employed, but not foreign-income applicants — unlike LOAN@UNSECURED_APPLI...
 - Maximum number of loans/obligations that can be consolidated
 - Concrete/indicative starting interest rate for the refinancing loan
@@ -245,7 +248,7 @@ Each family below lists the **distinct information areas** the KB is missing (na
 - Minimum age for Garmin/Xiaomi/Swatch wallets
 
 ### SHOW_ATM_BRANCH_FINDER — 2 gap questions
-- An in-app way to locate Erste Group ATMs abroad (the fragment defers entirely to an external web link, which the agent cannot render as in-app guidance)
+- An in-app way to locate Erste Group ATMs abroad (the fragment defers entirely to an external web link)
 - How to identify and locate cash branches ('hotovostné pobočky') for foreign-currency withdrawal
 
 ### CREATE_STANDING_ORDER — 2 gap questions

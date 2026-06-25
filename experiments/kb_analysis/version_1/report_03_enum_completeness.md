@@ -10,6 +10,8 @@ This is the exhaustive, per-fragment catalogue you asked for: *for each ENUM, is
 
 The two dominant patterns (see Report 0 §3 for the first): **missing concrete numbers** (fees/limits/rates deferred to the external Sadzobník) and **summary-vs-body scope mismatch** (the `summary` promises content the `description` never delivers).
 
+> **How to read the `missing_info` / `underspecified` items about fees, rates and limits.** By design these figures are **not** in the KB — they live in the official price list (Sadzobník), shown to the customer as a **clickable link they open**. So such an item is a real defect only when (a) the ENUM fragment cites the price list with **no link**, (b) it gives an **illustrative figure** that could be quoted as real, or (c) the **linked document's accuracy** is in doubt (a separate check). Where an auto-generated line says the agent *cannot read/browse* a PDF or that a rate is *unanswerable by design*, read it as *the figure isn't restated in the ENUM fragment — it's in the linked price list*. The genuinely missing knowledge here is the non-price-list items (procedures, eligibility, conditions).
+
 ---
 ## 1. Fragments with HIGH-impact issues (full detail)
 Grouped by product family. Format: **issue type** — detail → *fix / missing area*.
@@ -91,7 +93,7 @@ Grouped by product family. Format: **issue type** — detail → *fix / missing 
 - **MED · internal_contradiction** — The SMS-confirmation fee is described inconsistently. The summary and one heading call it "poplatok za používanie ePIN", but the body states the 0,20 € charge is "Poplatok za zaslanie SMS správy s jednorazovým autorizačným 3D Secure kódom" — i.e. a per-SMS 3D Secure fee, not an ePIN fee. A user asking 'how much does ePIN cost' may be told 0,20 € or told ePIN itself is free (only the SMS is charged), depending on which sentence the agent latches onto. → *Clarify that the 0,20 € fee is for the authorisation SMS (not for ePIN setup/use) and align the heading/summary wording.*
 
 **`CARD_DEBIT@FEES`** — Debetná karta - Poplatky
-- **HIGH · missing_info** — The fragment contains no actual fee figures at all — it only links to the Sadzobník poplatkov. For any concrete 'how much' question (monthly card fee, foreign/non-EUR transaction fee, ATM withdrawal fee) the agent cannot give a number and can only point to the document. → *Concrete key card fees in EUR (monthly card fee per card type, foreign-currency transaction surcharge, out-of-network ATM fee).*
+- **HIGH · missing_info** — The fragment contains no actual fee figures at all — it only links to the Sadzobník poplatkov. For any concrete 'how much' question (monthly card fee, foreign/non-EUR transaction fee, ATM withdrawal fee) the figure isn't restated in the ENUM fragment; the customer opens the linked price list. → *Concrete key card fees in EUR (monthly card fee per card type, foreign-currency transaction surcharge, out-of-network ATM fee).*
 
 ### CHANGE_CARD_LIMITS
 
@@ -120,7 +122,7 @@ Grouped by product family. Format: **issue type** — detail → *fix / missing 
 
 **`GEORGE@DAILY_BALANCE`** — Nastavenie notifikácii vo webovom Georgeovi
 - **HIGH · scope_mismatch** — knowledgeName and notInScope scope this strictly to WEB George ('Nastavenie notifikácii vo webovom Georgeovi', 'Nerieši sa tu aplikácia George. Nerieši sa tu mobilná verzia Georgea.'), yet the topic (account notifications, SMS fees) is one users overwhelmingly ask about for the mobile app. The agent may answer mobile-app notification questions from this web-only fragment, giving web-only steps for a mobile user. → *Either add a pointer to the mobile-app notification fragment or have the agent route mobile-notification questions elsewhere; web-only steps must not be served for mobile.*
-- **HIGH · underspecified** — SMS notifications are 'spoplatnené podľa sadzobníka' with only a link to the PDF tariff; no actual per-SMS price is given, so the agent cannot answer 'how much does an SMS notification cost' deterministically. → *Exact per-SMS notification fee in EUR (or a stated current amount).*
+- **HIGH · underspecified** — SMS notifications are 'spoplatnené podľa sadzobníka' with only a link to the PDF tariff; no actual per-SMS price is given, so the ENUM fragment should surface the price-list link. → *Exact per-SMS notification fee in EUR (or a stated current amount).*
 
 ### GEORGE_DEVICES
 
@@ -170,7 +172,7 @@ Grouped by product family. Format: **issue type** — detail → *fix / missing 
 - **HIGH · missing_info** — Unlike the unsecured-loan rate fragment (which gives 'od 5,99 %' and an RPMN example), the consolidation rate fragment gives no concrete number at all — only 'stanovuje sa individuálne' and a link. A user asking 'what rate will I get on consolidation?' cannot get even an indicative figure. → *Add an indicative starting rate / representative RPMN example for the refinancing loan, as exists for the plain unsecured loan.*
 
 **`LOAN@MORTGAGE_INTEREST_RATES`** — Hypotéka - úroková sadzba
-- **HIGH · missing_info** — The 'Aký je najnižší možný úrok na hypotéke' section deliberately gives no number and points to an external PDF/web page for current rates. Since the agent answers from description text only and cannot browse the linked PDF, it literally cannot tell a user the current lowest rate — the single most-asked rate question is unanswerable by design. → *There is no fix without a live figure; the agent must be steered to say rates aren't fixed in the KB and to direct the user to the calculator/PDF. The missing area is the actual current lowest interest rate in % p.a.*
+- **HIGH · missing_info** — The 'Aký je najnižší možný úrok na hypotéke' section deliberately gives no number and points to an external PDF/web page for current rates. Since the agent answers from description text only and does not restate the linked figure, the ENUM fragment does not restate the current rate — the single most-asked rate question is answered by surfacing the link. → *There is no fix without a live figure; the agent must be steered to say rates aren't fixed in the KB and to direct the user to the calculator/PDF. The missing area is the actual current lowest interest rate in % p.a.*
 - **MED · internal_contradiction** — The discount breakdown lists '-0,50 % p.a.' for repayment from an SLSP account and '-0,20 % p.a.' for loan insurance, then says 'Až -0,70 % p.a. pri splnení oboch výhod'. 0,50 + 0,20 = 0,70, so the arithmetic is internally consistent — flagging instead the truncated sentence below: 'banka garantuje nezmenenú výšku úrokovej sadzby ... (výnimkou je neplnenie pode' cuts off mid-word ('pode...' = podmienok). The fixation guarantee's exception clause is incomplete. → *Complete the truncated sentence about when the fixed rate is NOT guaranteed (likely 'neplnenie podmienok zmluvy').*
 
 **`LOAN@MORTGAGE_REQUIREMENTS`** — Hypotéka - podmienky
@@ -387,7 +389,7 @@ One line per fragment; full per-issue detail in `analysis_outputs/gap_completene
 | `SAVING@DEPOSIT_DISPOSING_PERSON` | 1 | Clear on setup (branch-only, both owners for joint) and that a disponent cannot cancel; gap is the concrete withdrawal scope given term lock-up. |
 | `SAVING@DEPOSIT_INTEREST_RATES` | 1 | Calculation logic and 19% tax are clear, but no current rate is groundable - the hypothetical 1,5 % example risks being quoted as if real. |
 | `SAVING@DISPOSING_PERSON` | 1 | Clear and well-structured on rights, setup channel, owner change and death; only gap is fees for managing a disponent. |
-| `SAVING@FEES` | 2 | Tax part (19% withholding) is solid; fee coverage is thin because all branch fees are deferred to an external PDF the agent cannot read. |
+| `SAVING@FEES` | 2 | Tax part (19% withholding) is solid; fee coverage is thin because all branch fees are deferred to an external PDF the customer opens it via a link. |
 | `SAVING@KIDS_ABOUT` | 2 | Rich and mostly clear; gaps are an unstated balance limit and the slightly fuzzy 14-to-15 transition wording. |
 | `SAVING@KIDS_APPLICATION` | 2 | Opening/closing steps are clear but the age eligibility is missing here while present in KIDS_ABOUT, creating cross-fragment inconsistency. |
 | `SAVING@KIDS_INTEREST_RATES` | 1 | States 1% monthly crediting clearly; minor issue is the rate-source link pointing at the SPACE kids account page rather than Pokladnička. |
